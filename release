@@ -25,6 +25,8 @@ cp relay-java/build/libs/gnirehtet.jar \
    relay-java/scripts/gnirehtet \
    relay-java/scripts/gnirehtet.cmd \
    relay-java/scripts/gnirehtet-get-adb.cmd \
+   relay-java/scripts/gnirehtet-launcher.cmd \
+   relay-java/scripts/gnirehtet-repair.cmd \
    relay-java/scripts/gnirehtet-run.cmd \
    "$DIST/$TARGET_DIR_JAVA"/
 

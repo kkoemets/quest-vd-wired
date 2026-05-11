@@ -1,2 +1,2 @@
-@java -jar gnirehtet.jar run
-@pause
+@echo off
+call "%~dp0gnirehtet-launcher.cmd" run
