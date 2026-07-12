@@ -10,24 +10,24 @@ headset.
 
 ## Choose your download
 
-### v3.1 Standard — recommended
+### v4.0.0 — current release
 
-This is the normal version for everyday use. It is the safer choice while the
-new version is tested by more people.
+This is the latest version and the recommended download. It starts from a
+simple icon near the Windows clock and reconnects automatically.
 
-[Download v3.1 Standard](https://github.com/kkoemets/gnirehtet-quest-3-virtual-desktop-link-cable/releases/download/v3.1.0/gnirehtet-java-v3.1.0.zip)
+[Download v4.0.0](https://github.com/kkoemets/gnirehtet-quest-3-virtual-desktop-link-cable/releases/download/v4.0.0/gnirehtet-v4.0.0-windows-x64.zip)
 
-### v4.0 Beta — for testing
+### v3.1.0 Legacy — older Java version
 
-This is the new version with a simpler tray app and a redesigned connection
-engine. It may still have bugs, so keep v3.1 Standard nearby.
+This is the previous Java version, kept available for users who need to roll
+back. New users should choose v4.0.0.
 
-[Download v4.0 Beta](https://github.com/kkoemets/gnirehtet-quest-3-virtual-desktop-link-cable/releases/download/v4.0.0-beta.1/gnirehtet-v4.0.0-beta.1-windows-x64.zip)
+[Download v3.1.0 Legacy](https://github.com/kkoemets/gnirehtet-quest-3-virtual-desktop-link-cable/releases/download/v3.1.0/gnirehtet-java-v3.1.0.zip)
 
 ### v3.0.0 Legacy — older fallback
 
-This is the previous release, kept available for users who need to roll back.
-New users should choose v3.1 Standard instead.
+This older release remains available as an additional fallback. New users
+should choose v4.0.0 instead.
 
 [Download v3.0.0 Legacy](https://github.com/kkoemets/gnirehtet-quest-3-virtual-desktop-link-cable/releases/download/v3.0.0/gnirehtet-java-v3.0.0.zip)
 
@@ -48,34 +48,32 @@ You need:
 The first time you connect the headset, put it on and accept the USB debugging
 prompt. Select **Always allow from this computer** if that choice is shown.
 
-## Use v3.1 Standard
+## Use v4.0.0
 
-1. Download and extract the v3.1 Standard zip.
+1. Download and extract the v4.0.0 zip.
+2. Connect the Quest 3 and accept the USB debugging prompt.
+3. Double-click `gnirehtet-vd.exe`.
+4. Accept the VPN prompt inside the headset if it appears.
+5. Open Virtual Desktop on the Quest.
+
+The wired link switches on automatically. Its icon near the Windows clock is
+green while it is on and gray while it is off. Right-click the icon to turn
+the link on or off, run **Diagnose and fix**, or exit safely.
+
+The app keeps trying quietly if the headset is not ready. Put on and unlock the
+headset if Windows is waiting for USB debugging permission.
+
+## Use v3.1.0 Legacy
+
+1. Download and extract the v3.1.0 Legacy zip.
 2. Connect the Quest 3 to the PC.
 3. Put on the headset and accept the USB debugging prompt.
 4. Double-click `gnirehtet-run.cmd`.
-5. If the launcher says a required Android tool is missing, press **R** to
-   repair it, then start again.
-6. Accept the VPN prompt inside the headset.
-7. Open Virtual Desktop on the Quest.
+5. Accept the VPN prompt inside the headset.
+6. Open Virtual Desktop on the Quest.
 
-Keep the launcher window open while using the wired link. If it reports that
-Java is missing, install a current Java 11 or newer runtime and try again.
-
-## Use v4.0 Beta
-
-1. Download and extract the v4.0 Beta zip.
-2. Connect the Quest 3 and accept the USB debugging prompt.
-3. Double-click `gnirehtet-vd.exe`.
-4. Find the Gnirehtet VD icon near the Windows clock.
-5. Right-click the icon and select **Start wired link**.
-6. Accept the VPN prompt inside the headset.
-7. Open Virtual Desktop on the Quest.
-
-If the Beta reports a missing Android tool, choose **Repair** from the same
-tray menu and then try **Start wired link** again. To disconnect, choose
-**Stop wired link** from the tray or from the Gnirehtet notification on the
-Quest.
+Keep the launcher window open while using the legacy version. It requires a
+Java 11 or newer runtime.
 
 ## What success looks like
 
@@ -106,26 +104,25 @@ The wired-link app will not start or restart Virtual Desktop for you.
 ### Performance suddenly becomes worse
 
 First restart Virtual Desktop on the Quest. If that fixes it, the slowdown may
-be inside the Virtual Desktop session rather than the cable link. Beta testers
-can use the tray **Status** option and include that information in a bug report.
+be inside the Virtual Desktop session rather than the cable link. If the wired
+link itself is not working, choose **Diagnose and fix** from the tray icon.
 
 ### The cable was unplugged
 
 Reconnect it, put on the headset, and approve USB debugging again if asked. The
-wired link keeps trying to reconnect. Use **Stop wired link** if you want to
-return the Quest to its normal network setup.
+wired link keeps trying to reconnect. Uncheck **Wired link** from the tray icon
+if you want to return the Quest to its normal network setup.
 
 ### An older install will not update
 
-Official v3.1 Standard and v4.0 Beta releases use the same project signing
-identity and should update in place. Very old builds from another source may
-need to be removed once before installing this project.
+Official v3.1.0 and v4.0.0 releases use the same project signing identity and
+should update in place. Very old builds from another source may need to be
+removed once before installing this project.
 
-## Standard or Beta?
+## Current or legacy?
 
-Use **v3.1 Standard** if you mainly want to play. Use **v4.0 Beta** if you are
-comfortable reporting problems and switching back to Standard when needed.
-Both versions stay available from the Releases page during the Beta period.
+Use **v4.0.0** for the current experience. Use **v3.1.0 Legacy** only if you
+need the older Java version. Both remain available from the Releases page.
 
 ## Privacy
 
