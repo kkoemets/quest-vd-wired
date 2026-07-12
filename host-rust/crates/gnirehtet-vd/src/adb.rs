@@ -741,6 +741,8 @@ impl AdbController {
     /// then removes every product-owned reverse mapping. Mapping cleanup is
     /// attempted even when the stop request or verification fails.
     pub fn stop(&self) -> Result<(), TransactionError> {
+        self.require_device()
+            .map_err(|failure| TransactionError::single("stop", failure))?;
         let mut failures = Vec::new();
         let args = strings(&[
             "-d",
@@ -952,10 +954,16 @@ impl AdbController {
                 Ok(output) => {
                     let state = output.stdout.trim();
                     let state = if state.is_empty() { "unknown" } else { state };
-                    return Err(AdbError::DeviceNotReady(state.to_owned()));
+                    return Err(AdbError::DeviceNotReady(device_help(state)));
                 }
                 Err(AdbError::Timeout(_)) if attempt == 0 => {
                     thread::sleep(self.poll_interval);
+                }
+                Err(error) if adb_reports_missing_device(&error) => {
+                    return Err(AdbError::DeviceNotReady(device_help("not found")));
+                }
+                Err(AdbError::Timeout(_)) => {
+                    return Err(AdbError::DeviceNotReady(device_help("not responding")));
                 }
                 Err(error) => return Err(error),
             }
@@ -1079,18 +1087,32 @@ pub enum AdbError {
     Read(String),
     #[error("ADB exited with {status}: {stderr}")]
     CommandFailed { status: i32, stderr: String },
-    #[error("Quest ADB connection is {0}; reconnect the USB cable and accept the USB debugging prompt in the headset")]
+    #[error("{0}")]
     DeviceNotReady(String),
     #[error("Android still reports an active VPN after the stop deadline")]
     VpnStillActive,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Error)]
-#[error("ADB {phase} transaction failed: {failures:?}")]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransactionError {
     pub phase: &'static str,
     pub failures: Vec<String>,
 }
+
+impl fmt::Display for TransactionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "ADB {} failed", self.phase)?;
+        if let [failure] = self.failures.as_slice() {
+            write!(formatter, ": {failure}")
+        } else if !self.failures.is_empty() {
+            write!(formatter, ": {}", self.failures.join("; "))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl std::error::Error for TransactionError {}
 
 impl TransactionError {
     fn new(phase: &'static str, failures: Vec<String>) -> Self {
@@ -1104,6 +1126,19 @@ impl TransactionError {
 
 fn strings(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_owned()).collect()
+}
+
+fn adb_reports_missing_device(error: &AdbError) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("no devices")
+        || message.contains("no device")
+        || message.contains("device not found")
+}
+
+fn device_help(state: &str) -> String {
+    format!(
+        "No Quest 3 is available through USB ({state}). Connect and unlock the headset with a USB data cable, then accept the USB debugging prompt and try again. To close this app without stopping a headset link, choose Exit tray only."
+    )
 }
 
 fn mapping_was_already_absent(output: &AdbOutput) -> bool {
@@ -1334,6 +1369,7 @@ mod tests {
     #[test]
     fn stop_cleanup_runs_even_when_stop_request_fails() {
         let mock = Arc::new(MockAdb::with_results(vec![
+            Ok(AdbOutput::success("device")),
             Ok(AdbOutput {
                 status: 1,
                 stdout: String::new(),
@@ -1358,6 +1394,7 @@ mod tests {
     #[test]
     fn already_stopped_is_idempotent_even_if_activity_command_fails() {
         let mock = Arc::new(MockAdb::with_results(vec![
+            Ok(AdbOutput::success("device")),
             Ok(AdbOutput {
                 status: 1,
                 stdout: String::new(),
@@ -1366,6 +1403,22 @@ mod tests {
             Ok(AdbOutput::success("No services match")),
         ]));
         controller(mock).stop().unwrap();
+    }
+
+    #[test]
+    fn stop_without_a_device_returns_one_error_and_skips_teardown_commands() {
+        let mock = Arc::new(MockAdb::with_results(vec![Ok(AdbOutput {
+            status: 1,
+            stdout: String::new(),
+            stderr: "adb.exe: no devices found".into(),
+        })]));
+        let error = controller(mock.clone()).stop().unwrap_err();
+        assert_eq!(error.phase, "stop");
+        assert_eq!(error.failures.len(), 1);
+        assert!(error.to_string().contains("Exit tray only"));
+        let calls = mock.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].iter().map(String::as_str).eq(["-d", "get-state"]));
     }
 
     #[test]
@@ -1568,6 +1621,25 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.phase, "device_check");
         assert!(error.failures[0].contains("accept the USB debugging prompt"));
+        assert_eq!(mock.calls.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn missing_device_has_one_concise_layman_friendly_error() {
+        let mock = Arc::new(MockAdb::with_results(vec![Ok(AdbOutput {
+            status: 1,
+            stdout: String::new(),
+            stderr: "error: no devices found".into(),
+        })]));
+        let error = AdbController::new(mock.clone())
+            .install_matching_apk(Path::new("embedded.apk"))
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("Connect and unlock the headset"));
+        assert!(message.contains("accept the USB debugging prompt"));
+        assert!(message.contains("Exit tray only"));
+        assert!(!message.contains("[\""));
+        assert_eq!(error.failures.len(), 1);
         assert_eq!(mock.calls.lock().unwrap().len(), 1);
     }
 

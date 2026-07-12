@@ -167,7 +167,7 @@ async fn execute_public_command(
 }
 
 #[cfg(any(target_os = "windows", test))]
-const BROKER_PROTOCOL_VERSION: u16 = 3;
+const BROKER_PROTOCOL_VERSION: u16 = 4;
 #[cfg(any(target_os = "windows", test))]
 const MAX_BROKER_FRAME: usize = 256 * 1024;
 #[cfg(any(target_os = "windows", test))]
@@ -1131,7 +1131,8 @@ enum TrayCommand {
     Start,
     Stop,
     Repair,
-    Exit,
+    StopAndExit,
+    ExitTray,
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -1144,6 +1145,8 @@ const TRAY_STOP_ID: usize = 1_003;
 const TRAY_EXIT_ID: usize = 1_004;
 #[cfg(any(target_os = "windows", test))]
 const TRAY_REPAIR_ID: usize = 1_005;
+#[cfg(any(target_os = "windows", test))]
+const TRAY_EXIT_ONLY_ID: usize = 1_006;
 
 #[cfg(any(target_os = "windows", test))]
 fn tray_command_from_id(id: usize) -> Option<TrayCommand> {
@@ -1152,7 +1155,8 @@ fn tray_command_from_id(id: usize) -> Option<TrayCommand> {
         TRAY_START_ID => Some(TrayCommand::Start),
         TRAY_STOP_ID => Some(TrayCommand::Stop),
         TRAY_REPAIR_ID => Some(TrayCommand::Repair),
-        TRAY_EXIT_ID => Some(TrayCommand::Exit),
+        TRAY_EXIT_ID => Some(TrayCommand::StopAndExit),
+        TRAY_EXIT_ONLY_ID => Some(TrayCommand::ExitTray),
         _ => None,
     }
 }
@@ -1164,17 +1168,19 @@ fn tray_command_arguments(command: TrayCommand) -> Option<&'static [&'static str
         TrayCommand::Start => Some(&["start"]),
         TrayCommand::Stop => Some(&["stop"]),
         TrayCommand::Repair => Some(&["repair"]),
-        TrayCommand::Exit => Some(&["stop"]),
+        TrayCommand::StopAndExit => Some(&["stop"]),
+        TrayCommand::ExitTray => None,
     }
 }
 
 #[cfg(any(target_os = "windows", test))]
-fn tray_public_command(command: TrayCommand) -> Command {
+fn tray_public_command(command: TrayCommand) -> Option<Command> {
     match command {
-        TrayCommand::Status => Command::Status(StatusArgs { json: false }),
-        TrayCommand::Start => Command::Start(StartArgs { all_traffic: false }),
-        TrayCommand::Stop | TrayCommand::Exit => Command::Stop,
-        TrayCommand::Repair => Command::Repair,
+        TrayCommand::Status => Some(Command::Status(StatusArgs { json: false })),
+        TrayCommand::Start => Some(Command::Start(StartArgs { all_traffic: false })),
+        TrayCommand::Stop | TrayCommand::StopAndExit => Some(Command::Stop),
+        TrayCommand::Repair => Some(Command::Repair),
+        TrayCommand::ExitTray => None,
     }
 }
 
@@ -1378,6 +1384,7 @@ fn run_windows_tray(
             (MF_STRING, TRAY_REPAIR_ID, Some("Repair")),
             (MF_SEPARATOR, 0, None),
             (MF_STRING, TRAY_EXIT_ID, Some("Stop wired link and exit")),
+            (MF_STRING, TRAY_EXIT_ONLY_ID, Some("Exit tray only")),
         ] {
             let label = label.map(wide_windows);
             unsafe {
@@ -1427,7 +1434,8 @@ fn run_windows_tray(
             drop(in_flight);
             return;
         };
-        let mut shutdown = if command == TrayCommand::Exit {
+        let exits_tray = matches!(command, TrayCommand::StopAndExit | TrayCommand::ExitTray);
+        let mut shutdown = if exits_tray {
             let Some(shutdown) = TrayShutdownGuard::new(gate.clone()) else {
                 drop(in_flight);
                 return;
@@ -1455,7 +1463,10 @@ fn run_windows_tray(
                     MessageBoxW, PostMessageW, MB_ICONINFORMATION, MB_OK, WM_CLOSE,
                 };
 
-                let result = runtime.block_on(context.execute(tray_public_command(command)));
+                let result = match tray_public_command(command) {
+                    Some(command) => runtime.block_on(context.execute(command)),
+                    None => Ok("Tray closed. Any headset link was left unchanged.".into()),
+                };
                 drop(command_guard);
                 let success = result.is_ok();
                 let outcome = match result {
@@ -1480,7 +1491,7 @@ fn run_windows_tray(
                         MB_OK | MB_ICONINFORMATION,
                     );
                 }
-                if command == TrayCommand::Exit && success {
+                if exits_tray && success {
                     let hwnd = hwnd_value as HWND;
                     unsafe {
                         if PostMessageW(hwnd, TRAY_EXIT_COMPLETE_MESSAGE, 0, 0) == 0 {
@@ -1764,11 +1775,16 @@ mod tests {
             tray_command_arguments(tray_command_from_id(TRAY_EXIT_ID).unwrap()),
             Some(&["stop"][..])
         );
+        assert_eq!(
+            tray_command_arguments(tray_command_from_id(TRAY_EXIT_ONLY_ID).unwrap()),
+            None
+        );
         assert_eq!(tray_command_from_id(0), None);
         assert!(matches!(
-            tray_public_command(TrayCommand::Exit),
-            Command::Stop
+            tray_public_command(TrayCommand::StopAndExit),
+            Some(Command::Stop)
         ));
+        assert!(tray_public_command(TrayCommand::ExitTray).is_none());
     }
 
     #[test]
@@ -1808,7 +1824,7 @@ mod tests {
 
     #[test]
     fn broker_deadlines_are_bounded_by_command_shape() {
-        assert_eq!(BROKER_PROTOCOL_VERSION, 3);
+        assert_eq!(BROKER_PROTOCOL_VERSION, 4);
         assert_eq!(
             BrokerCommand::Version.response_timeout(),
             Duration::from_secs(5)
