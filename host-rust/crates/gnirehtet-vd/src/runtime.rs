@@ -1366,13 +1366,17 @@ fn command_text_with_timeout(
     arguments: &[&str],
     timeout: Duration,
 ) -> io::Result<(std::process::ExitStatus, String)> {
+    use std::os::windows::process::CommandExt;
     const MAX_COMMAND_OUTPUT: u64 = 64 * 1024;
-    let mut child = Command::new(program)
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut command = Command::new(program);
+    command
         .args(arguments)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .spawn()?;
+        .creation_flags(CREATE_NO_WINDOW);
+    let mut child = command.spawn()?;
     let status = match child.wait_timeout(timeout)? {
         Some(status) => status,
         None => {
@@ -1842,6 +1846,7 @@ mod tests {
                 {
                     break;
                 }
+                time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
@@ -1854,11 +1859,26 @@ mod tests {
                 admin_command(&paths, "status", Duration::from_secs(3)).await
             }));
         }
-        for client in clients {
-            assert!(client.await.unwrap().unwrap().ok);
-        }
-        assert!(!server_task.is_finished());
+        let outcome = time::timeout(Duration::from_secs(10), async {
+            for client in clients {
+                let response = client
+                    .await
+                    .map_err(|error| format!("admin client task failed: {error}"))?
+                    .map_err(|error| format!("admin client request failed: {error}"))?;
+                if !response.ok {
+                    return Err(format!("admin client was rejected: {:?}", response.error));
+                }
+            }
+            Ok::<(), String>(())
+        })
+        .await;
+        let server_running = !server_task.is_finished();
         server_task.abort();
+        let _ = server_task.await;
+        assert!(server_running);
+        outcome
+            .expect("concurrent named-pipe clients exceeded the test deadline")
+            .unwrap();
     }
 
     #[cfg(unix)]

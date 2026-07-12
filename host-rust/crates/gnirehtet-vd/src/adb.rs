@@ -26,8 +26,8 @@ pub const ANDROID_VPN_SERVICE: &str = "com.genymobile.gnirehtet/.v4.VdLinkVpnSer
 pub const ACTION_START_V4: &str = "com.genymobile.gnirehtet.v4.START";
 pub const ACTION_STOP_V4: &str = "com.genymobile.gnirehtet.v4.STOP";
 pub const VIRTUAL_DESKTOP_PACKAGE: &str = "VirtualDesktop.Android";
-pub const ANDROID_VERSION_CODE: &str = "40";
-pub const ANDROID_VERSION_NAME: &str = "4.0.0-beta.1";
+pub const ANDROID_VERSION_CODE: &str = "41";
+pub const ANDROID_VERSION_NAME: &str = "4.0.0-beta.2";
 pub const PLATFORM_TOOLS_VERSION: &str = "37.0.0";
 pub const PLATFORM_TOOLS_WINDOWS_URL: &str =
     "https://dl.google.com/android/repository/platform-tools_r37.0.0-win.zip";
@@ -112,18 +112,30 @@ impl SystemAdb {
     }
 }
 
+fn hide_subprocess_window(command: &mut Command) {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = command;
+}
+
 impl AdbExecutor for SystemAdb {
     fn execute(&self, args: &[String], timeout: Duration) -> Result<AdbOutput, AdbError> {
-        let child = Command::new(&self.program)
+        let mut command = Command::new(&self.program);
+        command
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|source| AdbError::Spawn {
-                program: self.program.clone(),
-                source,
-            })?;
+            .stderr(Stdio::piped());
+        hide_subprocess_window(&mut command);
+        let child = command.spawn().map_err(|source| AdbError::Spawn {
+            program: self.program.clone(),
+            source,
+        })?;
         collect_child_output(child, timeout)
     }
 }
@@ -1140,7 +1152,8 @@ pub fn repair_adb_if_missing(
     }
     let archive = app_root.join(format!("platform-tools-{PLATFORM_TOOLS_VERSION}-win.zip"));
     let script = "$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; Invoke-WebRequest -Uri $env:GNR4_ADB_URL -OutFile $env:GNR4_ADB_ARCHIVE; $actual=(Get-FileHash -Algorithm SHA256 -LiteralPath $env:GNR4_ADB_ARCHIVE).Hash.ToLowerInvariant(); if($actual -ne $env:GNR4_ADB_SHA){Remove-Item -Force $env:GNR4_ADB_ARCHIVE -ErrorAction SilentlyContinue; throw ('SHA-256 mismatch: '+$actual)}; Expand-Archive -LiteralPath $env:GNR4_ADB_ARCHIVE -DestinationPath $env:GNR4_ADB_DEST -Force";
-    let child = Command::new("powershell.exe")
+    let mut command = Command::new("powershell.exe");
+    command
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -1155,8 +1168,9 @@ pub fn repair_adb_if_missing(
         .env("GNR4_ADB_DEST", &install_root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    hide_subprocess_window(&mut command);
+    let child = command.spawn()?;
     let output = collect_child_output(child, PLATFORM_TOOLS_DOWNLOAD_TIMEOUT)
         .map_err(|error| AdbBootstrapError::PowerShell(error.to_string()))?;
     let _ = fs::remove_file(&archive);
@@ -1443,7 +1457,7 @@ mod tests {
             Ok(AdbOutput::success("device")),
             Ok(AdbOutput::success("Success")),
             Ok(AdbOutput::success(
-                "versionCode=40 minSdk=29 targetSdk=36\nversionName=4.0.0-beta.1\n",
+                "versionCode=41 minSdk=29 targetSdk=36\nversionName=4.0.0-beta.2\n",
             )),
         ]));
         AdbController::new(mock.clone())

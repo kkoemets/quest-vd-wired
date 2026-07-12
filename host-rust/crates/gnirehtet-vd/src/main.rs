@@ -167,7 +167,7 @@ async fn execute_public_command(
 }
 
 #[cfg(any(target_os = "windows", test))]
-const BROKER_PROTOCOL_VERSION: u16 = 1;
+const BROKER_PROTOCOL_VERSION: u16 = 2;
 #[cfg(any(target_os = "windows", test))]
 const MAX_BROKER_FRAME: usize = 256 * 1024;
 #[cfg(any(target_os = "windows", test))]
@@ -279,7 +279,8 @@ impl BrokerCommand {
 
     fn response_timeout(&self) -> Duration {
         match self {
-            Self::Start { .. } => Duration::from_secs(180),
+            // First Start may also download and verify Android platform-tools.
+            Self::Start { .. } => Duration::from_secs(15 * 60),
             Self::Stop => Duration::from_secs(30),
             Self::Status { .. } | Self::Doctor => Duration::from_secs(15),
             // The checksum-verified platform-tools bootstrap has its own
@@ -451,19 +452,41 @@ impl BrokerContext {
         Ok(adb)
     }
 
-    async fn execute(&self, command: Command) -> Result<String> {
+    fn ensure_adb(&self) -> Result<BrokerEnvironment> {
+        self.ensure_adb_with(|program, root| Ok(repair_adb_if_missing(program, root)?))
+    }
+
+    fn ensure_adb_with<F>(&self, repair: F) -> Result<BrokerEnvironment>
+    where
+        F: FnOnce(PathBuf, &std::path::Path) -> Result<PathBuf>,
+    {
         let environment = self.environment()?;
+        let adb_program = repair(environment.adb_program.clone(), &self.paths.root)?;
+        if adb_program == environment.adb_program {
+            return Ok(environment);
+        }
+        let adb = self.replace_adb(adb_program.clone())?;
+        Ok(BrokerEnvironment { adb_program, adb })
+    }
+
+    async fn execute(&self, command: Command) -> Result<String> {
         match command {
+            Command::Start(args) => {
+                let environment = self.ensure_adb()?;
+                start(
+                    &environment.adb_program,
+                    &self.paths,
+                    &environment.adb,
+                    args,
+                )
+                .await
+            }
             Command::Repair => {
-                let repaired_program =
-                    repair_adb_if_missing(environment.adb_program, &self.paths.root)?;
-                // Publish the verified executable before mapping repair. Even
-                // if the device-side repair then fails, later broker requests
-                // must use the ADB installation that was verified/downloaded.
-                let repaired_adb = self.replace_adb(repaired_program)?;
-                repair(&self.paths, &repaired_adb)
+                let environment = self.ensure_adb()?;
+                repair(&self.paths, &environment.adb)
             }
             command => {
+                let environment = self.environment()?;
                 execute_public_command(
                     &environment.adb_program,
                     &self.paths,
@@ -546,23 +569,6 @@ async fn serve_broker(
 }
 
 #[cfg(target_os = "windows")]
-fn broker_is_present() -> Result<bool> {
-    use tokio::net::windows::named_pipe::ClientOptions;
-    use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY};
-
-    let name = gnirehtet_vd::runtime::windows_broker_pipe_name()?;
-    match ClientOptions::new().open(&name) {
-        Ok(client) => {
-            drop(client);
-            Ok(true)
-        }
-        Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => Ok(true),
-        Err(error) if error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) => Ok(false),
-        Err(error) => Err(error).context("probing the per-user broker pipe"),
-    }
-}
-
-#[cfg(target_os = "windows")]
 fn spawn_broker_process(paths: &AppPaths, adb_program: &std::path::Path) -> Result<()> {
     use std::os::windows::process::CommandExt;
 
@@ -585,35 +591,40 @@ fn spawn_broker_process(paths: &AppPaths, adb_program: &std::path::Path) -> Resu
 }
 
 #[cfg(target_os = "windows")]
-async fn open_broker_client(
+async fn open_or_start_broker_client<F>(
+    name: &str,
     wait: Duration,
-) -> Result<tokio::net::windows::named_pipe::NamedPipeClient> {
+    start: F,
+) -> Result<tokio::net::windows::named_pipe::NamedPipeClient>
+where
+    F: FnOnce() -> Result<()>,
+{
     use tokio::net::windows::named_pipe::ClientOptions;
     use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY};
 
-    let name = gnirehtet_vd::runtime::windows_broker_pipe_name()?;
+    let mut start = Some(start);
     let operation = async {
         loop {
-            match ClientOptions::new().open(&name) {
+            match ClientOptions::new().open(name) {
                 Ok(client) => return Ok(client),
-                Err(error)
-                    if matches!(
-                        error.raw_os_error(),
-                        Some(code)
-                            if code == ERROR_FILE_NOT_FOUND as i32
-                                || code == ERROR_PIPE_BUSY as i32
-                    ) =>
-                {
-                    tokio::time::sleep(Duration::from_millis(25)).await;
+                Err(error) if error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) => {
+                    if let Some(start) = start.take() {
+                        start().context("starting the per-user command broker")?;
+                    }
                 }
-                Err(error) => return Err(error),
+                Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => {}
+                Err(error) => {
+                    return Err(
+                        anyhow::Error::new(error).context("opening the per-user broker pipe")
+                    )
+                }
             }
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
     };
     tokio::time::timeout(wait, operation)
         .await
         .context("timed out waiting for the per-user command broker")?
-        .context("opening the per-user broker pipe")
 }
 
 #[cfg(target_os = "windows")]
@@ -622,9 +633,6 @@ async fn send_broker_command(
     adb_program: &std::path::Path,
     command: BrokerCommand,
 ) -> Result<BrokerResponse> {
-    if !broker_is_present()? {
-        spawn_broker_process(paths, adb_program)?;
-    }
     let response_timeout = command.response_timeout();
     let request = BrokerRequest {
         protocol_version: BROKER_PROTOCOL_VERSION,
@@ -633,14 +641,19 @@ async fn send_broker_command(
         command,
     };
     let operation = async {
-        let mut stream = open_broker_client(Duration::from_secs(5)).await?;
+        let name = gnirehtet_vd::runtime::windows_broker_pipe_name()?;
+        let mut stream = open_or_start_broker_client(&name, Duration::from_secs(5), || {
+            spawn_broker_process(paths, adb_program)
+        })
+        .await?;
         write_broker_frame(&mut stream, &request).await?;
         let response: BrokerResponse = read_broker_frame(&mut stream).await?;
         if response.protocol_version != BROKER_PROTOCOL_VERSION {
             bail!(
-                "broker response protocol mismatch: expected {}, got {}",
+                "another Gnirehtet VD version is already running (broker protocol {}, expected {}); use its Stop wired link and exit action before starting {}",
+                response.protocol_version,
                 BROKER_PROTOCOL_VERSION,
-                response.protocol_version
+                env!("CARGO_PKG_VERSION")
             );
         }
         Ok(response)
@@ -981,7 +994,8 @@ fn spawn_daemon(adb: &std::path::Path, paths: &AppPaths, session: SessionId) -> 
         use std::os::windows::process::CommandExt;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         const DETACHED_PROCESS: u32 = 0x0000_0008;
-        command.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS | CREATE_NO_WINDOW);
     }
     command.spawn().context("starting host daemon")
 }
@@ -1061,6 +1075,11 @@ async fn no_argument_entry(
             windows_sys::Win32::System::Console::FreeConsole();
         }
         let Some(instance) = acquire_tray_instance()? else {
+            if let Err(error) =
+                send_broker_command(&paths, &adb_program, BrokerCommand::Version).await
+            {
+                show_windows_message("Gnirehtet VD could not start", &format!("{error:#}"));
+            }
             return Ok(());
         };
         let class_name = instance.class_name.clone();
@@ -1069,8 +1088,11 @@ async fn no_argument_entry(
         let server = prepare_broker_pipe()?;
         let gate = BrokerGate::default();
         let context = BrokerContext::new(paths, adb_program, adb, gate.clone());
-        let mut broker = tokio::spawn(serve_broker(server, context));
-        let mut tray = tokio::task::spawn_blocking(move || run_windows_tray(instance, gate));
+        let broker_context = context.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let mut broker = tokio::spawn(serve_broker(server, broker_context));
+        let mut tray =
+            tokio::task::spawn_blocking(move || run_windows_tray(instance, context, runtime));
         tokio::select! {
             tray_result = &mut tray => {
                 broker.abort();
@@ -1135,14 +1157,24 @@ fn tray_command_from_id(id: usize) -> Option<TrayCommand> {
     }
 }
 
-#[cfg(any(target_os = "windows", test))]
+#[cfg(test)]
 fn tray_command_arguments(command: TrayCommand) -> Option<&'static [&'static str]> {
     match command {
         TrayCommand::Status => Some(&["status"]),
         TrayCommand::Start => Some(&["start"]),
         TrayCommand::Stop => Some(&["stop"]),
         TrayCommand::Repair => Some(&["repair"]),
-        TrayCommand::Exit => None,
+        TrayCommand::Exit => Some(&["stop"]),
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn tray_public_command(command: TrayCommand) -> Command {
+    match command {
+        TrayCommand::Status => Command::Status(StatusArgs { json: false }),
+        TrayCommand::Start => Command::Start(StartArgs { all_traffic: false }),
+        TrayCommand::Stop | TrayCommand::Exit => Command::Stop,
+        TrayCommand::Repair => Command::Repair,
     }
 }
 
@@ -1162,11 +1194,60 @@ fn begin_tray_shutdown(in_flight: &AtomicBool, gate: &BrokerGate) -> bool {
 static TRAY_COMMAND_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "windows")]
 static WINDOWS_BROKER_GATE: std::sync::OnceLock<BrokerGate> = std::sync::OnceLock::new();
+#[cfg(target_os = "windows")]
+static WINDOWS_TRAY_RUNTIME: std::sync::OnceLock<WindowsTrayRuntime> = std::sync::OnceLock::new();
+
+#[cfg(target_os = "windows")]
+struct WindowsTrayRuntime {
+    context: BrokerContext,
+    runtime: tokio::runtime::Handle,
+}
+
+#[cfg(target_os = "windows")]
+struct TrayInFlightGuard;
+
+#[cfg(target_os = "windows")]
+impl Drop for TrayInFlightGuard {
+    fn drop(&mut self) {
+        TRAY_COMMAND_IN_FLIGHT.store(false, Ordering::Release);
+    }
+}
+
+#[cfg(target_os = "windows")]
+struct TrayShutdownGuard {
+    gate: BrokerGate,
+    committed: bool,
+}
+
+#[cfg(target_os = "windows")]
+impl TrayShutdownGuard {
+    fn new(gate: BrokerGate) -> Option<Self> {
+        gate.begin_shutdown().then_some(Self {
+            gate,
+            committed: false,
+        })
+    }
+
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for TrayShutdownGuard {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.gate.cancel_shutdown();
+        }
+    }
+}
 
 #[cfg(target_os = "windows")]
 const TRAY_CALLBACK_MESSAGE: u32 = 0x8000 + 41;
 #[cfg(target_os = "windows")]
 const TRAY_SHOW_EXISTING_MESSAGE: u32 = 0x8000 + 42;
+#[cfg(target_os = "windows")]
+const TRAY_EXIT_COMPLETE_MESSAGE: u32 = 0x8000 + 43;
 
 #[cfg(target_os = "windows")]
 struct TrayInstance {
@@ -1189,6 +1270,23 @@ impl Drop for TrayInstance {
 #[cfg(target_os = "windows")]
 fn wide_windows(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(target_os = "windows")]
+fn show_windows_message(title: &str, message: &str) {
+    use std::ptr::null_mut;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OK};
+
+    let title = wide_windows(title);
+    let message = wide_windows(message);
+    unsafe {
+        MessageBoxW(
+            null_mut(),
+            message.as_ptr(),
+            title.as_ptr(),
+            MB_OK | MB_ICONINFORMATION,
+        );
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -1241,7 +1339,11 @@ fn request_tray_exit(class_name: &[u16]) {
 }
 
 #[cfg(target_os = "windows")]
-fn run_windows_tray(instance_guard: TrayInstance, broker_gate: BrokerGate) -> std::io::Result<()> {
+fn run_windows_tray(
+    instance_guard: TrayInstance,
+    broker_context: BrokerContext,
+    runtime: tokio::runtime::Handle,
+) -> std::io::Result<()> {
     use std::ptr::{null, null_mut};
     use windows_sys::Win32::{
         Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM},
@@ -1275,7 +1377,7 @@ fn run_windows_tray(instance_guard: TrayInstance, broker_gate: BrokerGate) -> st
             (MF_STRING, TRAY_STOP_ID, Some("Stop wired link")),
             (MF_STRING, TRAY_REPAIR_ID, Some("Repair")),
             (MF_SEPARATOR, 0, None),
-            (MF_STRING, TRAY_EXIT_ID, Some("Exit tray")),
+            (MF_STRING, TRAY_EXIT_ID, Some("Stop wired link and exit")),
         ] {
             let label = label.map(wide_windows);
             unsafe {
@@ -1313,62 +1415,61 @@ fn run_windows_tray(instance_guard: TrayInstance, broker_gate: BrokerGate) -> st
     }
 
     fn dispatch_tray_command(command: TrayCommand, hwnd: HWND) {
-        if command == TrayCommand::Exit {
-            let Some(gate) = WINDOWS_BROKER_GATE.get() else {
-                return;
-            };
-            if !begin_tray_shutdown(&TRAY_COMMAND_IN_FLIGHT, gate) {
-                return;
-            }
-            if unsafe { DestroyWindow(hwnd) } == 0 {
-                gate.cancel_shutdown();
-            }
-            return;
-        }
-        let Some(arguments) = tray_command_arguments(command) else {
+        let Some(tray) = WINDOWS_TRAY_RUNTIME.get() else {
             return;
         };
         if !begin_tray_command(&TRAY_COMMAND_IN_FLIGHT) {
             return;
         }
+        let in_flight = TrayInFlightGuard;
+        let gate = WINDOWS_BROKER_GATE.get().cloned();
+        let Some(gate) = gate else {
+            drop(in_flight);
+            return;
+        };
+        let mut shutdown = if command == TrayCommand::Exit {
+            let Some(shutdown) = TrayShutdownGuard::new(gate.clone()) else {
+                drop(in_flight);
+                return;
+            };
+            Some(shutdown)
+        } else {
+            None
+        };
+        let command_guard = if shutdown.is_none() {
+            let Some(command_guard) = gate.begin_command() else {
+                drop(in_flight);
+                return;
+            };
+            Some(command_guard)
+        } else {
+            None
+        };
+        let context = tray.context.clone();
+        let runtime = tray.runtime.clone();
+        let hwnd_value = hwnd as usize;
         let worker = std::thread::Builder::new()
             .name("gnirehtet-vd-tray-command".into())
             .spawn(move || {
-                use std::os::windows::process::CommandExt;
                 use windows_sys::Win32::UI::WindowsAndMessaging::{
-                    MessageBoxW, MB_ICONINFORMATION, MB_OK,
+                    MessageBoxW, PostMessageW, MB_ICONINFORMATION, MB_OK, WM_CLOSE,
                 };
 
-                const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-                let outcome = std::env::current_exe()
-                    .and_then(|executable| {
-                        ProcessCommand::new(executable)
-                            .args(arguments)
-                            .creation_flags(CREATE_NO_WINDOW)
-                            .stdout(Stdio::piped())
-                            .stderr(Stdio::piped())
-                            // `output()` drains both pipes concurrently. Mutation
-                            // deadlines and rollback belong to the CLI transaction;
-                            // the tray must not kill it at an arbitrary UI timeout.
-                            .output()
-                    })
-                    .map(|output| {
-                        let bytes = if output.status.success() || output.stderr.is_empty() {
-                            output.stdout
-                        } else {
-                            output.stderr
-                        };
-                        let mut text = String::from_utf8_lossy(&bytes).trim().to_owned();
-                        if text.is_empty() {
-                            text = if output.status.success() {
-                                "Command completed".into()
-                            } else {
-                                "Command failed without details".into()
-                            };
-                        }
-                        text.chars().take(4 * 1024).collect()
-                    })
-                    .unwrap_or_else(|error| format!("Could not run command: {error}"));
+                let result = runtime.block_on(context.execute(tray_public_command(command)));
+                drop(command_guard);
+                let success = result.is_ok();
+                let outcome = match result {
+                    Ok(output) if output.trim().is_empty() => "Command completed".into(),
+                    Ok(output) => output,
+                    Err(error) => format!("Error: {error:#}"),
+                };
+                if success {
+                    if let Some(shutdown) = shutdown.as_mut() {
+                        shutdown.commit();
+                    }
+                }
+                drop(shutdown);
+                drop(in_flight);
                 let message = wide_windows(&outcome);
                 let title = wide_windows("Gnirehtet VD wired link");
                 unsafe {
@@ -1379,7 +1480,17 @@ fn run_windows_tray(instance_guard: TrayInstance, broker_gate: BrokerGate) -> st
                         MB_OK | MB_ICONINFORMATION,
                     );
                 }
-                TRAY_COMMAND_IN_FLIGHT.store(false, Ordering::Release);
+                if command == TrayCommand::Exit && success {
+                    let hwnd = hwnd_value as HWND;
+                    unsafe {
+                        if PostMessageW(hwnd, TRAY_EXIT_COMPLETE_MESSAGE, 0, 0) == 0 {
+                            if let Some(gate) = WINDOWS_BROKER_GATE.get() {
+                                gate.cancel_shutdown();
+                            }
+                            PostMessageW(hwnd, WM_CLOSE, 0, 0);
+                        }
+                    }
+                }
             });
         if worker.is_err() {
             TRAY_COMMAND_IN_FLIGHT.store(false, Ordering::Release);
@@ -1401,6 +1512,10 @@ fn run_windows_tray(instance_guard: TrayInstance, broker_gate: BrokerGate) -> st
             }
             TRAY_SHOW_EXISTING_MESSAGE => {
                 show_menu(hwnd);
+                0
+            }
+            TRAY_EXIT_COMPLETE_MESSAGE => {
+                DestroyWindow(hwnd);
                 0
             }
             WM_COMMAND => {
@@ -1435,8 +1550,14 @@ fn run_windows_tray(instance_guard: TrayInstance, broker_gate: BrokerGate) -> st
     }
 
     WINDOWS_BROKER_GATE
-        .set(broker_gate)
+        .set(broker_context.gate.clone())
         .map_err(|_| std::io::Error::other("broker gate was initialized more than once"))?;
+    WINDOWS_TRAY_RUNTIME
+        .set(WindowsTrayRuntime {
+            context: broker_context,
+            runtime,
+        })
+        .map_err(|_| std::io::Error::other("tray runtime was initialized more than once"))?;
     let class_name = instance_guard.class_name.clone();
 
     let instance = unsafe { GetModuleHandleW(null()) };
@@ -1641,9 +1762,13 @@ mod tests {
         );
         assert_eq!(
             tray_command_arguments(tray_command_from_id(TRAY_EXIT_ID).unwrap()),
-            None
+            Some(&["stop"][..])
         );
         assert_eq!(tray_command_from_id(0), None);
+        assert!(matches!(
+            tray_public_command(TrayCommand::Exit),
+            Command::Stop
+        ));
     }
 
     #[test]
@@ -1683,13 +1808,14 @@ mod tests {
 
     #[test]
     fn broker_deadlines_are_bounded_by_command_shape() {
+        assert_eq!(BROKER_PROTOCOL_VERSION, 2);
         assert_eq!(
             BrokerCommand::Version.response_timeout(),
             Duration::from_secs(5)
         );
         assert_eq!(
             BrokerCommand::Start { all_traffic: false }.response_timeout(),
-            Duration::from_secs(180)
+            Duration::from_secs(15 * 60)
         );
         assert_eq!(
             BrokerCommand::DiagnosticsCapture { duration: u64::MAX }.response_timeout(),
@@ -1733,6 +1859,50 @@ mod tests {
         assert!(read_broker_frame::<BrokerRequest, _>(&mut receiver)
             .await
             .is_err());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn broker_uses_the_first_pipe_connection_for_the_command() {
+        let pipe_name = format!(
+            r"\\.\pipe\gnirehtet-vd-broker-test-{}-{}",
+            std::process::id(),
+            SessionId::random()
+        );
+        let mut server =
+            gnirehtet_vd::runtime::create_secure_named_pipe(&pipe_name, true, 1).unwrap();
+        let accepted = tokio::spawn(async move {
+            server.connect().await.unwrap();
+            let request: BrokerRequest = read_broker_frame(&mut server).await.unwrap();
+            assert_eq!(request.command, BrokerCommand::Version);
+            write_broker_frame(&mut server, &BrokerResponse::success("ready".into()))
+                .await
+                .unwrap();
+        });
+        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let start_counter = starts.clone();
+        let mut client =
+            open_or_start_broker_client(&pipe_name, Duration::from_secs(2), move || {
+                start_counter.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        write_broker_frame(
+            &mut client,
+            &BrokerRequest {
+                protocol_version: BROKER_PROTOCOL_VERSION,
+                instance_root: PathBuf::from("test-root"),
+                adb_program: PathBuf::from("test-adb"),
+                command: BrokerCommand::Version,
+            },
+        )
+        .await
+        .unwrap();
+        let response: BrokerResponse = read_broker_frame(&mut client).await.unwrap();
+        accepted.await.unwrap();
+        assert_eq!(starts.load(Ordering::Relaxed), 0);
+        assert_eq!(response.stdout, "ready\n");
     }
 
     #[tokio::test]
@@ -1788,7 +1958,7 @@ mod tests {
     }
 
     #[test]
-    fn broker_replaces_stale_adb_context_after_bootstrap() {
+    fn broker_publishes_automatically_bootstrapped_adb() {
         let directory = tempfile::tempdir().unwrap();
         let paths = AppPaths::discover(Some(directory.path().to_owned())).unwrap();
         let original = PathBuf::from("adb");
@@ -1799,7 +1969,14 @@ mod tests {
             BrokerGate::default(),
         );
         let verified = directory.path().join("platform-tools/adb.exe");
-        context.replace_adb(verified.clone()).unwrap();
+        let ensured = context
+            .ensure_adb_with(|program, root| {
+                assert_eq!(program, PathBuf::from("adb"));
+                assert_eq!(root, directory.path());
+                Ok(verified.clone())
+            })
+            .unwrap();
+        assert_eq!(ensured.adb_program, verified);
         assert_eq!(context.environment().unwrap().adb_program, verified);
     }
 }

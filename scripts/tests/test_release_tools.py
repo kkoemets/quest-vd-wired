@@ -175,8 +175,8 @@ class CommandLineToolsTest(unittest.TestCase):
                 "#!/bin/sh\n"
                 "case \"$2\" in\n"
                 "application-id) echo com.genymobile.gnirehtet ;;\n"
-                "version-code) echo 40 ;;\n"
-                "version-name) echo 4.0.0-beta.1 ;;\n"
+                "version-code) echo 41 ;;\n"
+                "version-name) echo 4.0.0-beta.2 ;;\n"
                 "min-sdk) echo 29 ;;\n"
                 "target-sdk) echo 36 ;;\n"
                 "debuggable) echo false ;;\n"
@@ -242,7 +242,7 @@ class CommandLineToolsTest(unittest.TestCase):
             )
 
 
-class WorkflowPolicyTest(unittest.TestCase):
+class ReleasePolicyTest(unittest.TestCase):
     def test_gradle_distributions_are_checksum_pinned(self) -> None:
         for properties in (
             REPOSITORY / "gradle/wrapper/gradle-wrapper.properties",
@@ -252,67 +252,37 @@ class WorkflowPolicyTest(unittest.TestCase):
             match = re.search(r"^distributionSha256Sum=([0-9a-f]{64})$", text, re.MULTILINE)
             self.assertIsNotNone(match, f"unverified Gradle distribution: {properties}")
 
-    def test_actions_and_runner_generations_are_pinned(self) -> None:
+    def test_github_actions_remain_disabled(self) -> None:
         workflows = sorted((REPOSITORY / ".github/workflows").glob("*.yml"))
-        self.assertTrue(workflows)
-        action_pattern = re.compile(r"^\s*-\s+uses:\s+([^\s#]+)", re.MULTILINE)
-        pinned_rust_action = (
-            "dtolnay/rust-toolchain@4e529fb27e59237866a6523e61ab248308c068b4"
-        )
-        pinned_rust_uses = 0
-        pinned_rust_inputs = 0
-        for workflow in workflows:
-            text = workflow.read_text(encoding="utf-8")
-            self.assertNotIn("ubuntu-latest", text, workflow.name)
-            self.assertNotIn("windows-latest", text, workflow.name)
-            for action in action_pattern.findall(text):
-                if action.startswith("./"):
-                    continue
-                self.assertRegex(
-                    action,
-                    r"@[0-9a-f]{40}$",
-                    f"{workflow.name} contains a floating action reference: {action}",
-                )
-            pinned_rust_uses += text.count(pinned_rust_action)
-            pinned_rust_inputs += text.count("toolchain: 1.88.0")
-        self.assertEqual(
-            pinned_rust_uses,
-            pinned_rust_inputs,
-            "every SHA-pinned stable Rust action must receive an explicit toolchain input",
-        )
+        self.assertEqual(workflows, [])
 
     def test_comparator_is_locked_audited_and_not_released(self) -> None:
-        ci = (REPOSITORY / ".github/workflows/ci.yml").read_text(encoding="utf-8")
-        security = (REPOSITORY / ".github/workflows/security.yml").read_text(encoding="utf-8")
-        release = (REPOSITORY / ".github/workflows/release-v4-beta.yml").read_text(
+        comparator = (
+            REPOSITORY / "benchmarks/comparators/tun2proxy/Cargo.toml"
+        ).read_text(encoding="utf-8")
+        lock = (REPOSITORY / "benchmarks/comparators/tun2proxy/Cargo.lock").read_text(
             encoding="utf-8"
         )
-        comparator = "benchmarks/comparators/tun2proxy/Cargo.toml"
-        revision = "eed123fbbec06295bf83f9be36d5a0f64ed9a8cb"
-        self.assertIn("tun2proxy-comparator:", ci)
-        self.assertGreaterEqual(ci.count("--locked"), 5)
-        self.assertIn(comparator, security)
-        self.assertIn(revision, security)
-        self.assertIn(
-            '{ allow = ["GPL-3.0-or-later"], crate = "socks5-impl@0.8.7" }',
-            security,
+        notices = (
+            REPOSITORY / "benchmarks/comparators/tun2proxy/THIRD_PARTY_NOTICES.md"
+        ).read_text(encoding="utf-8")
+        release = (REPOSITORY / "scripts/build_v4_windows_rc.ps1").read_text(
+            encoding="utf-8"
         )
-        self.assertIn('{ allow = ["WTFPL"], crate = "tun@0.8.13" }', security)
+        revision = "eed123fbbec06295bf83f9be36d5a0f64ed9a8cb"
+        self.assertIn(revision, comparator)
+        self.assertIn(revision, lock)
+        self.assertIn("GPL-3.0-or-later", notices)
+        self.assertIn("WTFPL", notices)
         product_policy = (REPOSITORY / "host-rust/deny.toml").read_text(encoding="utf-8")
         self.assertNotIn("GPL-3.0-or-later", product_policy)
         self.assertNotIn("WTFPL", product_policy)
         self.assertNotIn("benchmarks/comparators", release)
-        self.assertIn("Verify transferred Android artifact checksums", release)
-        self.assertIn("Verify release build did not rewrite locked inputs", release)
+        self.assertIn('"--locked"', release)
+        self.assertIn("target-feature=+crt-static", release)
 
     def test_standard_and_beta_rollout_is_publishable_and_user_facing(self) -> None:
         readme = (REPOSITORY / "README.md").read_text(encoding="utf-8")
-        standard = (REPOSITORY / ".github/workflows/release-v3-standard.yml").read_text(
-            encoding="utf-8"
-        )
-        beta = (REPOSITORY / ".github/workflows/release-v4-beta.yml").read_text(
-            encoding="utf-8"
-        )
         android_v4 = (REPOSITORY / "android-v4/app/build.gradle.kts").read_text(
             encoding="utf-8"
         )
@@ -326,12 +296,11 @@ class WorkflowPolicyTest(unittest.TestCase):
         self.assertIn("gnirehtet-java-v3.0.0.zip", readme)
         self.assertNotIn("docs/", readme)
         self.assertIn("/docs/", ignore)
-        self.assertIn("gh release create", standard)
-        self.assertNotIn("--prerelease", standard)
-        self.assertIn("gh release create", beta)
-        self.assertIn("--prerelease", beta)
-        self.assertIn('versionName = "4.0.0-beta.1"', android_v4)
-        self.assertIn('version = "4.0.0-beta.1"', rust_v4)
+        self.assertTrue((REPOSITORY / "release").is_file())
+        self.assertTrue((REPOSITORY / "scripts/build_v4_android_rc.sh").is_file())
+        self.assertTrue((REPOSITORY / "scripts/build_v4_windows_rc.ps1").is_file())
+        self.assertIn('versionName = "4.0.0-beta.2"', android_v4)
+        self.assertIn('version = "4.0.0-beta.2"', rust_v4)
 
 
 if __name__ == "__main__":
