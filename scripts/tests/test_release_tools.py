@@ -17,6 +17,53 @@ sys.path.insert(0, str(SCRIPTS))
 
 import generate_rust_notices  # noqa: E402
 import generate_v4_native_sbom  # noqa: E402
+import normalize_windows_pe  # noqa: E402
+
+
+class WindowsPeNormalizationTest(unittest.TestCase):
+    @staticmethod
+    def pe_fixture(marker: int) -> bytes:
+        data = bytearray(0x600)
+        data[:2] = b"MZ"
+        struct.pack_into("<I", data, 0x3C, 0x80)
+        pe = 0x80
+        data[pe : pe + 4] = b"PE\0\0"
+        struct.pack_into("<H", data, pe + 4, 0x8664)
+        struct.pack_into("<H", data, pe + 6, 1)
+        struct.pack_into("<I", data, pe + 8, marker)
+        struct.pack_into("<H", data, pe + 20, 0xF0)
+        optional = pe + 24
+        struct.pack_into("<H", data, optional, 0x20B)
+        struct.pack_into("<I", data, optional + 108, 16)
+        struct.pack_into("<II", data, optional + 112 + 6 * 8, 0x1100, 56)
+        section = optional + 0xF0
+        data[section : section + 8] = b".rdata\0\0"
+        struct.pack_into("<IIII", data, section + 8, 0x400, 0x1000, 0x400, 0x200)
+        debug = 0x300
+        struct.pack_into("<I", data, debug + 4, marker)
+        struct.pack_into("<I", data, debug + 12, 2)
+        struct.pack_into("<I", data, debug + 16, 32)
+        struct.pack_into("<I", data, debug + 24, 0x400)
+        struct.pack_into("<I", data, debug + 28 + 4, marker)
+        data[0x400:0x404] = b"RSDS"
+        data[0x404:0x414] = bytes([marker & 0xFF]) * 16
+        struct.pack_into("<I", data, 0x414, 1)
+        data[0x418:0x420] = b"test.pdb"
+        return bytes(data)
+
+    def test_normalization_is_idempotent_and_removes_build_variance(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            first = Path(directory) / "first.exe"
+            second = Path(directory) / "second.exe"
+            first.write_bytes(self.pe_fixture(0x11111111))
+            second.write_bytes(self.pe_fixture(0x22222222))
+
+            self.assertEqual((2, 1), normalize_windows_pe.normalize(first))
+            self.assertEqual((2, 1), normalize_windows_pe.normalize(second))
+            normalized = first.read_bytes()
+            self.assertEqual(normalized, second.read_bytes())
+            self.assertEqual((2, 1), normalize_windows_pe.normalize(first))
+            self.assertEqual(normalized, first.read_bytes())
 
 
 class NativeSbomTest(unittest.TestCase):
