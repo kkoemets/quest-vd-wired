@@ -40,7 +40,7 @@ New-Item -ItemType Directory -Path $output | Out-Null
 
 $env:GNIREHTET_VD_APK = $apk
 $env:CARGO_INCREMENTAL = "0"
-$env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = "-C target-feature=+crt-static"
+$env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = "-C target-feature=+crt-static -C link-arg=/Brepro"
 if (-not $env:SOURCE_DATE_EPOCH) {
     $env:SOURCE_DATE_EPOCH = (& git -C $repoRoot show -s --format=%ct HEAD).Trim()
     if ($LASTEXITCODE -ne 0) { throw "could not determine SOURCE_DATE_EPOCH" }
