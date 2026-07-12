@@ -107,10 +107,9 @@ payloads to logs.
 The trust boundaries, failure policy, local command-channel requirement, and
 release supply-chain rules must remain enforced by code, tests, and workflows.
 
-## v4 Beta release
+## v4.0 release
 
-The `Publish v4.0 Beta` workflow requires these repository
-secrets:
+The local Android release build requires these environment variables:
 
 - `ANDROID_RELEASE_KEYSTORE_BASE64`
 - `ANDROID_RELEASE_STORE_PASSWORD`
@@ -118,12 +117,11 @@ secrets:
 - `ANDROID_RELEASE_KEY_PASSWORD`
 - `ANDROID_RELEASE_CERT_SHA256`
 
-The Android job fails closed unless the certificate, application ID, version,
+The Android build fails closed unless the certificate, application ID, version,
 non-debuggable flag, arm64 ABI, native engine, and packaged notices all match.
 It builds twice and compares the signed APK payload independently of the APK
-signing block. The Windows job embeds that exact signed APK, verifies the byte
-sequence in the executable, performs a clean second build, and packages SBOMs,
-notices, and SHA-256 manifests.
+signing block. The Windows build embeds that exact signed APK, verifies the byte
+sequence in the executable, and packages SBOMs, notices, and SHA-256 manifests.
 
 Local release-tool tests do not need signing material:
 

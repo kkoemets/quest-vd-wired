@@ -175,8 +175,8 @@ class CommandLineToolsTest(unittest.TestCase):
                 "#!/bin/sh\n"
                 "case \"$2\" in\n"
                 "application-id) echo com.genymobile.gnirehtet ;;\n"
-                "version-code) echo 42 ;;\n"
-                "version-name) echo 4.0.0-beta.3 ;;\n"
+                "version-code) echo 43 ;;\n"
+                "version-name) echo 4.0.0 ;;\n"
                 "min-sdk) echo 29 ;;\n"
                 "target-sdk) echo 36 ;;\n"
                 "debuggable) echo false ;;\n"
@@ -200,7 +200,7 @@ class CommandLineToolsTest(unittest.TestCase):
                 env=environment,
             )
 
-    def test_v3_apk_verifier_checks_standard_identity(self) -> None:
+    def test_v3_apk_verifier_checks_legacy_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             sdk = root / "sdk"
@@ -281,7 +281,7 @@ class ReleasePolicyTest(unittest.TestCase):
         self.assertIn('"--locked"', release)
         self.assertIn("target-feature=+crt-static", release)
 
-    def test_standard_and_beta_rollout_is_publishable_and_user_facing(self) -> None:
+    def test_current_and_legacy_rollout_is_publishable_and_user_facing(self) -> None:
         readme = (REPOSITORY / "README.md").read_text(encoding="utf-8")
         android_v4 = (REPOSITORY / "android-v4/app/build.gradle.kts").read_text(
             encoding="utf-8"
@@ -289,18 +289,18 @@ class ReleasePolicyTest(unittest.TestCase):
         rust_v4 = (REPOSITORY / "host-rust/Cargo.toml").read_text(encoding="utf-8")
         ignore = (REPOSITORY / ".gitignore").read_text(encoding="utf-8")
 
-        self.assertIn("v3.1 Standard", readme)
-        self.assertIn("v4.0 Beta", readme)
+        self.assertIn("v4.0.0 — current release", readme)
+        self.assertIn("v3.1.0 Legacy", readme)
         self.assertIn("gnirehtet-java-v3.1.0.zip", readme)
-        self.assertIn("gnirehtet-v4.0.0-beta.1-windows-x64.zip", readme)
+        self.assertIn("gnirehtet-v4.0.0-windows-x64.zip", readme)
         self.assertIn("gnirehtet-java-v3.0.0.zip", readme)
         self.assertNotIn("docs/", readme)
         self.assertIn("/docs/", ignore)
         self.assertTrue((REPOSITORY / "release").is_file())
         self.assertTrue((REPOSITORY / "scripts/build_v4_android_rc.sh").is_file())
         self.assertTrue((REPOSITORY / "scripts/build_v4_windows_rc.ps1").is_file())
-        self.assertIn('versionName = "4.0.0-beta.3"', android_v4)
-        self.assertIn('version = "4.0.0-beta.3"', rust_v4)
+        self.assertIn('versionName = "4.0.0"', android_v4)
+        self.assertIn('version = "4.0.0"', rust_v4)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-Gnirehtet v3.1 Standard for Quest 3 and Virtual Desktop
+Gnirehtet v3.1 Legacy for Quest 3 and Virtual Desktop
 
 Quick start
 
@@ -37,5 +37,4 @@ Notes
 - Java still needs to be installed separately if the launcher reports it
   missing.
 
-This is the recommended everyday release. v4.0 Beta is available separately
-for users who want to test the new tray app.
+This is the legacy Java release. v4.0.0 is the recommended current version.
