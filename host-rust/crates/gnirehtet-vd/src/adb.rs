@@ -36,7 +36,8 @@ pub const PLATFORM_TOOLS_WINDOWS_SHA256: &str =
 pub const SOCKS_PORT: u16 = 31_416;
 pub const CONTROL_PORT: u16 = 31_417;
 pub const UDP_STREAM_PORT: u16 = 31_418;
-pub const ADB_MAPPING_COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
+pub const ADB_DEVICE_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
+pub const ADB_MAPPING_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 const ADB_INSTALL_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_ADB_OUTPUT_BYTES: usize = 1024 * 1024;
 const OUTPUT_TRUNCATED_MARKER: &[u8] = b"\n[ADB output truncated]\n";
@@ -546,6 +547,7 @@ impl Drop for CommandContainment {
 #[derive(Clone)]
 pub struct AdbController {
     executor: Arc<dyn AdbExecutor>,
+    device_timeout: Duration,
     command_timeout: Duration,
     mapping_timeout: Duration,
     install_timeout: Duration,
@@ -557,6 +559,7 @@ impl fmt::Debug for AdbController {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("AdbController")
+            .field("device_timeout", &self.device_timeout)
             .field("command_timeout", &self.command_timeout)
             .field("stop_timeout", &self.stop_timeout)
             .field("poll_interval", &self.poll_interval)
@@ -566,12 +569,14 @@ impl fmt::Debug for AdbController {
 
 impl AdbController {
     pub fn new(executor: Arc<dyn AdbExecutor>) -> Self {
-        Self::with_timing(
+        let mut controller = Self::with_timing(
             executor,
             Duration::from_secs(8),
             Duration::from_secs(5),
             Duration::from_millis(100),
-        )
+        );
+        controller.device_timeout = ADB_DEVICE_COMMAND_TIMEOUT;
+        controller
     }
 
     pub fn with_timing(
@@ -582,6 +587,7 @@ impl AdbController {
     ) -> Self {
         Self {
             executor,
+            device_timeout: command_timeout,
             command_timeout,
             mapping_timeout: command_timeout.min(ADB_MAPPING_COMMAND_TIMEOUT),
             install_timeout: command_timeout.max(ADB_INSTALL_TIMEOUT),
@@ -591,7 +597,7 @@ impl AdbController {
     }
 
     pub fn install_matching_apk(&self, apk: &Path) -> Result<(), TransactionError> {
-        self.run_checked_with(&strings(&["-d", "get-state"]), self.mapping_timeout)
+        self.require_device()
             .map_err(|failure| TransactionError::single("device_check", failure))?;
         let args = vec![
             "-d".into(),
@@ -637,7 +643,7 @@ impl AdbController {
         all_traffic: bool,
     ) -> Result<StartReceipt, TransactionError> {
         let allowed_package = VIRTUAL_DESKTOP_PACKAGE;
-        self.run_checked_with(&strings(&["-d", "get-state"]), self.mapping_timeout)
+        self.require_device()
             .map_err(|failure| TransactionError::single("device_check", failure))?;
 
         let mut failures = Vec::new();
@@ -935,6 +941,28 @@ impl AdbController {
         self.run_checked_with(args, self.command_timeout)
     }
 
+    /// The first command after installing platform-tools may also have to
+    /// start the ADB server. Give that cold path its own deadline and retry a
+    /// single timeout; routine mapping probes remain independently bounded.
+    fn require_device(&self) -> Result<(), AdbError> {
+        let args = strings(&["-d", "get-state"]);
+        for attempt in 0..2 {
+            match self.run_checked_with(&args, self.device_timeout) {
+                Ok(output) if output.stdout.trim() == "device" => return Ok(()),
+                Ok(output) => {
+                    let state = output.stdout.trim();
+                    let state = if state.is_empty() { "unknown" } else { state };
+                    return Err(AdbError::DeviceNotReady(state.to_owned()));
+                }
+                Err(AdbError::Timeout(_)) if attempt == 0 => {
+                    thread::sleep(self.poll_interval);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("the bounded ADB device check always returns within two attempts")
+    }
+
     fn run_checked_with(&self, args: &[String], timeout: Duration) -> Result<AdbOutput, AdbError> {
         let output = self.executor.execute(args, timeout)?;
         if output.is_success() {
@@ -1051,6 +1079,8 @@ pub enum AdbError {
     Read(String),
     #[error("ADB exited with {status}: {stderr}")]
     CommandFailed { status: i32, stderr: String },
+    #[error("Quest ADB connection is {0}; reconnect the USB cable and accept the USB debugging prompt in the headset")]
+    DeviceNotReady(String),
     #[error("Android still reports an active VPN after the stop deadline")]
     VpnStillActive,
 }
@@ -1350,7 +1380,7 @@ mod tests {
             )),
             Ok(AdbOutput::success("Starting")),
         ]));
-        let receipt = controller(mock.clone())
+        let receipt = AdbController::new(mock.clone())
             .start(SessionId([0x11; 16]), false)
             .unwrap();
         assert_eq!(receipt.allowed_package, VIRTUAL_DESKTOP_PACKAGE);
@@ -1381,6 +1411,20 @@ mod tests {
         assert!(start
             .windows(3)
             .any(|arguments| { arguments == ["--es", "vdPackage", VIRTUAL_DESKTOP_PACKAGE] }));
+        drop(calls);
+        let timeouts = mock.timeouts.lock().unwrap();
+        assert!(timeouts.iter().any(|(args, timeout)| {
+            args.iter().map(String::as_str).eq(["-d", "get-state"])
+                && *timeout == ADB_DEVICE_COMMAND_TIMEOUT
+        }));
+        assert!(timeouts.iter().any(|(args, timeout)| {
+            args.iter().any(|argument| argument == "reverse")
+                && *timeout == ADB_MAPPING_COMMAND_TIMEOUT
+        }));
+        assert!(timeouts.iter().any(|(args, timeout)| {
+            args.iter().any(|argument| argument == ACTION_START_V4)
+                && *timeout == Duration::from_secs(8)
+        }));
     }
 
     #[test]
@@ -1485,8 +1529,46 @@ mod tests {
         }));
         assert!(timeouts.iter().any(|(args, timeout)| {
             args.iter().any(|argument| argument == "get-state")
-                && *timeout == ADB_MAPPING_COMMAND_TIMEOUT
+                && *timeout == ADB_DEVICE_COMMAND_TIMEOUT
         }));
+    }
+
+    #[test]
+    fn cold_device_timeout_is_retried_once_with_the_device_deadline() {
+        let mock = Arc::new(MockAdb::with_results(vec![
+            Err(AdbError::Timeout(ADB_DEVICE_COMMAND_TIMEOUT)),
+            Ok(AdbOutput::success("device")),
+            Ok(AdbOutput::success("Success")),
+            Ok(AdbOutput::success(
+                "versionCode=41 minSdk=29 targetSdk=36\nversionName=4.0.0-beta.2\n",
+            )),
+        ]));
+        AdbController::new(mock.clone())
+            .install_matching_apk(Path::new("embedded.apk"))
+            .unwrap();
+
+        let timeouts = mock.timeouts.lock().unwrap();
+        let device_checks: Vec<_> = timeouts
+            .iter()
+            .filter(|(args, _)| args.iter().map(String::as_str).eq(["-d", "get-state"]))
+            .collect();
+        assert_eq!(device_checks.len(), 2);
+        assert!(device_checks
+            .iter()
+            .all(|(_, timeout)| *timeout == ADB_DEVICE_COMMAND_TIMEOUT));
+    }
+
+    #[test]
+    fn unauthorized_device_fails_immediately_with_actionable_error() {
+        let mock = Arc::new(MockAdb::with_results(vec![Ok(AdbOutput::success(
+            "unauthorized",
+        ))]));
+        let error = AdbController::new(mock.clone())
+            .install_matching_apk(Path::new("embedded.apk"))
+            .unwrap_err();
+        assert_eq!(error.phase, "device_check");
+        assert!(error.failures[0].contains("accept the USB debugging prompt"));
+        assert_eq!(mock.calls.lock().unwrap().len(), 1);
     }
 
     #[test]

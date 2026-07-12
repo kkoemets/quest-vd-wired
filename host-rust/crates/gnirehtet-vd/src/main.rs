@@ -167,7 +167,7 @@ async fn execute_public_command(
 }
 
 #[cfg(any(target_os = "windows", test))]
-const BROKER_PROTOCOL_VERSION: u16 = 2;
+const BROKER_PROTOCOL_VERSION: u16 = 3;
 #[cfg(any(target_os = "windows", test))]
 const MAX_BROKER_FRAME: usize = 256 * 1024;
 #[cfg(any(target_os = "windows", test))]
@@ -1808,7 +1808,7 @@ mod tests {
 
     #[test]
     fn broker_deadlines_are_bounded_by_command_shape() {
-        assert_eq!(BROKER_PROTOCOL_VERSION, 2);
+        assert_eq!(BROKER_PROTOCOL_VERSION, 3);
         assert_eq!(
             BrokerCommand::Version.response_timeout(),
             Duration::from_secs(5)
