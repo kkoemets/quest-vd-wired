@@ -599,6 +599,13 @@ impl AdbController {
     pub fn install_matching_apk(&self, apk: &Path) -> Result<(), TransactionError> {
         self.require_device()
             .map_err(|failure| TransactionError::single("device_check", failure))?;
+        let package_args = strings(&["-d", "shell", "dumpsys", "package", ANDROID_PACKAGE]);
+        let installed = self
+            .run_checked(&package_args)
+            .map_err(|failure| TransactionError::single("apk_probe", failure))?;
+        if package_version_matches(&installed.stdout) {
+            return Ok(());
+        }
         let args = vec![
             "-d".into(),
             "install".into(),
@@ -608,25 +615,9 @@ impl AdbController {
         self.run_checked_with(&args, self.install_timeout)
             .map_err(|failure| TransactionError::single("apk_install", failure))?;
         let package = self
-            .run_checked(&strings(&[
-                "-d",
-                "shell",
-                "dumpsys",
-                "package",
-                ANDROID_PACKAGE,
-            ]))
+            .run_checked(&package_args)
             .map_err(|failure| TransactionError::single("apk_verify", failure))?;
-        let has_code = package.stdout.lines().any(|line| {
-            line.trim()
-                .strip_prefix("versionCode=")
-                .and_then(|value| value.split_whitespace().next())
-                == Some(ANDROID_VERSION_CODE)
-        });
-        let has_name = package
-            .stdout
-            .lines()
-            .any(|line| line.trim() == format!("versionName={ANDROID_VERSION_NAME}"));
-        if !has_code || !has_name {
+        if !package_version_matches(&package.stdout) {
             return Err(TransactionError::new(
                 "apk_verify",
                 vec![format!(
@@ -1128,6 +1119,19 @@ fn strings(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_owned()).collect()
 }
 
+fn package_version_matches(output: &str) -> bool {
+    let has_code = output.lines().any(|line| {
+        line.trim()
+            .strip_prefix("versionCode=")
+            .and_then(|value| value.split_whitespace().next())
+            == Some(ANDROID_VERSION_CODE)
+    });
+    let has_name = output
+        .lines()
+        .any(|line| line.trim() == format!("versionName={ANDROID_VERSION_NAME}"));
+    has_code && has_name
+}
+
 fn adb_reports_missing_device(error: &AdbError) -> bool {
     let message = error.to_string().to_ascii_lowercase();
     message.contains("no devices")
@@ -1137,7 +1141,7 @@ fn adb_reports_missing_device(error: &AdbError) -> bool {
 
 fn device_help(state: &str) -> String {
     format!(
-        "No Quest 3 is available through USB ({state}). Connect and unlock the headset with a USB data cable, then accept the USB debugging prompt and try again. To close this app without stopping a headset link, choose Exit tray only."
+        "No Quest 3 is available through USB ({state}). Connect and unlock the headset with a USB data cable, then accept the USB debugging prompt and try again."
     )
 }
 
@@ -1415,7 +1419,7 @@ mod tests {
         let error = controller(mock.clone()).stop().unwrap_err();
         assert_eq!(error.phase, "stop");
         assert_eq!(error.failures.len(), 1);
-        assert!(error.to_string().contains("Exit tray only"));
+        assert!(error.to_string().contains("Connect and unlock the headset"));
         let calls = mock.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert!(calls[0].iter().map(String::as_str).eq(["-d", "get-state"]));
@@ -1552,6 +1556,7 @@ mod tests {
     fn install_verifies_matching_package_version() {
         let mock = Arc::new(MockAdb::with_results(vec![
             Ok(AdbOutput::success("device")),
+            Ok(AdbOutput::success("Package not found")),
             Ok(AdbOutput::success("Success")),
             Ok(AdbOutput::success(
                 "versionCode=42 minSdk=29 targetSdk=36\nversionName=4.0.0-beta.3\n",
@@ -1591,6 +1596,7 @@ mod tests {
         let mock = Arc::new(MockAdb::with_results(vec![
             Err(AdbError::Timeout(ADB_DEVICE_COMMAND_TIMEOUT)),
             Ok(AdbOutput::success("device")),
+            Ok(AdbOutput::success("Package not found")),
             Ok(AdbOutput::success("Success")),
             Ok(AdbOutput::success(
                 "versionCode=42 minSdk=29 targetSdk=36\nversionName=4.0.0-beta.3\n",
@@ -1609,6 +1615,25 @@ mod tests {
         assert!(device_checks
             .iter()
             .all(|(_, timeout)| *timeout == ADB_DEVICE_COMMAND_TIMEOUT));
+    }
+
+    #[test]
+    fn matching_apk_is_not_reinstalled_during_retry() {
+        let mock = Arc::new(MockAdb::with_results(vec![
+            Ok(AdbOutput::success("device")),
+            Ok(AdbOutput::success(
+                "versionCode=42 minSdk=29 targetSdk=36\nversionName=4.0.0-beta.3\n",
+            )),
+        ]));
+        AdbController::new(mock.clone())
+            .install_matching_apk(Path::new("embedded.apk"))
+            .unwrap();
+
+        let calls = mock.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert!(!calls
+            .iter()
+            .any(|args| args.iter().any(|argument| argument == "install")));
     }
 
     #[test]
@@ -1637,7 +1662,6 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("Connect and unlock the headset"));
         assert!(message.contains("accept the USB debugging prompt"));
-        assert!(message.contains("Exit tray only"));
         assert!(!message.contains("[\""));
         assert_eq!(error.failures.len(), 1);
         assert_eq!(mock.calls.lock().unwrap().len(), 1);
