@@ -26,8 +26,8 @@ pub const ANDROID_VPN_SERVICE: &str = "com.genymobile.gnirehtet/.v4.VdLinkVpnSer
 pub const ACTION_START_V4: &str = "com.genymobile.gnirehtet.v4.START";
 pub const ACTION_STOP_V4: &str = "com.genymobile.gnirehtet.v4.STOP";
 pub const VIRTUAL_DESKTOP_PACKAGE: &str = "VirtualDesktop.Android";
-pub const ANDROID_VERSION_CODE: &str = "40";
-pub const ANDROID_VERSION_NAME: &str = "4.0.0-beta.1";
+pub const ANDROID_VERSION_CODE: &str = "43";
+pub const ANDROID_VERSION_NAME: &str = "4.0.0";
 pub const PLATFORM_TOOLS_VERSION: &str = "37.0.0";
 pub const PLATFORM_TOOLS_WINDOWS_URL: &str =
     "https://dl.google.com/android/repository/platform-tools_r37.0.0-win.zip";
@@ -36,7 +36,8 @@ pub const PLATFORM_TOOLS_WINDOWS_SHA256: &str =
 pub const SOCKS_PORT: u16 = 31_416;
 pub const CONTROL_PORT: u16 = 31_417;
 pub const UDP_STREAM_PORT: u16 = 31_418;
-pub const ADB_MAPPING_COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
+pub const ADB_DEVICE_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
+pub const ADB_MAPPING_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 const ADB_INSTALL_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_ADB_OUTPUT_BYTES: usize = 1024 * 1024;
 const OUTPUT_TRUNCATED_MARKER: &[u8] = b"\n[ADB output truncated]\n";
@@ -112,18 +113,30 @@ impl SystemAdb {
     }
 }
 
+fn hide_subprocess_window(command: &mut Command) {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = command;
+}
+
 impl AdbExecutor for SystemAdb {
     fn execute(&self, args: &[String], timeout: Duration) -> Result<AdbOutput, AdbError> {
-        let child = Command::new(&self.program)
+        let mut command = Command::new(&self.program);
+        command
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|source| AdbError::Spawn {
-                program: self.program.clone(),
-                source,
-            })?;
+            .stderr(Stdio::piped());
+        hide_subprocess_window(&mut command);
+        let child = command.spawn().map_err(|source| AdbError::Spawn {
+            program: self.program.clone(),
+            source,
+        })?;
         collect_child_output(child, timeout)
     }
 }
@@ -534,6 +547,7 @@ impl Drop for CommandContainment {
 #[derive(Clone)]
 pub struct AdbController {
     executor: Arc<dyn AdbExecutor>,
+    device_timeout: Duration,
     command_timeout: Duration,
     mapping_timeout: Duration,
     install_timeout: Duration,
@@ -545,6 +559,7 @@ impl fmt::Debug for AdbController {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("AdbController")
+            .field("device_timeout", &self.device_timeout)
             .field("command_timeout", &self.command_timeout)
             .field("stop_timeout", &self.stop_timeout)
             .field("poll_interval", &self.poll_interval)
@@ -554,12 +569,14 @@ impl fmt::Debug for AdbController {
 
 impl AdbController {
     pub fn new(executor: Arc<dyn AdbExecutor>) -> Self {
-        Self::with_timing(
+        let mut controller = Self::with_timing(
             executor,
             Duration::from_secs(8),
             Duration::from_secs(5),
             Duration::from_millis(100),
-        )
+        );
+        controller.device_timeout = ADB_DEVICE_COMMAND_TIMEOUT;
+        controller
     }
 
     pub fn with_timing(
@@ -570,6 +587,7 @@ impl AdbController {
     ) -> Self {
         Self {
             executor,
+            device_timeout: command_timeout,
             command_timeout,
             mapping_timeout: command_timeout.min(ADB_MAPPING_COMMAND_TIMEOUT),
             install_timeout: command_timeout.max(ADB_INSTALL_TIMEOUT),
@@ -579,8 +597,15 @@ impl AdbController {
     }
 
     pub fn install_matching_apk(&self, apk: &Path) -> Result<(), TransactionError> {
-        self.run_checked_with(&strings(&["-d", "get-state"]), self.mapping_timeout)
+        self.require_device()
             .map_err(|failure| TransactionError::single("device_check", failure))?;
+        let package_args = strings(&["-d", "shell", "dumpsys", "package", ANDROID_PACKAGE]);
+        let installed = self
+            .run_checked(&package_args)
+            .map_err(|failure| TransactionError::single("apk_probe", failure))?;
+        if package_version_matches(&installed.stdout) {
+            return Ok(());
+        }
         let args = vec![
             "-d".into(),
             "install".into(),
@@ -590,25 +615,9 @@ impl AdbController {
         self.run_checked_with(&args, self.install_timeout)
             .map_err(|failure| TransactionError::single("apk_install", failure))?;
         let package = self
-            .run_checked(&strings(&[
-                "-d",
-                "shell",
-                "dumpsys",
-                "package",
-                ANDROID_PACKAGE,
-            ]))
+            .run_checked(&package_args)
             .map_err(|failure| TransactionError::single("apk_verify", failure))?;
-        let has_code = package.stdout.lines().any(|line| {
-            line.trim()
-                .strip_prefix("versionCode=")
-                .and_then(|value| value.split_whitespace().next())
-                == Some(ANDROID_VERSION_CODE)
-        });
-        let has_name = package
-            .stdout
-            .lines()
-            .any(|line| line.trim() == format!("versionName={ANDROID_VERSION_NAME}"));
-        if !has_code || !has_name {
+        if !package_version_matches(&package.stdout) {
             return Err(TransactionError::new(
                 "apk_verify",
                 vec![format!(
@@ -625,7 +634,7 @@ impl AdbController {
         all_traffic: bool,
     ) -> Result<StartReceipt, TransactionError> {
         let allowed_package = VIRTUAL_DESKTOP_PACKAGE;
-        self.run_checked_with(&strings(&["-d", "get-state"]), self.mapping_timeout)
+        self.require_device()
             .map_err(|failure| TransactionError::single("device_check", failure))?;
 
         let mut failures = Vec::new();
@@ -723,6 +732,8 @@ impl AdbController {
     /// then removes every product-owned reverse mapping. Mapping cleanup is
     /// attempted even when the stop request or verification fails.
     pub fn stop(&self) -> Result<(), TransactionError> {
+        self.require_device()
+            .map_err(|failure| TransactionError::single("stop", failure))?;
         let mut failures = Vec::new();
         let args = strings(&[
             "-d",
@@ -923,6 +934,34 @@ impl AdbController {
         self.run_checked_with(args, self.command_timeout)
     }
 
+    /// The first command after installing platform-tools may also have to
+    /// start the ADB server. Give that cold path its own deadline and retry a
+    /// single timeout; routine mapping probes remain independently bounded.
+    fn require_device(&self) -> Result<(), AdbError> {
+        let args = strings(&["-d", "get-state"]);
+        for attempt in 0..2 {
+            match self.run_checked_with(&args, self.device_timeout) {
+                Ok(output) if output.stdout.trim() == "device" => return Ok(()),
+                Ok(output) => {
+                    let state = output.stdout.trim();
+                    let state = if state.is_empty() { "unknown" } else { state };
+                    return Err(AdbError::DeviceNotReady(device_help(state)));
+                }
+                Err(AdbError::Timeout(_)) if attempt == 0 => {
+                    thread::sleep(self.poll_interval);
+                }
+                Err(error) if adb_reports_missing_device(&error) => {
+                    return Err(AdbError::DeviceNotReady(device_help("not found")));
+                }
+                Err(AdbError::Timeout(_)) => {
+                    return Err(AdbError::DeviceNotReady(device_help("not responding")));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("the bounded ADB device check always returns within two attempts")
+    }
+
     fn run_checked_with(&self, args: &[String], timeout: Duration) -> Result<AdbOutput, AdbError> {
         let output = self.executor.execute(args, timeout)?;
         if output.is_success() {
@@ -1039,16 +1078,32 @@ pub enum AdbError {
     Read(String),
     #[error("ADB exited with {status}: {stderr}")]
     CommandFailed { status: i32, stderr: String },
+    #[error("{0}")]
+    DeviceNotReady(String),
     #[error("Android still reports an active VPN after the stop deadline")]
     VpnStillActive,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Error)]
-#[error("ADB {phase} transaction failed: {failures:?}")]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransactionError {
     pub phase: &'static str,
     pub failures: Vec<String>,
 }
+
+impl fmt::Display for TransactionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "ADB {} failed", self.phase)?;
+        if let [failure] = self.failures.as_slice() {
+            write!(formatter, ": {failure}")
+        } else if !self.failures.is_empty() {
+            write!(formatter, ": {}", self.failures.join("; "))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl std::error::Error for TransactionError {}
 
 impl TransactionError {
     fn new(phase: &'static str, failures: Vec<String>) -> Self {
@@ -1062,6 +1117,32 @@ impl TransactionError {
 
 fn strings(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_owned()).collect()
+}
+
+fn package_version_matches(output: &str) -> bool {
+    let has_code = output.lines().any(|line| {
+        line.trim()
+            .strip_prefix("versionCode=")
+            .and_then(|value| value.split_whitespace().next())
+            == Some(ANDROID_VERSION_CODE)
+    });
+    let has_name = output
+        .lines()
+        .any(|line| line.trim() == format!("versionName={ANDROID_VERSION_NAME}"));
+    has_code && has_name
+}
+
+fn adb_reports_missing_device(error: &AdbError) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("no devices")
+        || message.contains("no device")
+        || message.contains("device not found")
+}
+
+fn device_help(state: &str) -> String {
+    format!(
+        "No Quest 3 is available through USB ({state}). Connect and unlock the headset with a USB data cable, then accept the USB debugging prompt and try again."
+    )
 }
 
 fn mapping_was_already_absent(output: &AdbOutput) -> bool {
@@ -1140,7 +1221,8 @@ pub fn repair_adb_if_missing(
     }
     let archive = app_root.join(format!("platform-tools-{PLATFORM_TOOLS_VERSION}-win.zip"));
     let script = "$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; Invoke-WebRequest -Uri $env:GNR4_ADB_URL -OutFile $env:GNR4_ADB_ARCHIVE; $actual=(Get-FileHash -Algorithm SHA256 -LiteralPath $env:GNR4_ADB_ARCHIVE).Hash.ToLowerInvariant(); if($actual -ne $env:GNR4_ADB_SHA){Remove-Item -Force $env:GNR4_ADB_ARCHIVE -ErrorAction SilentlyContinue; throw ('SHA-256 mismatch: '+$actual)}; Expand-Archive -LiteralPath $env:GNR4_ADB_ARCHIVE -DestinationPath $env:GNR4_ADB_DEST -Force";
-    let child = Command::new("powershell.exe")
+    let mut command = Command::new("powershell.exe");
+    command
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -1155,8 +1237,9 @@ pub fn repair_adb_if_missing(
         .env("GNR4_ADB_DEST", &install_root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    hide_subprocess_window(&mut command);
+    let child = command.spawn()?;
     let output = collect_child_output(child, PLATFORM_TOOLS_DOWNLOAD_TIMEOUT)
         .map_err(|error| AdbBootstrapError::PowerShell(error.to_string()))?;
     let _ = fs::remove_file(&archive);
@@ -1290,6 +1373,7 @@ mod tests {
     #[test]
     fn stop_cleanup_runs_even_when_stop_request_fails() {
         let mock = Arc::new(MockAdb::with_results(vec![
+            Ok(AdbOutput::success("device")),
             Ok(AdbOutput {
                 status: 1,
                 stdout: String::new(),
@@ -1314,6 +1398,7 @@ mod tests {
     #[test]
     fn already_stopped_is_idempotent_even_if_activity_command_fails() {
         let mock = Arc::new(MockAdb::with_results(vec![
+            Ok(AdbOutput::success("device")),
             Ok(AdbOutput {
                 status: 1,
                 stdout: String::new(),
@@ -1322,6 +1407,22 @@ mod tests {
             Ok(AdbOutput::success("No services match")),
         ]));
         controller(mock).stop().unwrap();
+    }
+
+    #[test]
+    fn stop_without_a_device_returns_one_error_and_skips_teardown_commands() {
+        let mock = Arc::new(MockAdb::with_results(vec![Ok(AdbOutput {
+            status: 1,
+            stdout: String::new(),
+            stderr: "adb.exe: no devices found".into(),
+        })]));
+        let error = controller(mock.clone()).stop().unwrap_err();
+        assert_eq!(error.phase, "stop");
+        assert_eq!(error.failures.len(), 1);
+        assert!(error.to_string().contains("Connect and unlock the headset"));
+        let calls = mock.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].iter().map(String::as_str).eq(["-d", "get-state"]));
     }
 
     #[test]
@@ -1336,7 +1437,7 @@ mod tests {
             )),
             Ok(AdbOutput::success("Starting")),
         ]));
-        let receipt = controller(mock.clone())
+        let receipt = AdbController::new(mock.clone())
             .start(SessionId([0x11; 16]), false)
             .unwrap();
         assert_eq!(receipt.allowed_package, VIRTUAL_DESKTOP_PACKAGE);
@@ -1367,6 +1468,20 @@ mod tests {
         assert!(start
             .windows(3)
             .any(|arguments| { arguments == ["--es", "vdPackage", VIRTUAL_DESKTOP_PACKAGE] }));
+        drop(calls);
+        let timeouts = mock.timeouts.lock().unwrap();
+        assert!(timeouts.iter().any(|(args, timeout)| {
+            args.iter().map(String::as_str).eq(["-d", "get-state"])
+                && *timeout == ADB_DEVICE_COMMAND_TIMEOUT
+        }));
+        assert!(timeouts.iter().any(|(args, timeout)| {
+            args.iter().any(|argument| argument == "reverse")
+                && *timeout == ADB_MAPPING_COMMAND_TIMEOUT
+        }));
+        assert!(timeouts.iter().any(|(args, timeout)| {
+            args.iter().any(|argument| argument == ACTION_START_V4)
+                && *timeout == Duration::from_secs(8)
+        }));
     }
 
     #[test]
@@ -1441,9 +1556,10 @@ mod tests {
     fn install_verifies_matching_package_version() {
         let mock = Arc::new(MockAdb::with_results(vec![
             Ok(AdbOutput::success("device")),
+            Ok(AdbOutput::success("Package not found")),
             Ok(AdbOutput::success("Success")),
             Ok(AdbOutput::success(
-                "versionCode=40 minSdk=29 targetSdk=36\nversionName=4.0.0-beta.1\n",
+                "versionCode=43 minSdk=29 targetSdk=36\nversionName=4.0.0\n",
             )),
         ]));
         AdbController::new(mock.clone())
@@ -1471,8 +1587,84 @@ mod tests {
         }));
         assert!(timeouts.iter().any(|(args, timeout)| {
             args.iter().any(|argument| argument == "get-state")
-                && *timeout == ADB_MAPPING_COMMAND_TIMEOUT
+                && *timeout == ADB_DEVICE_COMMAND_TIMEOUT
         }));
+    }
+
+    #[test]
+    fn cold_device_timeout_is_retried_once_with_the_device_deadline() {
+        let mock = Arc::new(MockAdb::with_results(vec![
+            Err(AdbError::Timeout(ADB_DEVICE_COMMAND_TIMEOUT)),
+            Ok(AdbOutput::success("device")),
+            Ok(AdbOutput::success("Package not found")),
+            Ok(AdbOutput::success("Success")),
+            Ok(AdbOutput::success(
+                "versionCode=43 minSdk=29 targetSdk=36\nversionName=4.0.0\n",
+            )),
+        ]));
+        AdbController::new(mock.clone())
+            .install_matching_apk(Path::new("embedded.apk"))
+            .unwrap();
+
+        let timeouts = mock.timeouts.lock().unwrap();
+        let device_checks: Vec<_> = timeouts
+            .iter()
+            .filter(|(args, _)| args.iter().map(String::as_str).eq(["-d", "get-state"]))
+            .collect();
+        assert_eq!(device_checks.len(), 2);
+        assert!(device_checks
+            .iter()
+            .all(|(_, timeout)| *timeout == ADB_DEVICE_COMMAND_TIMEOUT));
+    }
+
+    #[test]
+    fn matching_apk_is_not_reinstalled_during_retry() {
+        let mock = Arc::new(MockAdb::with_results(vec![
+            Ok(AdbOutput::success("device")),
+            Ok(AdbOutput::success(
+                "versionCode=43 minSdk=29 targetSdk=36\nversionName=4.0.0\n",
+            )),
+        ]));
+        AdbController::new(mock.clone())
+            .install_matching_apk(Path::new("embedded.apk"))
+            .unwrap();
+
+        let calls = mock.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert!(!calls
+            .iter()
+            .any(|args| args.iter().any(|argument| argument == "install")));
+    }
+
+    #[test]
+    fn unauthorized_device_fails_immediately_with_actionable_error() {
+        let mock = Arc::new(MockAdb::with_results(vec![Ok(AdbOutput::success(
+            "unauthorized",
+        ))]));
+        let error = AdbController::new(mock.clone())
+            .install_matching_apk(Path::new("embedded.apk"))
+            .unwrap_err();
+        assert_eq!(error.phase, "device_check");
+        assert!(error.failures[0].contains("accept the USB debugging prompt"));
+        assert_eq!(mock.calls.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn missing_device_has_one_concise_layman_friendly_error() {
+        let mock = Arc::new(MockAdb::with_results(vec![Ok(AdbOutput {
+            status: 1,
+            stdout: String::new(),
+            stderr: "error: no devices found".into(),
+        })]));
+        let error = AdbController::new(mock.clone())
+            .install_matching_apk(Path::new("embedded.apk"))
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("Connect and unlock the headset"));
+        assert!(message.contains("accept the USB debugging prompt"));
+        assert!(!message.contains("[\""));
+        assert_eq!(error.failures.len(), 1);
+        assert_eq!(mock.calls.lock().unwrap().len(), 1);
     }
 
     #[test]

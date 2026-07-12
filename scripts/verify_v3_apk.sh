@@ -56,7 +56,7 @@ if [[ "$package_name" != "com.genymobile.gnirehtet" ]]; then
     exit 1
 fi
 if [[ "$version_code" != "11" || "$version_name" != "3.1.0" ]]; then
-    echo "APK version is not the exact v3.1 Standard identity" >&2
+    echo "APK version is not the exact v3.1 Legacy identity" >&2
     exit 1
 fi
 if [[ "$min_sdk" != "21" || "$target_sdk" != "29" ]]; then
@@ -64,6 +64,6 @@ if [[ "$min_sdk" != "21" || "$target_sdk" != "29" ]]; then
     exit 1
 fi
 if [[ "$debuggable" != "false" ]]; then
-    echo "v3.1 Standard APK is debuggable" >&2
+    echo "v3.1 Legacy APK is debuggable" >&2
     exit 1
 fi

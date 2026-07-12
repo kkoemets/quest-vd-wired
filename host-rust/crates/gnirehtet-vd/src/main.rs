@@ -13,7 +13,9 @@ use std::io::Write;
 use std::sync::Mutex as StdMutex;
 
 #[cfg(any(target_os = "windows", test))]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
+#[cfg(target_os = "windows")]
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize};
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -167,7 +169,7 @@ async fn execute_public_command(
 }
 
 #[cfg(any(target_os = "windows", test))]
-const BROKER_PROTOCOL_VERSION: u16 = 1;
+const BROKER_PROTOCOL_VERSION: u16 = 6;
 #[cfg(any(target_os = "windows", test))]
 const MAX_BROKER_FRAME: usize = 256 * 1024;
 #[cfg(any(target_os = "windows", test))]
@@ -197,6 +199,7 @@ impl BrokerGate {
         Some(BrokerCommandGuard(self.clone()))
     }
 
+    #[cfg(test)]
     fn begin_shutdown(&self) -> bool {
         let Ok(mut state) = self.0.lock() else {
             return false;
@@ -208,6 +211,7 @@ impl BrokerGate {
         true
     }
 
+    #[cfg(test)]
     fn cancel_shutdown(&self) {
         if let Ok(mut state) = self.0.lock() {
             state.shutting_down = false;
@@ -279,7 +283,8 @@ impl BrokerCommand {
 
     fn response_timeout(&self) -> Duration {
         match self {
-            Self::Start { .. } => Duration::from_secs(180),
+            // First Start may also download and verify Android platform-tools.
+            Self::Start { .. } => Duration::from_secs(15 * 60),
             Self::Stop => Duration::from_secs(30),
             Self::Status { .. } | Self::Doctor => Duration::from_secs(15),
             // The checksum-verified platform-tools bootstrap has its own
@@ -413,6 +418,7 @@ where
 struct BrokerContext {
     paths: AppPaths,
     environment: Arc<StdMutex<BrokerEnvironment>>,
+    adb_lane: Arc<tokio::sync::Mutex<()>>,
     gate: BrokerGate,
 }
 
@@ -429,6 +435,7 @@ impl BrokerContext {
         Self {
             paths,
             environment: Arc::new(StdMutex::new(BrokerEnvironment { adb_program, adb })),
+            adb_lane: Arc::new(tokio::sync::Mutex::new(())),
             gate,
         }
     }
@@ -451,19 +458,62 @@ impl BrokerContext {
         Ok(adb)
     }
 
-    async fn execute(&self, command: Command) -> Result<String> {
+    fn ensure_adb(&self) -> Result<BrokerEnvironment> {
+        self.ensure_adb_with(|program, root| Ok(repair_adb_if_missing(program, root)?))
+    }
+
+    fn ensure_adb_with<F>(&self, repair: F) -> Result<BrokerEnvironment>
+    where
+        F: FnOnce(PathBuf, &std::path::Path) -> Result<PathBuf>,
+    {
         let environment = self.environment()?;
+        let adb_program = repair(environment.adb_program.clone(), &self.paths.root)?;
+        if adb_program == environment.adb_program {
+            return Ok(environment);
+        }
+        let adb = self.replace_adb(adb_program.clone())?;
+        Ok(BrokerEnvironment { adb_program, adb })
+    }
+
+    async fn execute(&self, command: Command) -> Result<String> {
         match command {
+            Command::Version => Ok(format!("gnirehtet-vd {} (GNR4)", env!("CARGO_PKG_VERSION"))),
+            Command::Diagnostics(DiagnosticsArgs {
+                command: DiagnosticsCommand::Export { path },
+            }) => {
+                let diagnostics = Diagnostics::open(&self.paths.logs)?;
+                let exported = diagnostics.export(path)?;
+                Ok(format!(
+                    "redacted support bundle written to {}",
+                    exported.display()
+                ))
+            }
+            Command::Diagnostics(DiagnosticsArgs {
+                command: DiagnosticsCommand::Capture { duration },
+            }) => self.capture_diagnostics(duration).await,
+            command => self.execute_adb_command(command).await,
+        }
+    }
+
+    async fn execute_adb_command(&self, command: Command) -> Result<String> {
+        let _adb_lane = self.adb_lane.lock().await;
+        match command {
+            Command::Start(args) => {
+                let environment = self.ensure_adb()?;
+                start(
+                    &environment.adb_program,
+                    &self.paths,
+                    &environment.adb,
+                    args,
+                )
+                .await
+            }
             Command::Repair => {
-                let repaired_program =
-                    repair_adb_if_missing(environment.adb_program, &self.paths.root)?;
-                // Publish the verified executable before mapping repair. Even
-                // if the device-side repair then fails, later broker requests
-                // must use the ADB installation that was verified/downloaded.
-                let repaired_adb = self.replace_adb(repaired_program)?;
-                repair(&self.paths, &repaired_adb)
+                let environment = self.ensure_adb()?;
+                repair(&self.paths, &environment.adb)
             }
             command => {
+                let environment = self.environment()?;
                 execute_public_command(
                     &environment.adb_program,
                     &self.paths,
@@ -472,6 +522,53 @@ impl BrokerContext {
                 )
                 .await
             }
+        }
+    }
+
+    async fn capture_diagnostics(&self, duration: u64) -> Result<String> {
+        let diagnostics = Diagnostics::open(&self.paths.logs)?;
+        let deadline = Instant::now() + Duration::from_secs(duration);
+        while Instant::now() < deadline {
+            {
+                let _adb_lane = self.adb_lane.lock().await;
+                let environment = self.environment()?;
+                diagnostics.capture_process_sample()?;
+                diagnostics.record(
+                    "doctor_snapshot",
+                    serde_json::to_value(doctor(&environment.adb))?,
+                )?;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        Ok(format!("captured {duration}s of local diagnostics"))
+    }
+
+    #[cfg(target_os = "windows")]
+    async fn diagnose_and_fix(&self, desired_on: bool) -> Result<String> {
+        let _adb_lane = self.adb_lane.lock().await;
+        let environment = self.ensure_adb()?;
+        let daemon_running =
+            read_daemon_pid(&self.paths.daemon_pid).is_some_and(process_is_running);
+        if desired_on {
+            if daemon_running || runtime_may_be_active(&self.paths) {
+                stop(&self.paths, &environment.adb).await?;
+            }
+            if !tray_desired_on() || tray_exit_requested() {
+                return Ok("wired link left off as requested".into());
+            }
+            start(
+                &environment.adb_program,
+                &self.paths,
+                &environment.adb,
+                StartArgs { all_traffic: false },
+            )
+            .await
+        } else {
+            let report = doctor(&environment.adb);
+            if let Err(error) = report.adb_state {
+                bail!("Quest connection check failed: {error}");
+            }
+            Ok("ADB and local tools are ready".into())
         }
     }
 }
@@ -506,10 +603,22 @@ where
         )
     } else {
         match request.command.into_public_command() {
-            Ok(command) => match context.execute(command).await {
-                Ok(output) => BrokerResponse::success(output),
-                Err(error) => BrokerResponse::failure(format!("{error:#}")),
-            },
+            Ok(command) => {
+                #[cfg(target_os = "windows")]
+                let result = match WINDOWS_TRAY_COORDINATOR.get() {
+                    Some(coordinator) if command_requires_lifecycle_serialization(&command) => {
+                        coordinator.execute_external(command).await
+                    }
+                    None => context.execute(command).await,
+                    Some(_) => context.execute(command).await,
+                };
+                #[cfg(not(target_os = "windows"))]
+                let result = context.execute(command).await;
+                match result {
+                    Ok(output) => BrokerResponse::success(output),
+                    Err(error) => BrokerResponse::failure(format!("{error:#}")),
+                }
+            }
             Err(error) => BrokerResponse::failure(error),
         }
     };
@@ -520,6 +629,11 @@ where
     .await
     .context("broker response timed out")??;
     Ok(())
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn command_requires_lifecycle_serialization(command: &Command) -> bool {
+    matches!(command, Command::Start(_) | Command::Stop | Command::Repair)
 }
 
 #[cfg(target_os = "windows")]
@@ -546,23 +660,6 @@ async fn serve_broker(
 }
 
 #[cfg(target_os = "windows")]
-fn broker_is_present() -> Result<bool> {
-    use tokio::net::windows::named_pipe::ClientOptions;
-    use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY};
-
-    let name = gnirehtet_vd::runtime::windows_broker_pipe_name()?;
-    match ClientOptions::new().open(&name) {
-        Ok(client) => {
-            drop(client);
-            Ok(true)
-        }
-        Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => Ok(true),
-        Err(error) if error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) => Ok(false),
-        Err(error) => Err(error).context("probing the per-user broker pipe"),
-    }
-}
-
-#[cfg(target_os = "windows")]
 fn spawn_broker_process(paths: &AppPaths, adb_program: &std::path::Path) -> Result<()> {
     use std::os::windows::process::CommandExt;
 
@@ -585,35 +682,40 @@ fn spawn_broker_process(paths: &AppPaths, adb_program: &std::path::Path) -> Resu
 }
 
 #[cfg(target_os = "windows")]
-async fn open_broker_client(
+async fn open_or_start_broker_client<F>(
+    name: &str,
     wait: Duration,
-) -> Result<tokio::net::windows::named_pipe::NamedPipeClient> {
+    start: F,
+) -> Result<tokio::net::windows::named_pipe::NamedPipeClient>
+where
+    F: FnOnce() -> Result<()>,
+{
     use tokio::net::windows::named_pipe::ClientOptions;
     use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY};
 
-    let name = gnirehtet_vd::runtime::windows_broker_pipe_name()?;
+    let mut start = Some(start);
     let operation = async {
         loop {
-            match ClientOptions::new().open(&name) {
+            match ClientOptions::new().open(name) {
                 Ok(client) => return Ok(client),
-                Err(error)
-                    if matches!(
-                        error.raw_os_error(),
-                        Some(code)
-                            if code == ERROR_FILE_NOT_FOUND as i32
-                                || code == ERROR_PIPE_BUSY as i32
-                    ) =>
-                {
-                    tokio::time::sleep(Duration::from_millis(25)).await;
+                Err(error) if error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) => {
+                    if let Some(start) = start.take() {
+                        start().context("starting the per-user command broker")?;
+                    }
                 }
-                Err(error) => return Err(error),
+                Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => {}
+                Err(error) => {
+                    return Err(
+                        anyhow::Error::new(error).context("opening the per-user broker pipe")
+                    )
+                }
             }
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
     };
     tokio::time::timeout(wait, operation)
         .await
         .context("timed out waiting for the per-user command broker")?
-        .context("opening the per-user broker pipe")
 }
 
 #[cfg(target_os = "windows")]
@@ -622,9 +724,6 @@ async fn send_broker_command(
     adb_program: &std::path::Path,
     command: BrokerCommand,
 ) -> Result<BrokerResponse> {
-    if !broker_is_present()? {
-        spawn_broker_process(paths, adb_program)?;
-    }
     let response_timeout = command.response_timeout();
     let request = BrokerRequest {
         protocol_version: BROKER_PROTOCOL_VERSION,
@@ -633,14 +732,19 @@ async fn send_broker_command(
         command,
     };
     let operation = async {
-        let mut stream = open_broker_client(Duration::from_secs(5)).await?;
+        let name = gnirehtet_vd::runtime::windows_broker_pipe_name()?;
+        let mut stream = open_or_start_broker_client(&name, Duration::from_secs(5), || {
+            spawn_broker_process(paths, adb_program)
+        })
+        .await?;
         write_broker_frame(&mut stream, &request).await?;
         let response: BrokerResponse = read_broker_frame(&mut stream).await?;
         if response.protocol_version != BROKER_PROTOCOL_VERSION {
             bail!(
-                "broker response protocol mismatch: expected {}, got {}",
+                "another Gnirehtet VD version is already running (broker protocol {}, expected {}); turn Wired link off, choose Exit, then start {}",
+                response.protocol_version,
                 BROKER_PROTOCOL_VERSION,
-                response.protocol_version
+                env!("CARGO_PKG_VERSION")
             );
         }
         Ok(response)
@@ -981,7 +1085,8 @@ fn spawn_daemon(adb: &std::path::Path, paths: &AppPaths, session: SessionId) -> 
         use std::os::windows::process::CommandExt;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         const DETACHED_PROCESS: u32 = 0x0000_0008;
-        command.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS | CREATE_NO_WINDOW);
     }
     command.spawn().context("starting host daemon")
 }
@@ -1061,6 +1166,11 @@ async fn no_argument_entry(
             windows_sys::Win32::System::Console::FreeConsole();
         }
         let Some(instance) = acquire_tray_instance()? else {
+            if let Err(error) =
+                send_broker_command(&paths, &adb_program, BrokerCommand::Version).await
+            {
+                show_windows_message("Gnirehtet VD could not start", &format!("{error:#}"));
+            }
             return Ok(());
         };
         let class_name = instance.class_name.clone();
@@ -1069,8 +1179,14 @@ async fn no_argument_entry(
         let server = prepare_broker_pipe()?;
         let gate = BrokerGate::default();
         let context = BrokerContext::new(paths, adb_program, adb, gate.clone());
-        let mut broker = tokio::spawn(serve_broker(server, context));
-        let mut tray = tokio::task::spawn_blocking(move || run_windows_tray(instance, gate));
+        let broker_context = context.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let coordinator = TrayCoordinatorHandle::spawn(context.clone(), runtime.clone());
+        WINDOWS_TRAY_COORDINATOR
+            .set(coordinator)
+            .map_err(|_| anyhow::Error::msg("tray coordinator was initialized more than once"))?;
+        let mut broker = tokio::spawn(serve_broker(server, broker_context));
+        let mut tray = tokio::task::spawn_blocking(move || run_windows_tray(instance, context));
         tokio::select! {
             tray_result = &mut tray => {
                 broker.abort();
@@ -1105,68 +1221,638 @@ async fn no_argument_entry(
 #[cfg(any(target_os = "windows", test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TrayCommand {
-    Status,
-    Start,
-    Stop,
-    Repair,
+    ToggleLink,
+    DiagnoseAndFix,
     Exit,
 }
 
 #[cfg(any(target_os = "windows", test))]
-const TRAY_STATUS_ID: usize = 1_001;
+const TRAY_TOGGLE_ID: usize = 1_001;
 #[cfg(any(target_os = "windows", test))]
-const TRAY_START_ID: usize = 1_002;
+const TRAY_DIAGNOSE_ID: usize = 1_002;
 #[cfg(any(target_os = "windows", test))]
-const TRAY_STOP_ID: usize = 1_003;
-#[cfg(any(target_os = "windows", test))]
-const TRAY_EXIT_ID: usize = 1_004;
-#[cfg(any(target_os = "windows", test))]
-const TRAY_REPAIR_ID: usize = 1_005;
+const TRAY_EXIT_ID: usize = 1_003;
 
 #[cfg(any(target_os = "windows", test))]
 fn tray_command_from_id(id: usize) -> Option<TrayCommand> {
     match id {
-        TRAY_STATUS_ID => Some(TrayCommand::Status),
-        TRAY_START_ID => Some(TrayCommand::Start),
-        TRAY_STOP_ID => Some(TrayCommand::Stop),
-        TRAY_REPAIR_ID => Some(TrayCommand::Repair),
+        TRAY_TOGGLE_ID => Some(TrayCommand::ToggleLink),
+        TRAY_DIAGNOSE_ID => Some(TrayCommand::DiagnoseAndFix),
         TRAY_EXIT_ID => Some(TrayCommand::Exit),
         _ => None,
     }
 }
 
-#[cfg(any(target_os = "windows", test))]
-fn tray_command_arguments(command: TrayCommand) -> Option<&'static [&'static str]> {
+#[cfg(target_os = "windows")]
+fn tray_command_id(command: TrayCommand) -> usize {
     match command {
-        TrayCommand::Status => Some(&["status"]),
-        TrayCommand::Start => Some(&["start"]),
-        TrayCommand::Stop => Some(&["stop"]),
-        TrayCommand::Repair => Some(&["repair"]),
-        TrayCommand::Exit => None,
+        TrayCommand::ToggleLink => TRAY_TOGGLE_ID,
+        TrayCommand::DiagnoseAndFix => TRAY_DIAGNOSE_ID,
+        TrayCommand::Exit => TRAY_EXIT_ID,
     }
 }
 
 #[cfg(any(target_os = "windows", test))]
-fn begin_tray_command(in_flight: &AtomicBool) -> bool {
-    in_flight
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok()
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TrayMenuEntry {
+    command: Option<TrayCommand>,
+    label: Option<&'static str>,
+    checked: bool,
 }
 
 #[cfg(any(target_os = "windows", test))]
-fn begin_tray_shutdown(in_flight: &AtomicBool, gate: &BrokerGate) -> bool {
-    !in_flight.load(Ordering::Acquire) && gate.begin_shutdown()
+fn tray_menu_entries(desired_on: bool) -> [TrayMenuEntry; 4] {
+    [
+        TrayMenuEntry {
+            command: Some(TrayCommand::ToggleLink),
+            label: Some("Wired link"),
+            checked: desired_on,
+        },
+        TrayMenuEntry {
+            command: Some(TrayCommand::DiagnoseAndFix),
+            label: Some("Diagnose and fix"),
+            checked: false,
+        },
+        TrayMenuEntry {
+            command: None,
+            label: None,
+            checked: false,
+        },
+        TrayMenuEntry {
+            command: Some(TrayCommand::Exit),
+            label: Some("Exit"),
+            checked: false,
+        },
+    ]
 }
 
 #[cfg(target_os = "windows")]
-static TRAY_COMMAND_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+static WINDOWS_TRAY_RUNTIME: std::sync::OnceLock<WindowsTrayRuntime> = std::sync::OnceLock::new();
 #[cfg(target_os = "windows")]
-static WINDOWS_BROKER_GATE: std::sync::OnceLock<BrokerGate> = std::sync::OnceLock::new();
+static WINDOWS_TRAY_COORDINATOR: std::sync::OnceLock<TrayCoordinatorHandle> =
+    std::sync::OnceLock::new();
+#[cfg(target_os = "windows")]
+static WINDOWS_TRAY_ICONS: std::sync::OnceLock<WindowsTrayIcons> = std::sync::OnceLock::new();
+#[cfg(target_os = "windows")]
+static TRAY_INTENT: AtomicU8 = AtomicU8::new(if TRAY_DEFAULT_ON {
+    TRAY_INTENT_ON
+} else {
+    TRAY_INTENT_OFF
+});
+#[cfg(target_os = "windows")]
+static TRAY_DIAGNOSE_ACTIVE: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "windows")]
+static TRAY_WINDOW: AtomicUsize = AtomicUsize::new(0);
+#[cfg(target_os = "windows")]
+static TRAY_LAST_ERROR: StdMutex<Option<String>> = StdMutex::new(None);
+
+#[cfg(any(target_os = "windows", test))]
+const TRAY_ICON_OFF_ICO: &[u8] = include_bytes!("../assets/tray-off.ico");
+#[cfg(any(target_os = "windows", test))]
+const TRAY_ICON_ON_ICO: &[u8] = include_bytes!("../assets/tray-on.ico");
+#[cfg(any(target_os = "windows", test))]
+const TRAY_DEFAULT_ON: bool = true;
+#[cfg(target_os = "windows")]
+const TRAY_INTENT_ON: u8 = 0;
+#[cfg(target_os = "windows")]
+const TRAY_INTENT_OFF: u8 = 1;
+#[cfg(target_os = "windows")]
+const TRAY_INTENT_EXITING: u8 = 2;
+
+#[cfg(target_os = "windows")]
+fn tray_desired_on() -> bool {
+    TRAY_INTENT.load(Ordering::Acquire) == TRAY_INTENT_ON
+}
+
+#[cfg(target_os = "windows")]
+fn tray_exit_requested() -> bool {
+    TRAY_INTENT.load(Ordering::Acquire) == TRAY_INTENT_EXITING
+}
+#[cfg(test)]
+fn tray_initial_desired_on() -> bool {
+    TRAY_DEFAULT_ON
+}
+#[cfg(any(target_os = "windows", test))]
+const TRAY_RETRY_INITIAL: Duration = Duration::from_millis(750);
+#[cfg(any(target_os = "windows", test))]
+const TRAY_RETRY_MAX: Duration = Duration::from_secs(8);
+
+#[cfg(any(target_os = "windows", test))]
+fn next_tray_retry_delay(current: Duration) -> Duration {
+    current.saturating_mul(2).min(TRAY_RETRY_MAX)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn ico_image_for_size(ico: &[u8], desired: u32) -> Option<&[u8]> {
+    if ico.len() < 6
+        || u16::from_le_bytes([ico[0], ico[1]]) != 0
+        || u16::from_le_bytes([ico[2], ico[3]]) != 1
+    {
+        return None;
+    }
+    let count = usize::from(u16::from_le_bytes([ico[4], ico[5]]));
+    let entries_end = 6usize.checked_add(count.checked_mul(16)?)?;
+    if count == 0 || entries_end > ico.len() {
+        return None;
+    }
+    let mut selected = None;
+    let mut selected_distance = u32::MAX;
+    let mut selected_width = 0;
+    for index in 0..count {
+        let entry = 6 + index * 16;
+        let width = if ico[entry] == 0 {
+            256
+        } else {
+            u32::from(ico[entry])
+        };
+        let height = if ico[entry + 1] == 0 {
+            256
+        } else {
+            u32::from(ico[entry + 1])
+        };
+        if width != height {
+            continue;
+        }
+        let length = u32::from_le_bytes(ico[entry + 8..entry + 12].try_into().ok()?) as usize;
+        let offset = u32::from_le_bytes(ico[entry + 12..entry + 16].try_into().ok()?) as usize;
+        let Some(end) = offset.checked_add(length) else {
+            continue;
+        };
+        if offset < entries_end || end > ico.len() || length == 0 {
+            continue;
+        }
+        let distance = width.abs_diff(desired);
+        if distance < selected_distance || (distance == selected_distance && width > selected_width)
+        {
+            selected = Some(&ico[offset..end]);
+            selected_distance = distance;
+            selected_width = width;
+        }
+    }
+    selected
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsTrayIcons {
+    off: usize,
+    on: usize,
+}
+
+#[cfg(target_os = "windows")]
+impl WindowsTrayIcons {
+    fn load() -> std::io::Result<Self> {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            CreateIconFromResourceEx, DestroyIcon, LR_DEFAULTCOLOR,
+        };
+
+        fn load_one(ico: &[u8]) -> std::io::Result<usize> {
+            let image = ico_image_for_size(ico, 32)
+                .ok_or_else(|| std::io::Error::other("embedded tray icon is malformed"))?;
+            let icon = unsafe {
+                CreateIconFromResourceEx(
+                    image.as_ptr(),
+                    image
+                        .len()
+                        .try_into()
+                        .map_err(|_| std::io::Error::other("embedded tray icon is too large"))?,
+                    1,
+                    0x0003_0000,
+                    32,
+                    32,
+                    LR_DEFAULTCOLOR,
+                )
+            };
+            if icon.is_null() {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(icon as usize)
+            }
+        }
+
+        let off = load_one(TRAY_ICON_OFF_ICO)?;
+        match load_one(TRAY_ICON_ON_ICO) {
+            Ok(on) => Ok(Self { off, on }),
+            Err(error) => {
+                unsafe {
+                    DestroyIcon(off as windows_sys::Win32::UI::WindowsAndMessaging::HICON);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn get() -> std::io::Result<&'static Self> {
+        if let Some(icons) = WINDOWS_TRAY_ICONS.get() {
+            return Ok(icons);
+        }
+        let icons = Self::load()?;
+        let _ = WINDOWS_TRAY_ICONS.set(icons);
+        WINDOWS_TRAY_ICONS
+            .get()
+            .ok_or_else(|| std::io::Error::other("tray icons were not initialized"))
+    }
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsTrayRuntime {
+    context: BrokerContext,
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Clone)]
+struct TrayCoordinatorHandle {
+    sender: tokio::sync::mpsc::UnboundedSender<TrayCoordinatorRequest>,
+}
+
+#[cfg(any(target_os = "windows", test))]
+enum TrayCoordinatorRequest {
+    Wake {
+        report_stop_error: bool,
+    },
+    Diagnose,
+    Exit,
+    External {
+        command: Command,
+        reply: tokio::sync::oneshot::Sender<std::result::Result<String, String>>,
+    },
+}
+
+#[cfg(any(target_os = "windows", test))]
+type TrayCoordinatorFuture<'a, T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
+#[cfg(any(target_os = "windows", test))]
+trait TrayCoordinatorBackend: Send + Sync + 'static {
+    fn diagnose(&self) -> TrayCoordinatorFuture<'_, Result<()>>;
+    fn execute_external(&self, command: Command) -> TrayCoordinatorFuture<'_, Result<String>>;
+    fn reconcile(&self) -> TrayCoordinatorFuture<'_, Result<bool>>;
+    fn exit_requested(&self) -> bool;
+    fn verified_off(&self) -> bool;
+    fn report_error(&self, error: String);
+    fn diagnosis_complete(&self);
+    fn exit_complete(&self);
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsTrayBackend {
+    context: BrokerContext,
+}
+
+#[cfg(target_os = "windows")]
+impl TrayCoordinatorBackend for WindowsTrayBackend {
+    fn diagnose(&self) -> TrayCoordinatorFuture<'_, Result<()>> {
+        Box::pin(async move {
+            self.context
+                .diagnose_and_fix(tray_desired_on())
+                .await
+                .map(|_| ())
+        })
+    }
+
+    fn execute_external(&self, command: Command) -> TrayCoordinatorFuture<'_, Result<String>> {
+        Box::pin(async move { self.context.execute(command).await })
+    }
+
+    fn reconcile(&self) -> TrayCoordinatorFuture<'_, Result<bool>> {
+        Box::pin(async move { reconcile_tray_desired_state(&self.context).await })
+    }
+
+    fn exit_requested(&self) -> bool {
+        tray_exit_requested()
+    }
+
+    fn verified_off(&self) -> bool {
+        TrayHostObservation::capture(&self.context.paths).is_verified_off()
+    }
+
+    fn report_error(&self, error: String) {
+        report_tray_error(error);
+    }
+
+    fn diagnosis_complete(&self) {
+        TRAY_DIAGNOSE_ACTIVE.store(false, Ordering::Release);
+    }
+
+    fn exit_complete(&self) {
+        let hwnd = TRAY_WINDOW.load(Ordering::Acquire) as windows_sys::Win32::Foundation::HWND;
+        if !hwnd.is_null() {
+            unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    hwnd,
+                    TRAY_EXIT_COMPLETE_MESSAGE,
+                    0,
+                    0,
+                );
+            }
+        }
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TrayReconcileAction {
+    None,
+    Start,
+    Stop,
+}
+
+#[cfg(any(target_os = "windows", test))]
+#[derive(Clone, Copy)]
+struct TrayHostObservation {
+    lifecycle: HostState,
+    daemon_running: bool,
+    runtime_visible: bool,
+}
+
+#[cfg(any(target_os = "windows", test))]
+impl TrayHostObservation {
+    #[cfg(target_os = "windows")]
+    fn capture(paths: &AppPaths) -> Self {
+        let lifecycle = StateStore::new(&paths.status)
+            .read_or_stopped()
+            .lifecycle
+            .state;
+        let daemon_running = read_daemon_pid(&paths.daemon_pid).is_some_and(process_is_running);
+        Self {
+            lifecycle,
+            daemon_running,
+            runtime_visible: runtime_may_be_active(paths),
+        }
+    }
+
+    fn is_verified_off(self) -> bool {
+        !self.daemon_running && !self.runtime_visible && self.lifecycle == HostState::Stopped
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn tray_reconcile_action(
+    desired_on: bool,
+    observation: TrayHostObservation,
+) -> TrayReconcileAction {
+    if !desired_on {
+        return if observation.is_verified_off() {
+            TrayReconcileAction::None
+        } else {
+            TrayReconcileAction::Stop
+        };
+    }
+    if observation.daemon_running {
+        return if matches!(
+            observation.lifecycle,
+            HostState::Preparing | HostState::Connected | HostState::Degraded
+        ) {
+            TrayReconcileAction::None
+        } else {
+            TrayReconcileAction::Stop
+        };
+    }
+    if observation.runtime_visible
+        || matches!(
+            observation.lifecycle,
+            HostState::Connected | HostState::Degraded | HostState::Stopping | HostState::Error
+        )
+    {
+        TrayReconcileAction::Stop
+    } else {
+        TrayReconcileAction::Start
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn tray_should_report_reconcile_error(report_stop_error: bool, exit_requested: bool) -> bool {
+    report_stop_error || exit_requested
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn tray_tooltip(desired_on: bool, observation: Option<TrayHostObservation>) -> &'static str {
+    if !desired_on {
+        return if observation.is_some_and(TrayHostObservation::is_verified_off) {
+            "Wired link: off"
+        } else {
+            "Wired link: stopping"
+        };
+    }
+    if observation
+        .is_some_and(|state| state.daemon_running && state.lifecycle == HostState::Connected)
+    {
+        "Gnirehtet VD — connected"
+    } else if observation.is_some_and(|state| state.lifecycle == HostState::Degraded) {
+        "Wired link: headset asleep — reconnecting"
+    } else {
+        "Wired link: connecting — allow USB debugging"
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl TrayCoordinatorHandle {
+    fn spawn(context: BrokerContext, runtime: tokio::runtime::Handle) -> Self {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        runtime.spawn(run_tray_coordinator(
+            receiver,
+            WindowsTrayBackend { context },
+        ));
+        Self { sender }
+    }
+
+    fn toggle(&self) {
+        let desired_on = loop {
+            let current = TRAY_INTENT.load(Ordering::Acquire);
+            if current == TRAY_INTENT_EXITING {
+                return;
+            }
+            let next = if current == TRAY_INTENT_ON {
+                TRAY_INTENT_OFF
+            } else {
+                TRAY_INTENT_ON
+            };
+            if TRAY_INTENT
+                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break next == TRAY_INTENT_ON;
+            }
+        };
+        let _ = self.sender.send(TrayCoordinatorRequest::Wake {
+            report_stop_error: !desired_on,
+        });
+    }
+
+    fn diagnose(&self) {
+        if tray_exit_requested()
+            || TRAY_DIAGNOSE_ACTIVE
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return;
+        }
+        if self.sender.send(TrayCoordinatorRequest::Diagnose).is_err() {
+            TRAY_DIAGNOSE_ACTIVE.store(false, Ordering::Release);
+        }
+    }
+
+    fn exit(&self) {
+        TRAY_INTENT.store(TRAY_INTENT_EXITING, Ordering::Release);
+        let _ = self.sender.send(TrayCoordinatorRequest::Exit);
+    }
+
+    async fn execute_external(&self, command: Command) -> Result<String> {
+        match command {
+            Command::Start(_) => loop {
+                let current = TRAY_INTENT.load(Ordering::Acquire);
+                if current == TRAY_INTENT_EXITING {
+                    bail!(
+                        "the notification-area app is exiting; start it again after Exit completes"
+                    );
+                }
+                if TRAY_INTENT
+                    .compare_exchange(current, TRAY_INTENT_ON, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    break;
+                }
+            },
+            Command::Stop => {
+                let _ = TRAY_INTENT.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    (current != TRAY_INTENT_EXITING).then_some(TRAY_INTENT_OFF)
+                });
+            }
+            _ => {}
+        }
+        let (reply, response) = tokio::sync::oneshot::channel();
+        self.sender
+            .send(TrayCoordinatorRequest::External { command, reply })
+            .map_err(|_| anyhow::Error::msg("tray coordinator is unavailable"))?;
+        response
+            .await
+            .map_err(|_| anyhow::Error::msg("tray coordinator stopped before replying"))?
+            .map_err(anyhow::Error::msg)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn report_tray_error(error: impl Into<String>) {
+    if let Ok(mut last_error) = TRAY_LAST_ERROR.lock() {
+        *last_error = Some(error.into());
+    }
+    let hwnd = TRAY_WINDOW.load(Ordering::Acquire) as windows_sys::Win32::Foundation::HWND;
+    if !hwnd.is_null() {
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
+                hwnd,
+                TRAY_ERROR_MESSAGE,
+                0,
+                0,
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+async fn reconcile_tray_desired_state(context: &BrokerContext) -> Result<bool> {
+    let observation = TrayHostObservation::capture(&context.paths);
+    match tray_reconcile_action(tray_desired_on(), observation) {
+        TrayReconcileAction::None => {}
+        TrayReconcileAction::Start => {
+            context
+                .execute(Command::Start(StartArgs { all_traffic: false }))
+                .await?;
+        }
+        TrayReconcileAction::Stop => {
+            context.execute(Command::Stop).await?;
+        }
+    }
+    let observation = TrayHostObservation::capture(&context.paths);
+    Ok(tray_reconcile_action(tray_desired_on(), observation) == TrayReconcileAction::None)
+}
+
+#[cfg(any(target_os = "windows", test))]
+async fn run_tray_coordinator<B>(
+    mut receiver: tokio::sync::mpsc::UnboundedReceiver<TrayCoordinatorRequest>,
+    backend: B,
+) where
+    B: TrayCoordinatorBackend,
+{
+    let mut retry_delay = TRAY_RETRY_INITIAL;
+    let mut report_next_stop_error = false;
+    let mut report_exit_error = false;
+    loop {
+        let request = tokio::select! {
+            request = receiver.recv() => request,
+            _ = tokio::time::sleep(retry_delay) => {
+                Some(TrayCoordinatorRequest::Wake { report_stop_error: false })
+            },
+        };
+        let Some(request) = request else {
+            return;
+        };
+        let explicit_request = !matches!(
+            &request,
+            TrayCoordinatorRequest::Wake {
+                report_stop_error: false
+            }
+        );
+        if explicit_request {
+            retry_delay = TRAY_RETRY_INITIAL;
+        }
+        match request {
+            TrayCoordinatorRequest::Wake { report_stop_error } => {
+                report_next_stop_error |= report_stop_error;
+            }
+            TrayCoordinatorRequest::Diagnose => {
+                if let Err(error) = backend.diagnose().await {
+                    backend.report_error(format!("Diagnose and fix could not finish: {error:#}"));
+                }
+                backend.diagnosis_complete();
+            }
+            TrayCoordinatorRequest::Exit => {
+                report_exit_error = true;
+            }
+            TrayCoordinatorRequest::External { command, reply } => {
+                let result = backend
+                    .execute_external(command)
+                    .await
+                    .map_err(|error| format!("{error:#}"));
+                let _ = reply.send(result);
+            }
+        }
+
+        let converged = match backend.reconcile().await {
+            Ok(converged) => converged,
+            Err(error) => {
+                retry_delay = next_tray_retry_delay(retry_delay);
+                if tray_should_report_reconcile_error(report_next_stop_error, report_exit_error) {
+                    backend.report_error(format!(
+                        "The wired link could not stop yet. Reconnect and unlock the headset, then try again: {error:#}"
+                    ));
+                    report_next_stop_error = false;
+                    report_exit_error = false;
+                }
+                continue;
+            }
+        };
+
+        if converged {
+            retry_delay = TRAY_RETRY_INITIAL;
+        }
+        report_next_stop_error = false;
+        if backend.exit_requested() && backend.verified_off() {
+            backend.exit_complete();
+            return;
+        }
+    }
+}
 
 #[cfg(target_os = "windows")]
 const TRAY_CALLBACK_MESSAGE: u32 = 0x8000 + 41;
 #[cfg(target_os = "windows")]
 const TRAY_SHOW_EXISTING_MESSAGE: u32 = 0x8000 + 42;
+#[cfg(target_os = "windows")]
+const TRAY_EXIT_COMPLETE_MESSAGE: u32 = 0x8000 + 43;
+#[cfg(target_os = "windows")]
+const TRAY_ERROR_MESSAGE: u32 = 0x8000 + 44;
+#[cfg(target_os = "windows")]
+const TRAY_ICON_TIMER_ID: usize = 41;
 
 #[cfg(target_os = "windows")]
 struct TrayInstance {
@@ -1189,6 +1875,23 @@ impl Drop for TrayInstance {
 #[cfg(target_os = "windows")]
 fn wide_windows(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(target_os = "windows")]
+fn show_windows_message(title: &str, message: &str) {
+    use std::ptr::null_mut;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OK};
+
+    let title = wide_windows(title);
+    let message = wide_windows(message);
+    unsafe {
+        MessageBoxW(
+            null_mut(),
+            message.as_ptr(),
+            title.as_ptr(),
+            MB_OK | MB_ICONINFORMATION,
+        );
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -1241,43 +1944,75 @@ fn request_tray_exit(class_name: &[u16]) {
 }
 
 #[cfg(target_os = "windows")]
-fn run_windows_tray(instance_guard: TrayInstance, broker_gate: BrokerGate) -> std::io::Result<()> {
+fn run_windows_tray(
+    instance_guard: TrayInstance,
+    broker_context: BrokerContext,
+) -> std::io::Result<()> {
     use std::ptr::{null, null_mut};
     use windows_sys::Win32::{
         Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM},
         System::LibraryLoader::GetModuleHandleW,
         UI::{
             Shell::{
-                Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
+                Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
                 NOTIFYICONDATAW,
             },
             WindowsAndMessaging::{
                 AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
-                DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, LoadIconW,
-                PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow, TrackPopupMenu,
-                TranslateMessage, IDI_APPLICATION, MF_SEPARATOR, MF_STRING, MSG, TPM_RETURNCMD,
-                TPM_RIGHTBUTTON, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_LBUTTONDBLCLK, WM_NULL,
-                WM_RBUTTONUP, WNDCLASSW,
+                DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, KillTimer, MessageBoxW,
+                PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow, SetTimer,
+                TrackPopupMenu, TranslateMessage, MB_ICONINFORMATION, MB_OK, MF_CHECKED,
+                MF_SEPARATOR, MF_STRING, MSG, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_CLOSE, WM_COMMAND,
+                WM_DESTROY, WM_LBUTTONDBLCLK, WM_NULL, WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
             },
         },
     };
 
     const ICON_ID: u32 = 1;
 
+    fn apply_tooltip(icon: &mut NOTIFYICONDATAW, text: &str) {
+        icon.szTip.fill(0);
+        for (destination, source) in icon.szTip.iter_mut().zip(text.encode_utf16()) {
+            *destination = source;
+        }
+    }
+
+    fn refresh_tray_icon(hwnd: HWND) {
+        let observation = WINDOWS_TRAY_RUNTIME
+            .get()
+            .map(|tray| TrayHostObservation::capture(&tray.context.paths));
+        let desired_on = tray_desired_on();
+        let Ok(icons) = WindowsTrayIcons::get() else {
+            return;
+        };
+        let mut icon = NOTIFYICONDATAW {
+            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: hwnd,
+            uID: ICON_ID,
+            uFlags: NIF_ICON | NIF_TIP,
+            hIcon: if desired_on { icons.on } else { icons.off }
+                as windows_sys::Win32::UI::WindowsAndMessaging::HICON,
+            ..Default::default()
+        };
+        apply_tooltip(&mut icon, tray_tooltip(desired_on, observation));
+        unsafe {
+            Shell_NotifyIconW(NIM_MODIFY, &icon);
+        }
+    }
+
     fn show_menu(hwnd: HWND) {
         let menu = unsafe { CreatePopupMenu() };
         if menu.is_null() {
             return;
         }
-        for (flags, id, label) in [
-            (MF_STRING, TRAY_STATUS_ID, Some("Status")),
-            (MF_STRING, TRAY_START_ID, Some("Start wired link")),
-            (MF_STRING, TRAY_STOP_ID, Some("Stop wired link")),
-            (MF_STRING, TRAY_REPAIR_ID, Some("Repair")),
-            (MF_SEPARATOR, 0, None),
-            (MF_STRING, TRAY_EXIT_ID, Some("Exit tray")),
-        ] {
-            let label = label.map(wide_windows);
+        for entry in tray_menu_entries(tray_desired_on()) {
+            let flags = if entry.command.is_some() {
+                MF_STRING | if entry.checked { MF_CHECKED } else { 0 }
+            } else {
+                MF_SEPARATOR
+            };
+            let id = entry.command.map_or(0, tray_command_id);
+            let label = entry.label.map(wide_windows);
             unsafe {
                 AppendMenuW(
                     menu,
@@ -1313,77 +2048,15 @@ fn run_windows_tray(instance_guard: TrayInstance, broker_gate: BrokerGate) -> st
     }
 
     fn dispatch_tray_command(command: TrayCommand, hwnd: HWND) {
-        if command == TrayCommand::Exit {
-            let Some(gate) = WINDOWS_BROKER_GATE.get() else {
-                return;
-            };
-            if !begin_tray_shutdown(&TRAY_COMMAND_IN_FLIGHT, gate) {
-                return;
-            }
-            if unsafe { DestroyWindow(hwnd) } == 0 {
-                gate.cancel_shutdown();
-            }
-            return;
-        }
-        let Some(arguments) = tray_command_arguments(command) else {
+        let Some(coordinator) = WINDOWS_TRAY_COORDINATOR.get() else {
             return;
         };
-        if !begin_tray_command(&TRAY_COMMAND_IN_FLIGHT) {
-            return;
+        match command {
+            TrayCommand::ToggleLink => coordinator.toggle(),
+            TrayCommand::DiagnoseAndFix => coordinator.diagnose(),
+            TrayCommand::Exit => coordinator.exit(),
         }
-        let worker = std::thread::Builder::new()
-            .name("gnirehtet-vd-tray-command".into())
-            .spawn(move || {
-                use std::os::windows::process::CommandExt;
-                use windows_sys::Win32::UI::WindowsAndMessaging::{
-                    MessageBoxW, MB_ICONINFORMATION, MB_OK,
-                };
-
-                const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-                let outcome = std::env::current_exe()
-                    .and_then(|executable| {
-                        ProcessCommand::new(executable)
-                            .args(arguments)
-                            .creation_flags(CREATE_NO_WINDOW)
-                            .stdout(Stdio::piped())
-                            .stderr(Stdio::piped())
-                            // `output()` drains both pipes concurrently. Mutation
-                            // deadlines and rollback belong to the CLI transaction;
-                            // the tray must not kill it at an arbitrary UI timeout.
-                            .output()
-                    })
-                    .map(|output| {
-                        let bytes = if output.status.success() || output.stderr.is_empty() {
-                            output.stdout
-                        } else {
-                            output.stderr
-                        };
-                        let mut text = String::from_utf8_lossy(&bytes).trim().to_owned();
-                        if text.is_empty() {
-                            text = if output.status.success() {
-                                "Command completed".into()
-                            } else {
-                                "Command failed without details".into()
-                            };
-                        }
-                        text.chars().take(4 * 1024).collect()
-                    })
-                    .unwrap_or_else(|error| format!("Could not run command: {error}"));
-                let message = wide_windows(&outcome);
-                let title = wide_windows("Gnirehtet VD wired link");
-                unsafe {
-                    MessageBoxW(
-                        null_mut(),
-                        message.as_ptr(),
-                        title.as_ptr(),
-                        MB_OK | MB_ICONINFORMATION,
-                    );
-                }
-                TRAY_COMMAND_IN_FLIGHT.store(false, Ordering::Release);
-            });
-        if worker.is_err() {
-            TRAY_COMMAND_IN_FLIGHT.store(false, Ordering::Release);
-        }
+        refresh_tray_icon(hwnd);
     }
 
     unsafe extern "system" fn window_proc(
@@ -1403,23 +2076,44 @@ fn run_windows_tray(instance_guard: TrayInstance, broker_gate: BrokerGate) -> st
                 show_menu(hwnd);
                 0
             }
+            TRAY_EXIT_COMPLETE_MESSAGE => {
+                DestroyWindow(hwnd);
+                0
+            }
+            TRAY_ERROR_MESSAGE => {
+                if let Ok(mut last_error) = TRAY_LAST_ERROR.lock() {
+                    if let Some(error) = last_error.take() {
+                        let message = wide_windows(&error);
+                        let title = wide_windows("Gnirehtet VD needs attention");
+                        MessageBoxW(
+                            null_mut(),
+                            message.as_ptr(),
+                            title.as_ptr(),
+                            MB_OK | MB_ICONINFORMATION,
+                        );
+                    }
+                }
+                0
+            }
             WM_COMMAND => {
                 if let Some(command) = tray_command_from_id(wparam & 0xffff) {
                     dispatch_tray_command(command, hwnd);
                 }
                 0
             }
+            WM_TIMER if wparam == TRAY_ICON_TIMER_ID => {
+                refresh_tray_icon(hwnd);
+                0
+            }
             WM_CLOSE => {
-                if let Some(gate) = WINDOWS_BROKER_GATE.get() {
-                    if begin_tray_shutdown(&TRAY_COMMAND_IN_FLIGHT, gate)
-                        && DestroyWindow(hwnd) == 0
-                    {
-                        gate.cancel_shutdown();
-                    }
+                if let Some(coordinator) = WINDOWS_TRAY_COORDINATOR.get() {
+                    coordinator.exit();
                 }
                 0
             }
             WM_DESTROY => {
+                TRAY_WINDOW.store(0, Ordering::Release);
+                KillTimer(hwnd, TRAY_ICON_TIMER_ID);
                 let icon = NOTIFYICONDATAW {
                     cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
                     hWnd: hwnd,
@@ -1434,10 +2128,13 @@ fn run_windows_tray(instance_guard: TrayInstance, broker_gate: BrokerGate) -> st
         }
     }
 
-    WINDOWS_BROKER_GATE
-        .set(broker_gate)
-        .map_err(|_| std::io::Error::other("broker gate was initialized more than once"))?;
+    WINDOWS_TRAY_RUNTIME
+        .set(WindowsTrayRuntime {
+            context: broker_context,
+        })
+        .map_err(|_| std::io::Error::other("tray runtime was initialized more than once"))?;
     let class_name = instance_guard.class_name.clone();
+    let tray_icons = WindowsTrayIcons::get()?;
 
     let instance = unsafe { GetModuleHandleW(null()) };
     if instance.is_null() {
@@ -1446,7 +2143,7 @@ fn run_windows_tray(instance_guard: TrayInstance, broker_gate: BrokerGate) -> st
     let window_class = WNDCLASSW {
         lpfnWndProc: Some(window_proc),
         hInstance: instance,
-        hIcon: unsafe { LoadIconW(null_mut(), IDI_APPLICATION) },
+        hIcon: tray_icons.on as windows_sys::Win32::UI::WindowsAndMessaging::HICON,
         lpszClassName: class_name.as_ptr(),
         ..Default::default()
     };
@@ -1478,14 +2175,28 @@ fn run_windows_tray(instance_guard: TrayInstance, broker_gate: BrokerGate) -> st
         uID: ICON_ID,
         uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
         uCallbackMessage: TRAY_CALLBACK_MESSAGE,
-        hIcon: unsafe { LoadIconW(null_mut(), IDI_APPLICATION) },
+        hIcon: if tray_desired_on() {
+            tray_icons.on
+        } else {
+            tray_icons.off
+        } as windows_sys::Win32::UI::WindowsAndMessaging::HICON,
         ..Default::default()
     };
-    let tooltip = "Gnirehtet VD wired link".encode_utf16();
-    for (destination, source) in icon.szTip.iter_mut().zip(tooltip) {
-        *destination = source;
-    }
+    apply_tooltip(&mut icon, tray_tooltip(tray_desired_on(), None));
     if unsafe { Shell_NotifyIconW(NIM_ADD, &icon) } == 0 {
+        unsafe {
+            DestroyWindow(hwnd);
+        }
+        return Err(std::io::Error::last_os_error());
+    }
+    TRAY_WINDOW.store(hwnd as usize, Ordering::Release);
+    refresh_tray_icon(hwnd);
+    if let Some(coordinator) = WINDOWS_TRAY_COORDINATOR.get() {
+        let _ = coordinator.sender.send(TrayCoordinatorRequest::Wake {
+            report_stop_error: false,
+        });
+    }
+    if unsafe { SetTimer(hwnd, TRAY_ICON_TIMER_ID, 500, None) } == 0 {
         unsafe {
             DestroyWindow(hwnd);
         }
@@ -1622,37 +2333,330 @@ mod tests {
     }
 
     #[test]
-    fn tray_menu_ids_map_only_to_the_public_commands() {
+    fn tray_menu_exposes_only_toggle_diagnose_and_exit() {
         assert_eq!(
-            tray_command_arguments(tray_command_from_id(TRAY_STATUS_ID).unwrap()),
-            Some(&["status"][..])
+            tray_command_from_id(TRAY_TOGGLE_ID),
+            Some(TrayCommand::ToggleLink)
         );
         assert_eq!(
-            tray_command_arguments(tray_command_from_id(TRAY_START_ID).unwrap()),
-            Some(&["start"][..])
+            tray_command_from_id(TRAY_DIAGNOSE_ID),
+            Some(TrayCommand::DiagnoseAndFix)
         );
-        assert_eq!(
-            tray_command_arguments(tray_command_from_id(TRAY_STOP_ID).unwrap()),
-            Some(&["stop"][..])
-        );
-        assert_eq!(
-            tray_command_arguments(tray_command_from_id(TRAY_REPAIR_ID).unwrap()),
-            Some(&["repair"][..])
-        );
-        assert_eq!(
-            tray_command_arguments(tray_command_from_id(TRAY_EXIT_ID).unwrap()),
-            None
-        );
+        assert_eq!(tray_command_from_id(TRAY_EXIT_ID), Some(TrayCommand::Exit));
         assert_eq!(tray_command_from_id(0), None);
+
+        let on = tray_menu_entries(true);
+        let visible: Vec<_> = on.iter().filter_map(|entry| entry.label).collect();
+        assert_eq!(visible, ["Wired link", "Diagnose and fix", "Exit"]);
+        assert!(on[0].checked);
+        assert!(!tray_menu_entries(false)[0].checked);
+    }
+
+    fn tray_observation(
+        lifecycle: HostState,
+        daemon_running: bool,
+        runtime_visible: bool,
+    ) -> TrayHostObservation {
+        TrayHostObservation {
+            lifecycle,
+            daemon_running,
+            runtime_visible,
+        }
     }
 
     #[test]
-    fn tray_allows_only_one_command_in_flight() {
-        let in_flight = AtomicBool::new(false);
-        assert!(begin_tray_command(&in_flight));
-        assert!(!begin_tray_command(&in_flight));
-        in_flight.store(false, Ordering::Release);
-        assert!(begin_tray_command(&in_flight));
+    fn tray_defaults_on_and_bounds_persistent_retry_backoff() {
+        assert!(tray_initial_desired_on());
+        assert_eq!(TRAY_RETRY_INITIAL, Duration::from_millis(750));
+        assert_eq!(
+            next_tray_retry_delay(TRAY_RETRY_INITIAL),
+            Duration::from_millis(1500)
+        );
+        assert_eq!(
+            next_tray_retry_delay(Duration::from_secs(6)),
+            TRAY_RETRY_MAX
+        );
+        assert_eq!(next_tray_retry_delay(TRAY_RETRY_MAX), TRAY_RETRY_MAX);
+    }
+
+    #[test]
+    fn tray_policy_suppresses_duplicate_start_and_cleans_stale_runtime() {
+        let clean = tray_observation(HostState::Stopped, false, false);
+        assert_eq!(
+            tray_reconcile_action(true, clean),
+            TrayReconcileAction::Start
+        );
+        for lifecycle in [
+            HostState::Preparing,
+            HostState::Connected,
+            HostState::Degraded,
+        ] {
+            assert_eq!(
+                tray_reconcile_action(true, tray_observation(lifecycle, true, true)),
+                TrayReconcileAction::None
+            );
+        }
+        assert_eq!(
+            tray_reconcile_action(true, tray_observation(HostState::Connected, false, false)),
+            TrayReconcileAction::Stop
+        );
+        assert_eq!(
+            tray_reconcile_action(true, tray_observation(HostState::Stopped, false, true)),
+            TrayReconcileAction::Stop
+        );
+    }
+
+    #[test]
+    fn tray_off_and_exit_require_verified_stop_without_automatic_alerts() {
+        let clean = tray_observation(HostState::Stopped, false, false);
+        let active = tray_observation(HostState::Connected, true, true);
+        assert_eq!(
+            tray_reconcile_action(false, clean),
+            TrayReconcileAction::None
+        );
+        assert_eq!(
+            tray_reconcile_action(false, active),
+            TrayReconcileAction::Stop
+        );
+        assert!(!tray_should_report_reconcile_error(false, false));
+        assert!(tray_should_report_reconcile_error(true, false));
+        assert!(tray_should_report_reconcile_error(false, true));
+    }
+
+    #[test]
+    fn tray_tooltips_separate_requested_color_from_actual_state() {
+        let clean = tray_observation(HostState::Stopped, false, false);
+        let connected = tray_observation(HostState::Connected, true, true);
+        let sleeping = tray_observation(HostState::Degraded, true, true);
+        assert_eq!(tray_tooltip(false, Some(clean)), "Wired link: off");
+        assert_eq!(tray_tooltip(false, Some(connected)), "Wired link: stopping");
+        assert_eq!(
+            tray_tooltip(true, Some(connected)),
+            "Gnirehtet VD — connected"
+        );
+        assert_eq!(
+            tray_tooltip(true, Some(sleeping)),
+            "Wired link: headset asleep — reconnecting"
+        );
+        assert!(tray_tooltip(true, None).contains("allow USB debugging"));
+    }
+
+    #[derive(Clone)]
+    struct FakeTrayBackend {
+        inner: Arc<FakeTrayBackendInner>,
+    }
+
+    enum FakeReconcileOutcome {
+        Error,
+        Intermediate,
+        Converged,
+    }
+
+    struct FakeTrayBackendInner {
+        outcomes: StdMutex<std::collections::VecDeque<FakeReconcileOutcome>>,
+        calls: StdMutex<Vec<Instant>>,
+        errors: StdMutex<Vec<String>>,
+        active: std::sync::atomic::AtomicUsize,
+        max_active: std::sync::atomic::AtomicUsize,
+        operation_delay: Duration,
+    }
+
+    impl FakeTrayBackend {
+        fn new(outcomes: impl IntoIterator<Item = bool>, operation_delay: Duration) -> Self {
+            Self::with_steps(
+                outcomes.into_iter().map(|success| {
+                    if success {
+                        FakeReconcileOutcome::Converged
+                    } else {
+                        FakeReconcileOutcome::Error
+                    }
+                }),
+                operation_delay,
+            )
+        }
+
+        fn with_steps(
+            outcomes: impl IntoIterator<Item = FakeReconcileOutcome>,
+            operation_delay: Duration,
+        ) -> Self {
+            Self {
+                inner: Arc::new(FakeTrayBackendInner {
+                    outcomes: StdMutex::new(outcomes.into_iter().collect()),
+                    calls: StdMutex::new(Vec::new()),
+                    errors: StdMutex::new(Vec::new()),
+                    active: std::sync::atomic::AtomicUsize::new(0),
+                    max_active: std::sync::atomic::AtomicUsize::new(0),
+                    operation_delay,
+                }),
+            }
+        }
+
+        fn call_times(&self) -> Vec<Instant> {
+            self.inner.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl TrayCoordinatorBackend for FakeTrayBackend {
+        fn diagnose(&self) -> TrayCoordinatorFuture<'_, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn execute_external(&self, _command: Command) -> TrayCoordinatorFuture<'_, Result<String>> {
+            Box::pin(async { Ok(String::new()) })
+        }
+
+        fn reconcile(&self) -> TrayCoordinatorFuture<'_, Result<bool>> {
+            Box::pin(async move {
+                let active = self.inner.active.fetch_add(1, Ordering::AcqRel) + 1;
+                self.inner.max_active.fetch_max(active, Ordering::AcqRel);
+                self.inner.calls.lock().unwrap().push(Instant::now());
+                tokio::time::sleep(self.inner.operation_delay).await;
+                self.inner.active.fetch_sub(1, Ordering::AcqRel);
+                match self
+                    .inner
+                    .outcomes
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or(FakeReconcileOutcome::Converged)
+                {
+                    FakeReconcileOutcome::Error => Err(anyhow::Error::msg("automatic failure")),
+                    FakeReconcileOutcome::Intermediate => Ok(false),
+                    FakeReconcileOutcome::Converged => Ok(true),
+                }
+            })
+        }
+
+        fn exit_requested(&self) -> bool {
+            false
+        }
+
+        fn verified_off(&self) -> bool {
+            false
+        }
+
+        fn report_error(&self, error: String) {
+            self.inner.errors.lock().unwrap().push(error);
+        }
+
+        fn diagnosis_complete(&self) {}
+
+        fn exit_complete(&self) {}
+    }
+
+    #[tokio::test]
+    async fn tray_coordinator_serializes_queued_reconciliation() {
+        let backend = FakeTrayBackend::new([true; 5], Duration::from_millis(25));
+        let inspect = backend.clone();
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let worker = tokio::spawn(run_tray_coordinator(receiver, backend));
+        for _ in 0..5 {
+            sender
+                .send(TrayCoordinatorRequest::Wake {
+                    report_stop_error: false,
+                })
+                .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while inspect.call_times().len() < 5 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(sender);
+        worker.await.unwrap();
+        assert_eq!(inspect.inner.max_active.load(Ordering::Acquire), 1);
+        assert!(inspect.inner.errors.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tray_coordinator_retries_automatic_failures_silently_with_backoff() {
+        let backend = FakeTrayBackend::with_steps(
+            [
+                FakeReconcileOutcome::Error,
+                FakeReconcileOutcome::Intermediate,
+                FakeReconcileOutcome::Error,
+                FakeReconcileOutcome::Converged,
+            ],
+            Duration::from_millis(5),
+        );
+        let inspect = backend.clone();
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let worker = tokio::spawn(run_tray_coordinator(receiver, backend));
+        sender
+            .send(TrayCoordinatorRequest::Wake {
+                report_stop_error: false,
+            })
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(8), async {
+            while inspect.call_times().len() < 4 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(sender);
+        worker.await.unwrap();
+
+        let calls = inspect.call_times();
+        assert_eq!(calls.len(), 4);
+        assert!(calls[1].duration_since(calls[0]) >= Duration::from_millis(1400));
+        assert!(calls[2].duration_since(calls[1]) >= Duration::from_millis(1400));
+        assert!(calls[3].duration_since(calls[2]) >= Duration::from_millis(2900));
+        assert_eq!(inspect.inner.max_active.load(Ordering::Acquire), 1);
+        assert!(inspect.inner.errors.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn embedded_tray_icons_contain_distinct_exact_32_pixel_images() {
+        let off = ico_image_for_size(TRAY_ICON_OFF_ICO, 32).unwrap();
+        let on = ico_image_for_size(TRAY_ICON_ON_ICO, 32).unwrap();
+        assert!(!off.is_empty());
+        assert!(!on.is_empty());
+        assert_ne!(off, on);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_accepts_both_embedded_tray_icons() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{DestroyIcon, HICON};
+
+        let icons = WindowsTrayIcons::load().unwrap();
+        assert_ne!(icons.off, 0);
+        assert_ne!(icons.on, 0);
+        assert_ne!(icons.off, icons.on);
+        unsafe {
+            DestroyIcon(icons.off as HICON);
+            DestroyIcon(icons.on as HICON);
+        }
+    }
+
+    #[test]
+    fn tray_icon_parser_rejects_malformed_headers() {
+        assert_eq!(ico_image_for_size(&[], 32), None);
+        assert_eq!(ico_image_for_size(&[0, 0, 2, 0, 0, 0], 32), None);
+        assert_eq!(ico_image_for_size(&[0, 0, 1, 0, 1, 0], 32), None);
+    }
+
+    #[test]
+    fn tray_icon_parser_skips_bad_entries_and_prefers_larger_ties() {
+        fn entry(width: u8, height: u8, length: u32, offset: u32) -> [u8; 16] {
+            let mut entry = [0; 16];
+            entry[0] = width;
+            entry[1] = height;
+            entry[8..12].copy_from_slice(&length.to_le_bytes());
+            entry[12..16].copy_from_slice(&offset.to_le_bytes());
+            entry
+        }
+
+        let mut ico = vec![0, 0, 1, 0, 3, 0];
+        ico.extend_from_slice(&entry(24, 23, u32::MAX, u32::MAX));
+        ico.extend_from_slice(&entry(24, 24, 1, 54));
+        ico.extend_from_slice(&entry(40, 40, 1, 55));
+        ico.extend_from_slice(&[24, 40]);
+
+        assert_eq!(ico_image_for_size(&ico, 32), Some(&[40][..]));
     }
 
     #[test]
@@ -1679,17 +2683,39 @@ mod tests {
         assert!(BrokerCommand::DiagnosticsCapture { duration: 0 }
             .into_public_command()
             .is_err());
+
+        assert!(command_requires_lifecycle_serialization(&Command::Start(
+            StartArgs { all_traffic: false }
+        )));
+        assert!(command_requires_lifecycle_serialization(&Command::Stop));
+        assert!(command_requires_lifecycle_serialization(&Command::Repair));
+        assert!(!command_requires_lifecycle_serialization(&Command::Version));
+    }
+
+    #[test]
+    fn coordinator_accepts_diagnose_exit_and_external_requests() {
+        let (reply, _response) = tokio::sync::oneshot::channel();
+        let requests = [
+            TrayCoordinatorRequest::Diagnose,
+            TrayCoordinatorRequest::Exit,
+            TrayCoordinatorRequest::External {
+                command: Command::Version,
+                reply,
+            },
+        ];
+        assert_eq!(requests.len(), 3);
     }
 
     #[test]
     fn broker_deadlines_are_bounded_by_command_shape() {
+        assert_eq!(BROKER_PROTOCOL_VERSION, 6);
         assert_eq!(
             BrokerCommand::Version.response_timeout(),
             Duration::from_secs(5)
         );
         assert_eq!(
             BrokerCommand::Start { all_traffic: false }.response_timeout(),
-            Duration::from_secs(180)
+            Duration::from_secs(15 * 60)
         );
         assert_eq!(
             BrokerCommand::DiagnosticsCapture { duration: u64::MAX }.response_timeout(),
@@ -1735,6 +2761,50 @@ mod tests {
             .is_err());
     }
 
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn broker_uses_the_first_pipe_connection_for_the_command() {
+        let pipe_name = format!(
+            r"\\.\pipe\gnirehtet-vd-broker-test-{}-{}",
+            std::process::id(),
+            SessionId::random()
+        );
+        let mut server =
+            gnirehtet_vd::runtime::create_secure_named_pipe(&pipe_name, true, 1).unwrap();
+        let accepted = tokio::spawn(async move {
+            server.connect().await.unwrap();
+            let request: BrokerRequest = read_broker_frame(&mut server).await.unwrap();
+            assert_eq!(request.command, BrokerCommand::Version);
+            write_broker_frame(&mut server, &BrokerResponse::success("ready".into()))
+                .await
+                .unwrap();
+        });
+        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let start_counter = starts.clone();
+        let mut client =
+            open_or_start_broker_client(&pipe_name, Duration::from_secs(2), move || {
+                start_counter.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        write_broker_frame(
+            &mut client,
+            &BrokerRequest {
+                protocol_version: BROKER_PROTOCOL_VERSION,
+                instance_root: PathBuf::from("test-root"),
+                adb_program: PathBuf::from("test-adb"),
+                command: BrokerCommand::Version,
+            },
+        )
+        .await
+        .unwrap();
+        let response: BrokerResponse = read_broker_frame(&mut client).await.unwrap();
+        accepted.await.unwrap();
+        assert_eq!(starts.load(Ordering::Relaxed), 0);
+        assert_eq!(response.stdout, "ready\n");
+    }
+
     #[tokio::test]
     async fn broker_executes_in_process_and_propagates_output() {
         let directory = tempfile::tempdir().unwrap();
@@ -1768,27 +2838,23 @@ mod tests {
     }
 
     #[test]
-    fn broker_gate_makes_command_and_tray_shutdown_atomic() {
+    fn broker_gate_makes_command_and_shutdown_atomic() {
         let gate = BrokerGate::default();
-        let tray_command = AtomicBool::new(false);
         let command = gate.begin_command().unwrap();
         assert_eq!(gate.snapshot(), (true, false));
-        assert!(!begin_tray_shutdown(&tray_command, &gate));
+        assert!(!gate.begin_shutdown());
         drop(command);
         assert_eq!(gate.snapshot(), (false, false));
 
-        assert!(begin_tray_shutdown(&tray_command, &gate));
+        assert!(gate.begin_shutdown());
         assert_eq!(gate.snapshot(), (false, true));
         assert!(gate.begin_command().is_none());
         gate.cancel_shutdown();
-
-        tray_command.store(true, Ordering::Release);
-        assert!(!begin_tray_shutdown(&tray_command, &gate));
         assert_eq!(gate.snapshot(), (false, false));
     }
 
     #[test]
-    fn broker_replaces_stale_adb_context_after_bootstrap() {
+    fn broker_publishes_automatically_bootstrapped_adb() {
         let directory = tempfile::tempdir().unwrap();
         let paths = AppPaths::discover(Some(directory.path().to_owned())).unwrap();
         let original = PathBuf::from("adb");
@@ -1799,7 +2865,38 @@ mod tests {
             BrokerGate::default(),
         );
         let verified = directory.path().join("platform-tools/adb.exe");
-        context.replace_adb(verified.clone()).unwrap();
+        let ensured = context
+            .ensure_adb_with(|program, root| {
+                assert_eq!(program, PathBuf::from("adb"));
+                assert_eq!(root, directory.path());
+                Ok(verified.clone())
+            })
+            .unwrap();
+        assert_eq!(ensured.adb_program, verified);
         assert_eq!(context.environment().unwrap().adb_program, verified);
+    }
+
+    #[tokio::test]
+    async fn broker_context_clones_share_one_adb_lane() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = AppPaths::discover(Some(directory.path().to_owned())).unwrap();
+        let adb_program = directory.path().join("unused-adb");
+        let context = BrokerContext::new(
+            paths,
+            adb_program.clone(),
+            AdbController::new(Arc::new(SystemAdb::new(adb_program))),
+            BrokerGate::default(),
+        );
+        let clone = context.clone();
+        let held = context.adb_lane.lock().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), clone.adb_lane.lock())
+                .await
+                .is_err()
+        );
+        drop(held);
+        let _reacquired = tokio::time::timeout(Duration::from_millis(100), clone.adb_lane.lock())
+            .await
+            .unwrap();
     }
 }

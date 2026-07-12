@@ -40,8 +40,10 @@ class ControlSupervisor(
     }
 
     private val running = AtomicBoolean()
+    private val paused = AtomicBoolean()
     private val sequence = AtomicLong()
     private val writeLock = Any()
+    private val pauseLock = Object()
     @Volatile private var socket: Socket? = null
     @Volatile private var thread: Thread? = null
 
@@ -49,33 +51,59 @@ class ControlSupervisor(
         require(port in 1_024..65_535) { "control port is outside 1024..65535" }
     }
 
-    fun start() {
-        if (!running.compareAndSet(false, true)) return
-        thread = Thread(::runLoop, "gnr4-control").apply { start() }
+    fun start(startPaused: Boolean = false) {
+        synchronized(pauseLock) {
+            if (!running.compareAndSet(false, true)) return
+            paused.set(startPaused || paused.get())
+            thread = Thread(::runLoop, "gnr4-control").apply { start() }
+        }
+    }
+
+    fun suspend() {
+        synchronized(pauseLock) {
+            if (!paused.compareAndSet(false, true)) return
+            socket?.close()
+        }
+    }
+
+    fun resume() {
+        synchronized(pauseLock) {
+            if (!paused.compareAndSet(true, false)) return
+            pauseLock.notifyAll()
+        }
     }
 
     private fun runLoop() {
         var delayMs = 250L
         while (running.get()) {
+            if (!awaitResume()) return
             try {
                 Socket().use { connected ->
+                    synchronized(pauseLock) {
+                        if (!running.get() || paused.get()) return@use
+                        socket = connected
+                    }
                     connected.connect(InetSocketAddress(IPV4_LOOPBACK, port), CONNECT_TIMEOUT_MS)
-                    socket = connected
                     connected.tcpNoDelay = true
                     connected.soTimeout = 1_000
-                    val hello = "android-v4;hev-udp-in-tcp".toByteArray(StandardCharsets.UTF_8)
-                    write(connected, Gnr4Frame(Gnr4MessageType.HELLO, sessionId, hello))
+                    synchronized(pauseLock) {
+                        if (!isActiveSocket(connected)) return@use
+                        val hello = "android-v4;hev-udp-in-tcp".toByteArray(StandardCharsets.UTF_8)
+                        write(connected, Gnr4Frame(Gnr4MessageType.HELLO, sessionId, hello))
+                    }
                     val acknowledgement = Gnr4.read(connected.getInputStream(), sessionId)
                     if (acknowledgement.type != Gnr4MessageType.HELLO_ACK) {
                         throw IllegalStateException("Expected HELLO_ACK, got ${acknowledgement.type}")
                     }
-                    if (!listener.shouldReportStarted()) return
-                    write(connected, Gnr4Frame(Gnr4MessageType.STARTED, sessionId))
-                    listener.onControlConnected()
+                    synchronized(pauseLock) {
+                        if (!isActiveSocket(connected) || !listener.shouldReportStarted()) return@use
+                        write(connected, Gnr4Frame(Gnr4MessageType.STARTED, sessionId))
+                        listener.onControlConnected()
+                    }
                     delayMs = 250L
                     var missed = 0
                     val outstandingHeartbeats = linkedMapOf<Long, Long>()
-                    while (running.get() && !connected.isClosed) {
+                    while (running.get() && !paused.get() && !connected.isClosed) {
                         try {
                             val frame = Gnr4.read(connected.getInputStream(), sessionId)
                             when (frame.type) {
@@ -134,30 +162,59 @@ class ControlSupervisor(
                     }
                 }
             } catch (error: Exception) {
-                if (running.get()) {
+                if (running.get() && !paused.get()) {
                     Log.w(TAG, "Control lane degraded", error)
                     listener.onControlDegraded(error)
-                    try {
-                        Thread.sleep(delayMs)
-                    } catch (_: InterruptedException) {
-                        Thread.currentThread().interrupt()
-                    }
+                    waitForReconnect(delayMs)
                     delayMs = nextControlReconnectDelayMs(delayMs)
                 }
             } finally {
-                socket = null
+                synchronized(pauseLock) {
+                    socket = null
+                }
             }
         }
     }
 
     override fun close() {
-        if (!running.compareAndSet(true, false)) return
-        socket?.close()
+        synchronized(pauseLock) {
+            if (!running.compareAndSet(true, false)) return
+            paused.set(false)
+            socket?.close()
+            pauseLock.notifyAll()
+        }
         thread?.interrupt()
         if (Thread.currentThread() !== thread) {
             thread?.join(2_000)
         }
         thread = null
+    }
+
+    private fun isActiveSocket(connected: Socket): Boolean =
+        running.get() && !paused.get() && socket === connected && !connected.isClosed
+
+    private fun awaitResume(): Boolean {
+        synchronized(pauseLock) {
+            while (running.get() && paused.get()) {
+                try {
+                    pauseLock.wait()
+                } catch (_: InterruptedException) {
+                    if (!running.get()) return false
+                }
+            }
+        }
+        return running.get()
+    }
+
+    private fun waitForReconnect(delayMs: Long) {
+        synchronized(pauseLock) {
+            if (!running.get() || paused.get()) return
+            try {
+                pauseLock.wait(delayMs)
+            } catch (_: InterruptedException) {
+                if (!running.get()) Thread.currentThread().interrupt()
+            }
+        }
     }
 
     private fun write(connected: Socket, frame: Gnr4Frame) {

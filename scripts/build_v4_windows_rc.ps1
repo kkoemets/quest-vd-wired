@@ -40,6 +40,7 @@ New-Item -ItemType Directory -Path $output | Out-Null
 
 $env:GNIREHTET_VD_APK = $apk
 $env:CARGO_INCREMENTAL = "0"
+$env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = "-C target-feature=+crt-static -C link-arg=/Brepro"
 if (-not $env:SOURCE_DATE_EPOCH) {
     $env:SOURCE_DATE_EPOCH = (& git -C $repoRoot show -s --format=%ct HEAD).Trim()
     if ($LASTEXITCODE -ne 0) { throw "could not determine SOURCE_DATE_EPOCH" }
@@ -50,6 +51,7 @@ Invoke-Checked "cargo" @("deny", "--manifest-path", $manifest, "--config", (Join
 Invoke-Checked "cargo" @("clippy", "--manifest-path", $manifest, "--locked", "--target", $target, "--all-targets", "--", "-D", "warnings")
 Invoke-Checked "cargo" @("test", "--manifest-path", $manifest, "--locked", "--target", $target, "--all-targets")
 Invoke-Checked "cargo" @("build", "--manifest-path", $manifest, "--locked", "--target", $target, "--release")
+Invoke-Checked "python" @((Join-Path $repoRoot "scripts\normalize_windows_pe.py"), $builtExe)
 
 if (-not (Test-Path -LiteralPath $builtExe -PathType Leaf)) {
     throw "Windows x64 host executable was not produced"
@@ -60,6 +62,7 @@ Invoke-Checked "python" @((Join-Path $repoRoot "scripts\verify_embedded_apk.py")
 
 Invoke-Checked "cargo" @("clean", "--manifest-path", $manifest, "--target", $target)
 Invoke-Checked "cargo" @("build", "--manifest-path", $manifest, "--locked", "--target", $target, "--release")
+Invoke-Checked "python" @((Join-Path $repoRoot "scripts\normalize_windows_pe.py"), $builtExe)
 $firstHash = (Get-FileHash -LiteralPath $firstExe -Algorithm SHA256).Hash.ToLowerInvariant()
 $secondHash = (Get-FileHash -LiteralPath $builtExe -Algorithm SHA256).Hash.ToLowerInvariant()
 @(

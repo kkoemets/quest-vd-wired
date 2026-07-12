@@ -17,6 +17,53 @@ sys.path.insert(0, str(SCRIPTS))
 
 import generate_rust_notices  # noqa: E402
 import generate_v4_native_sbom  # noqa: E402
+import normalize_windows_pe  # noqa: E402
+
+
+class WindowsPeNormalizationTest(unittest.TestCase):
+    @staticmethod
+    def pe_fixture(marker: int) -> bytes:
+        data = bytearray(0x600)
+        data[:2] = b"MZ"
+        struct.pack_into("<I", data, 0x3C, 0x80)
+        pe = 0x80
+        data[pe : pe + 4] = b"PE\0\0"
+        struct.pack_into("<H", data, pe + 4, 0x8664)
+        struct.pack_into("<H", data, pe + 6, 1)
+        struct.pack_into("<I", data, pe + 8, marker)
+        struct.pack_into("<H", data, pe + 20, 0xF0)
+        optional = pe + 24
+        struct.pack_into("<H", data, optional, 0x20B)
+        struct.pack_into("<I", data, optional + 108, 16)
+        struct.pack_into("<II", data, optional + 112 + 6 * 8, 0x1100, 56)
+        section = optional + 0xF0
+        data[section : section + 8] = b".rdata\0\0"
+        struct.pack_into("<IIII", data, section + 8, 0x400, 0x1000, 0x400, 0x200)
+        debug = 0x300
+        struct.pack_into("<I", data, debug + 4, marker)
+        struct.pack_into("<I", data, debug + 12, 2)
+        struct.pack_into("<I", data, debug + 16, 32)
+        struct.pack_into("<I", data, debug + 24, 0x400)
+        struct.pack_into("<I", data, debug + 28 + 4, marker)
+        data[0x400:0x404] = b"RSDS"
+        data[0x404:0x414] = bytes([marker & 0xFF]) * 16
+        struct.pack_into("<I", data, 0x414, 1)
+        data[0x418:0x420] = b"test.pdb"
+        return bytes(data)
+
+    def test_normalization_is_idempotent_and_removes_build_variance(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            first = Path(directory) / "first.exe"
+            second = Path(directory) / "second.exe"
+            first.write_bytes(self.pe_fixture(0x11111111))
+            second.write_bytes(self.pe_fixture(0x22222222))
+
+            self.assertEqual((2, 1), normalize_windows_pe.normalize(first))
+            self.assertEqual((2, 1), normalize_windows_pe.normalize(second))
+            normalized = first.read_bytes()
+            self.assertEqual(normalized, second.read_bytes())
+            self.assertEqual((2, 1), normalize_windows_pe.normalize(first))
+            self.assertEqual(normalized, first.read_bytes())
 
 
 class NativeSbomTest(unittest.TestCase):
@@ -175,8 +222,8 @@ class CommandLineToolsTest(unittest.TestCase):
                 "#!/bin/sh\n"
                 "case \"$2\" in\n"
                 "application-id) echo com.genymobile.gnirehtet ;;\n"
-                "version-code) echo 40 ;;\n"
-                "version-name) echo 4.0.0-beta.1 ;;\n"
+                "version-code) echo 43 ;;\n"
+                "version-name) echo 4.0.0 ;;\n"
                 "min-sdk) echo 29 ;;\n"
                 "target-sdk) echo 36 ;;\n"
                 "debuggable) echo false ;;\n"
@@ -200,7 +247,7 @@ class CommandLineToolsTest(unittest.TestCase):
                 env=environment,
             )
 
-    def test_v3_apk_verifier_checks_standard_identity(self) -> None:
+    def test_v3_apk_verifier_checks_legacy_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             sdk = root / "sdk"
@@ -242,7 +289,7 @@ class CommandLineToolsTest(unittest.TestCase):
             )
 
 
-class WorkflowPolicyTest(unittest.TestCase):
+class ReleasePolicyTest(unittest.TestCase):
     def test_gradle_distributions_are_checksum_pinned(self) -> None:
         for properties in (
             REPOSITORY / "gradle/wrapper/gradle-wrapper.properties",
@@ -252,86 +299,55 @@ class WorkflowPolicyTest(unittest.TestCase):
             match = re.search(r"^distributionSha256Sum=([0-9a-f]{64})$", text, re.MULTILINE)
             self.assertIsNotNone(match, f"unverified Gradle distribution: {properties}")
 
-    def test_actions_and_runner_generations_are_pinned(self) -> None:
+    def test_github_actions_remain_disabled(self) -> None:
         workflows = sorted((REPOSITORY / ".github/workflows").glob("*.yml"))
-        self.assertTrue(workflows)
-        action_pattern = re.compile(r"^\s*-\s+uses:\s+([^\s#]+)", re.MULTILINE)
-        pinned_rust_action = (
-            "dtolnay/rust-toolchain@4e529fb27e59237866a6523e61ab248308c068b4"
-        )
-        pinned_rust_uses = 0
-        pinned_rust_inputs = 0
-        for workflow in workflows:
-            text = workflow.read_text(encoding="utf-8")
-            self.assertNotIn("ubuntu-latest", text, workflow.name)
-            self.assertNotIn("windows-latest", text, workflow.name)
-            for action in action_pattern.findall(text):
-                if action.startswith("./"):
-                    continue
-                self.assertRegex(
-                    action,
-                    r"@[0-9a-f]{40}$",
-                    f"{workflow.name} contains a floating action reference: {action}",
-                )
-            pinned_rust_uses += text.count(pinned_rust_action)
-            pinned_rust_inputs += text.count("toolchain: 1.88.0")
-        self.assertEqual(
-            pinned_rust_uses,
-            pinned_rust_inputs,
-            "every SHA-pinned stable Rust action must receive an explicit toolchain input",
-        )
+        self.assertEqual(workflows, [])
 
     def test_comparator_is_locked_audited_and_not_released(self) -> None:
-        ci = (REPOSITORY / ".github/workflows/ci.yml").read_text(encoding="utf-8")
-        security = (REPOSITORY / ".github/workflows/security.yml").read_text(encoding="utf-8")
-        release = (REPOSITORY / ".github/workflows/release-v4-beta.yml").read_text(
+        comparator = (
+            REPOSITORY / "benchmarks/comparators/tun2proxy/Cargo.toml"
+        ).read_text(encoding="utf-8")
+        lock = (REPOSITORY / "benchmarks/comparators/tun2proxy/Cargo.lock").read_text(
             encoding="utf-8"
         )
-        comparator = "benchmarks/comparators/tun2proxy/Cargo.toml"
-        revision = "eed123fbbec06295bf83f9be36d5a0f64ed9a8cb"
-        self.assertIn("tun2proxy-comparator:", ci)
-        self.assertGreaterEqual(ci.count("--locked"), 5)
-        self.assertIn(comparator, security)
-        self.assertIn(revision, security)
-        self.assertIn(
-            '{ allow = ["GPL-3.0-or-later"], crate = "socks5-impl@0.8.7" }',
-            security,
+        notices = (
+            REPOSITORY / "benchmarks/comparators/tun2proxy/THIRD_PARTY_NOTICES.md"
+        ).read_text(encoding="utf-8")
+        release = (REPOSITORY / "scripts/build_v4_windows_rc.ps1").read_text(
+            encoding="utf-8"
         )
-        self.assertIn('{ allow = ["WTFPL"], crate = "tun@0.8.13" }', security)
+        revision = "eed123fbbec06295bf83f9be36d5a0f64ed9a8cb"
+        self.assertIn(revision, comparator)
+        self.assertIn(revision, lock)
+        self.assertIn("GPL-3.0-or-later", notices)
+        self.assertIn("WTFPL", notices)
         product_policy = (REPOSITORY / "host-rust/deny.toml").read_text(encoding="utf-8")
         self.assertNotIn("GPL-3.0-or-later", product_policy)
         self.assertNotIn("WTFPL", product_policy)
         self.assertNotIn("benchmarks/comparators", release)
-        self.assertIn("Verify transferred Android artifact checksums", release)
-        self.assertIn("Verify release build did not rewrite locked inputs", release)
+        self.assertIn('"--locked"', release)
+        self.assertIn("target-feature=+crt-static", release)
 
-    def test_standard_and_beta_rollout_is_publishable_and_user_facing(self) -> None:
+    def test_current_and_legacy_rollout_is_publishable_and_user_facing(self) -> None:
         readme = (REPOSITORY / "README.md").read_text(encoding="utf-8")
-        standard = (REPOSITORY / ".github/workflows/release-v3-standard.yml").read_text(
-            encoding="utf-8"
-        )
-        beta = (REPOSITORY / ".github/workflows/release-v4-beta.yml").read_text(
-            encoding="utf-8"
-        )
         android_v4 = (REPOSITORY / "android-v4/app/build.gradle.kts").read_text(
             encoding="utf-8"
         )
         rust_v4 = (REPOSITORY / "host-rust/Cargo.toml").read_text(encoding="utf-8")
         ignore = (REPOSITORY / ".gitignore").read_text(encoding="utf-8")
 
-        self.assertIn("v3.1 Standard", readme)
-        self.assertIn("v4.0 Beta", readme)
+        self.assertIn("v4.0.0 — current release", readme)
+        self.assertIn("v3.1.0 Legacy", readme)
         self.assertIn("gnirehtet-java-v3.1.0.zip", readme)
-        self.assertIn("gnirehtet-v4.0.0-beta.1-windows-x64.zip", readme)
+        self.assertIn("gnirehtet-v4.0.0-windows-x64.zip", readme)
         self.assertIn("gnirehtet-java-v3.0.0.zip", readme)
         self.assertNotIn("docs/", readme)
         self.assertIn("/docs/", ignore)
-        self.assertIn("gh release create", standard)
-        self.assertNotIn("--prerelease", standard)
-        self.assertIn("gh release create", beta)
-        self.assertIn("--prerelease", beta)
-        self.assertIn('versionName = "4.0.0-beta.1"', android_v4)
-        self.assertIn('version = "4.0.0-beta.1"', rust_v4)
+        self.assertTrue((REPOSITORY / "release").is_file())
+        self.assertTrue((REPOSITORY / "scripts/build_v4_android_rc.sh").is_file())
+        self.assertTrue((REPOSITORY / "scripts/build_v4_windows_rc.ps1").is_file())
+        self.assertIn('versionName = "4.0.0"', android_v4)
+        self.assertIn('version = "4.0.0"', rust_v4)
 
 
 if __name__ == "__main__":

@@ -35,7 +35,7 @@ use crate::{
     control::{ControlConfig, ControlHandle, ControlServer, StateObserver},
     diagnostics::Diagnostics,
     protocol::SessionId,
-    socks::{SocksCommandPolicy, SocksConfig, SocksServer},
+    socks::{RelayGate, SocksCommandPolicy, SocksConfig, SocksServer},
     state::{HostState, StateSnapshot},
 };
 
@@ -533,9 +533,12 @@ impl HostRuntime {
         let diagnostics = Diagnostics::open(&self.config.paths.logs)?;
         let store = StateStore::new(&self.config.paths.status);
         write_daemon_identity(&self.config.paths.daemon_pid, self.config.session_id)?;
+        let relay_gate = RelayGate::default();
         let observer_store = store.clone();
         let observer_diagnostics = diagnostics.clone();
+        let observer_relay_gate = relay_gate.clone();
         let observer: StateObserver = Arc::new(move |snapshot| {
+            observer_relay_gate.set_enabled(snapshot.state == HostState::Connected);
             if let Err(error) = observer_store.write(snapshot, Some(std::process::id())) {
                 let _ = observer_diagnostics.record(
                     "state_persistence_error",
@@ -565,13 +568,15 @@ impl HostRuntime {
             command_policy: SocksCommandPolicy::ConnectOnly,
             ..Default::default()
         })?
-        .with_diagnostics(diagnostics.clone());
+        .with_diagnostics(diagnostics.clone())
+        .with_relay_gate(relay_gate.clone());
         let udp_socks = SocksServer::new(SocksConfig {
             bind: self.config.udp_bind,
             command_policy: SocksCommandPolicy::FwdUdpOnly,
             ..Default::default()
         })?
-        .with_diagnostics(diagnostics.clone());
+        .with_diagnostics(diagnostics.clone())
+        .with_relay_gate(relay_gate);
         let metrics_tcp_socks = tcp_socks.clone();
         let metrics_udp_socks = udp_socks.clone();
         let metrics_control = control.clone();
@@ -1366,13 +1371,17 @@ fn command_text_with_timeout(
     arguments: &[&str],
     timeout: Duration,
 ) -> io::Result<(std::process::ExitStatus, String)> {
+    use std::os::windows::process::CommandExt;
     const MAX_COMMAND_OUTPUT: u64 = 64 * 1024;
-    let mut child = Command::new(program)
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut command = Command::new(program);
+    command
         .args(arguments)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .spawn()?;
+        .creation_flags(CREATE_NO_WINDOW);
+    let mut child = command.spawn()?;
     let status = match child.wait_timeout(timeout)? {
         Some(status) => status,
         None => {
@@ -1842,6 +1851,7 @@ mod tests {
                 {
                     break;
                 }
+                time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
@@ -1854,11 +1864,26 @@ mod tests {
                 admin_command(&paths, "status", Duration::from_secs(3)).await
             }));
         }
-        for client in clients {
-            assert!(client.await.unwrap().unwrap().ok);
-        }
-        assert!(!server_task.is_finished());
+        let outcome = time::timeout(Duration::from_secs(10), async {
+            for client in clients {
+                let response = client
+                    .await
+                    .map_err(|error| format!("admin client task failed: {error}"))?
+                    .map_err(|error| format!("admin client request failed: {error}"))?;
+                if !response.ok {
+                    return Err(format!("admin client was rejected: {:?}", response.error));
+                }
+            }
+            Ok::<(), String>(())
+        })
+        .await;
+        let server_running = !server_task.is_finished();
         server_task.abort();
+        let _ = server_task.await;
+        assert!(server_running);
+        outcome
+            .expect("concurrent named-pipe clients exceeded the test deadline")
+            .unwrap();
     }
 
     #[cfg(unix)]

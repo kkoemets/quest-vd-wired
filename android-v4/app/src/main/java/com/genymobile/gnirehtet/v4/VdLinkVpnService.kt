@@ -5,8 +5,10 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
@@ -16,6 +18,7 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.ParcelFileDescriptor
+import android.os.PowerManager
 import android.os.Process
 import android.util.Log
 import java.io.FileDescriptor
@@ -62,12 +65,39 @@ class VdLinkVpnService : VpnService() {
     // without allowing lifecycle work to grow an unbounded thread pool.
     private val worker: ExecutorService = Executors.newFixedThreadPool(2, LifecycleThreadFactory())
     private val destroyed = AtomicBoolean()
+    private val screenSuspended = AtomicBoolean()
+    private val screenReceiverRegistered = AtomicBoolean()
+
+    private val screenReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                Intent.ACTION_SCREEN_OFF -> setScreenSuspended(true)
+                Intent.ACTION_SCREEN_ON -> setScreenSuspended(false)
+            }
+        }
+    }
 
     private var active: SessionResources? = null
     private var teardownInProgress = false
     private var closingGeneration = 0L
     private var terminalAfterTeardown = LifecycleState.STOPPED
     @Volatile private var sessionId: UUID? = null
+
+    override fun onCreate() {
+        super.onCreate()
+        screenSuspended.set(!getSystemService(PowerManager::class.java).isInteractive)
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_OFF)
+            addAction(Intent.ACTION_SCREEN_ON)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(screenReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("DEPRECATION")
+            registerReceiver(screenReceiver, filter)
+        }
+        screenReceiverRegistered.set(true)
+    }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -231,12 +261,16 @@ class VdLinkVpnService : VpnService() {
             val accepted = synchronized(lifecycleLock) {
                 if (generationGate.isCurrent(resources.generation) && active === resources) {
                     resources.control = supervisor
+                    // Start while holding the same lock used by screen-state
+                    // delivery so a concurrent wake cannot be lost between
+                    // publishing the supervisor and applying its initial pause.
+                    supervisor.start(screenSuspended.get())
                     true
                 } else {
                     false
                 }
             }
-            if (accepted) supervisor.start() else supervisor.close()
+            if (!accepted) supervisor.close()
         } catch (error: Throwable) {
             failGeneration(resources.generation, error)
         }
@@ -248,6 +282,20 @@ class VdLinkVpnService : VpnService() {
                 active === resources &&
                 (supervisor == null || resources.control === supervisor)
         }
+
+    private fun setScreenSuspended(suspended: Boolean) {
+        if (!screenSuspended.compareAndSet(!suspended, suspended)) return
+        val control = synchronized(lifecycleLock) { active?.control }
+        if (suspended) {
+            control?.suspend()
+            if (control != null && state.compareAndSet(LifecycleState.CONNECTED, LifecycleState.DEGRADED)) {
+                lastError.set("Headset is asleep; VPN remains ready to reconnect")
+                updateNotification()
+            }
+        } else {
+            control?.resume()
+        }
+    }
 
     private fun failGeneration(generation: Long, error: Throwable) {
         synchronized(lifecycleLock) {
@@ -436,6 +484,10 @@ class VdLinkVpnService : VpnService() {
     }
 
     override fun onDestroy() {
+        if (screenReceiverRegistered.compareAndSet(true, false)) {
+            runCatching { unregisterReceiver(screenReceiver) }
+                .onFailure { Log.w(TAG, "Could not unregister screen receiver", it) }
+        }
         destroyed.set(true)
         requestStop(failure = if (state.get() == LifecycleState.ERROR) {
             IllegalStateException(lastError.get() ?: "VPN service terminated with an error")

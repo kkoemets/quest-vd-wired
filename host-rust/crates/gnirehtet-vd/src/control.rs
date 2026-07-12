@@ -2,7 +2,7 @@ use std::{
     net::{Ipv4Addr, SocketAddr},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, RwLock,
     },
     time::{Duration, Instant},
 };
@@ -36,6 +36,8 @@ struct ControlCommand {
 pub struct ControlHandle {
     sender: mpsc::Sender<ControlCommand>,
     state: Arc<Mutex<StateMachine>>,
+    observer: Arc<RwLock<Option<StateObserver>>>,
+    publication: Arc<Mutex<()>>,
 }
 
 #[derive(Clone, Default)]
@@ -101,9 +103,20 @@ impl ControlHandle {
     /// Records loss of the host-side carrier without stopping the Android VPN.
     /// A later authenticated heartbeat returns the lifecycle to `connected`.
     pub async fn transport_lost(&self, reason: impl Into<String>) -> StateSnapshot {
+        let _publication = self.publication.lock().await;
         let mut state = self.state.lock().await;
         state.transport_lost(reason);
-        state.snapshot()
+        let snapshot = state.snapshot();
+        drop(state);
+        if let Some(observer) = self
+            .observer
+            .read()
+            .ok()
+            .and_then(|observer| observer.clone())
+        {
+            observer(&snapshot);
+        }
+        snapshot
     }
 }
 
@@ -127,7 +140,8 @@ pub struct ControlServer {
     config: ControlConfig,
     state: Arc<Mutex<StateMachine>>,
     diagnostics: Option<Diagnostics>,
-    observer: Option<StateObserver>,
+    observer: Arc<RwLock<Option<StateObserver>>>,
+    publication: Arc<Mutex<()>>,
     commands: Arc<Mutex<mpsc::Receiver<ControlCommand>>>,
     handle: ControlHandle,
     metrics: ControlMetrics,
@@ -142,16 +156,21 @@ impl ControlServer {
         machine.begin_start(config.session_id)?;
         let state = Arc::new(Mutex::new(machine));
         let (command_tx, command_rx) = mpsc::channel(4);
+        let observer = Arc::new(RwLock::new(None));
+        let publication = Arc::new(Mutex::new(()));
         Ok(Self {
             config,
             state: state.clone(),
             diagnostics: None,
-            observer: None,
+            observer: observer.clone(),
             commands: Arc::new(Mutex::new(command_rx)),
             handle: ControlHandle {
                 sender: command_tx,
                 state,
+                observer,
+                publication: publication.clone(),
             },
+            publication,
             metrics: ControlMetrics::default(),
         })
     }
@@ -161,8 +180,10 @@ impl ControlServer {
         self
     }
 
-    pub fn with_observer(mut self, observer: StateObserver) -> Self {
-        self.observer = Some(observer);
+    pub fn with_observer(self, observer: StateObserver) -> Self {
+        if let Ok(mut slot) = self.observer.write() {
+            *slot = Some(observer);
+        }
         self
     }
 
@@ -404,8 +425,16 @@ impl ControlServer {
     }
 
     async fn publish(&self) {
+        // Serialize publication and re-read authoritative state so an older
+        // Connected snapshot can never arrive after a newer degradation.
+        let _publication = self.publication.lock().await;
         let snapshot = self.state.lock().await.snapshot();
-        if let Some(observer) = &self.observer {
+        if let Some(observer) = self
+            .observer
+            .read()
+            .ok()
+            .and_then(|observer| observer.clone())
+        {
             observer(&snapshot);
         }
         if let Some(diagnostics) = &self.diagnostics {
@@ -526,6 +555,8 @@ impl ControlError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex as StdMutex;
+
     use tokio::net::TcpStream;
 
     use super::*;
@@ -540,6 +571,69 @@ mod tests {
             ControlServer::new(config),
             Err(ControlError::NonLoopbackBind(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn carrier_loss_notifies_the_shared_lifecycle_observer() {
+        let session = SessionId([0x31; 16]);
+        let observed = Arc::new(StdMutex::new(Vec::new()));
+        let observer_values = observed.clone();
+        let server = ControlServer::new(ControlConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            session_id: session,
+        })
+        .unwrap()
+        .with_observer(Arc::new(move |snapshot| {
+            observer_values.lock().unwrap().push(snapshot.state);
+        }));
+        server
+            .state()
+            .lock()
+            .await
+            .peer_started(session, Instant::now())
+            .unwrap();
+
+        let snapshot = server
+            .command_handle()
+            .transport_lost("USB carrier unavailable")
+            .await;
+        assert_eq!(snapshot.state, HostState::Degraded);
+        assert_eq!(*observed.lock().unwrap(), vec![HostState::Degraded]);
+    }
+
+    #[tokio::test]
+    async fn delayed_publication_rereads_authoritative_lifecycle_state() {
+        let session = SessionId([0x32; 16]);
+        let observed = Arc::new(StdMutex::new(Vec::new()));
+        let observer_values = observed.clone();
+        let server = ControlServer::new(ControlConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            session_id: session,
+        })
+        .unwrap()
+        .with_observer(Arc::new(move |snapshot| {
+            observer_values.lock().unwrap().push(snapshot.state);
+        }));
+        server
+            .state()
+            .lock()
+            .await
+            .peer_started(session, Instant::now())
+            .unwrap();
+
+        let publication = server.publication.clone().lock_owned().await;
+        let delayed_server = server.clone();
+        let delayed = tokio::spawn(async move { delayed_server.publish().await });
+        tokio::task::yield_now().await;
+        server
+            .state()
+            .lock()
+            .await
+            .transport_lost("newer carrier loss");
+        drop(publication);
+        delayed.await.unwrap();
+
+        assert_eq!(*observed.lock().unwrap(), vec![HostState::Degraded]);
     }
 
     #[tokio::test]
