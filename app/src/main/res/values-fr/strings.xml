@@ -2,5 +2,8 @@
 <resources>
     <string name="relay_connected">Reverse tethering activé</string>
     <string name="relay_disconnected">Déconnecté du serveur relais</string>
-    <string name="stop_vpn">Arrêter Gnirehtet</string>
+    <string name="stop_vpn">Arrêter la liaison filaire</string>
+    <string name="wired_link_title">Liaison filaire Quest</string>
+    <string name="wired_link_status">État : %1$s\n%2$s</string>
+    <string name="stop_requested">État : ARRÊT EN COURS\nArrêt demandé</string>
 </resources>

@@ -135,4 +135,71 @@ public class IPv4PacketBufferTest {
         Assert.assertEquals(1234, udpHeader.getSourcePort());
         Assert.assertEquals(5678, udpHeader.getDestinationPort());
     }
+
+    @Test
+    public void testRejectInvalidVersion() throws IOException {
+        ByteBuffer packet = createMockPacket();
+        packet.put(0, (byte) ((6 << 4) | 5));
+        assertMalformed(packet);
+    }
+
+    @Test
+    public void testRejectTotalLengthShorterThanHeader() throws IOException {
+        ByteBuffer packet = createMockPacket();
+        packet.putShort(2, (short) 12);
+        assertMalformed(packet);
+    }
+
+    @Test
+    public void testRejectInvalidIpv4HeaderLength() throws IOException {
+        ByteBuffer packet = createMockPacket();
+        packet.put(0, (byte) ((4 << 4) | 15));
+        assertMalformed(packet);
+    }
+
+    @Test
+    public void testRejectInconsistentUdpLength() throws IOException {
+        ByteBuffer packet = createMockPacket();
+        packet.putShort(24, (short) 8);
+        assertMalformed(packet);
+    }
+
+    @Test
+    public void testRejectInvalidTcpHeaderLength() throws IOException {
+        ByteBuffer packet = createMockTcpPacket();
+        packet.put(32, (byte) 0xf0);
+        assertMalformed(packet);
+    }
+
+    private static ByteBuffer createMockTcpPacket() {
+        ByteBuffer packet = ByteBuffer.allocate(40);
+        packet.put((byte) ((4 << 4) | 5));
+        packet.put((byte) 0);
+        packet.putShort((short) 40);
+        packet.putInt(0);
+        packet.put((byte) 64);
+        packet.put((byte) 6);
+        packet.putShort((short) 0);
+        packet.putInt(0x12345678);
+        packet.putInt(0x42424242);
+        packet.putShort((short) 1234);
+        packet.putShort((short) 5678);
+        packet.putLong(0);
+        packet.putShort((short) (5 << 12));
+        packet.putShort((short) 1024);
+        packet.putInt(0);
+        packet.flip();
+        return packet;
+    }
+
+    private static void assertMalformed(ByteBuffer packet) throws IOException {
+        IPv4PacketBuffer packetBuffer = new IPv4PacketBuffer();
+        packetBuffer.readFrom(contentToChannel(packet));
+        try {
+            packetBuffer.asIPv4Packet();
+            Assert.fail("Expected malformed packet rejection");
+        } catch (IOException e) {
+            Assert.assertTrue(e.getMessage().contains("Malformed Android packet"));
+        }
+    }
 }

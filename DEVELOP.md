@@ -1,142 +1,136 @@
-# Developing The Quest 3 Fork
+# Development
 
-This repository is maintained as a **Quest 3 link-cable reverse tethering
-fork** of gnirehtet. The active codebase is:
+The repository deliberately carries two product generations:
 
-- the Android client in [`app/`](app/)
-- the Java relay in [`relay-java/`](relay-java/)
+- `app/` and `relay-java/` are the supported v3.1 safety/performance baseline.
+- `android-v4/` and `host-rust/` are the Quest 3/Virtual Desktop v4 Beta.
 
-The Rust relay has been removed from this fork.
+Do not delete the Java baseline until v4 has reviewable passing evidence from
+the target Quest 3 and Windows hardware, including long runs and lifecycle
+cycling.
 
-## Tooling
+## v3.1 build
 
-- Android Studio with the Android SDK installed
-- a Java 11 runtime for local Gradle builds
-- `adb` from Android platform-tools
-
-Android Studio is the recommended IDE for this repository. Plain IntelliJ is
-not a good fit for the Android module and signing flow.
-
-This project still uses Gradle 5.4.1 and Android Gradle Plugin 3.5.0. In
-practice that means modern systems usually need **Java 11**, not the newest JDK
-on the machine.
-
-If your default `java` is too new, point `JAVA_HOME` at a Java 11 runtime
-before running Gradle.
-
-## Local Setup
-
-Create a local `local.properties` file that points to your Android SDK:
+The legacy Gradle build requires JDK 11, Android SDK platform 28, and build
+tools 28.0.3. Point `local.properties` at the Android SDK:
 
 ```properties
 sdk.dir=/path/to/Android/sdk
 ```
 
-That file is local-only and should not be committed.
+Build and test with:
 
-## Build
-
-Use the Gradle wrapper:
-
-```bash
-./gradlew build
+```console
+JAVA_HOME=/path/to/jdk-11 ./gradlew checkAll :relay-java:jar :app:assembleDebug
 ```
 
-Important root tasks:
+The release APK preserves application ID `com.genymobile.gnirehtet`. Release
+signing uses Gradle properties and must use the existing fork key for in-place
+upgrades:
 
-- `debugJava` builds the debug Android app and the Java relay
-- `releaseJava` builds the release Android app and the Java relay
-- `checkJava` runs checks for both modules
-- `debugAll`, `releaseAll`, and `checkAll` are aliases for the Java-only fork
-
-Useful focused builds:
-
-```bash
-./gradlew :relay-java:jar
-./gradlew :app:assembleDebug
-./gradlew :app:assembleRelease
-./gradlew :relay-java:check
+```properties
+RELEASE_STORE_FILE=/absolute/path/to/gnirehtet-release.jks
+RELEASE_STORE_PASSWORD=...
+RELEASE_KEY_ALIAS=...
+RELEASE_KEY_PASSWORD=...
 ```
 
-## Release Outputs
+Signing files belong in `.local-signing/` or another private location and must
+never be committed. `dist/`, root generated APKs, and local signing material are
+ignored.
 
-The release bundle is still built around the same files:
+The root `release` script builds the v3.1 fallback bundle. Its Windows repair
+script must remain fail-closed on a pinned official platform-tools checksum.
 
-- `gnirehtet.apk`
-- `gnirehtet.jar`
-- `README.txt`
-- `gnirehtet`
-- `gnirehtet.cmd`
-- `gnirehtet-get-adb.cmd`
-- `gnirehtet-run.cmd`
+## Android v4 build
 
-The packaging script is [`release`](release). It expects:
+Android v4 uses Gradle 9.4.1, Android Gradle Plugin 9.2, JDK 17 language level,
+compile/target SDK 36, NDK 28.2.13676358, min SDK 29, and arm64-v8a only.
 
-- a release APK from `app/build/outputs/apk/release/`
-- the relay jar from `relay-java/build/libs/`
-- the launcher scripts from `relay-java/scripts/`
-
-## Release Signing
-
-Public releases should use a **signed** Android release build.
-
-Signing is configured through [`config/android-signing.gradle`](config/android-signing.gradle)
-and activates only if these Gradle properties exist:
-
-- `RELEASE_STORE_FILE`
-- `RELEASE_STORE_PASSWORD`
-- `RELEASE_KEY_ALIAS`
-- `RELEASE_KEY_PASSWORD`
-
-Without those properties, Gradle produces `gnirehtet-release-unsigned.apk`
-instead of `gnirehtet-release.apk`, and the packaging script will not complete
-as-is.
-
-If you publish this fork with your own signing key, Android treats it as a
-different signer than the original upstream APK. Existing upstream users must
-uninstall `com.genymobile.gnirehtet` once before installing the forked release.
-
-## Architecture
-
-The Android client registers a [VPN], intercepts the headset's IPv4 traffic,
-and forwards raw packets to the relay server over a TCP connection established
-through `adb reverse`:
-
-```bash
-adb reverse localabstract:gnirehtet tcp:31416
+```console
+cd android-v4
+ANDROID_HOME=/path/to/android-sdk JAVA_HOME=/path/to/jdk-17 \
+  ./gradlew testDebugUnitTest lintDebug assembleDebug
 ```
 
-The relay server receives those packets and opens normal TCP and UDP sockets on
-the computer, effectively acting as a user-space NAT for the connected headset.
+The build fetches HEV Socks5Tunnel at
+`c6e4c72246fb0f20bda299f0efc7814bb3098d57`, checks out its exact gitlinks,
+and rejects a locally modified dependency tree. Notices are packaged from
+`android-v4/app/src/main/assets/THIRD_PARTY_NOTICES.md`.
 
-[VPN]: https://developer.android.com/reference/android/net/VpnService.html
+Android v4 keeps application ID `com.genymobile.gnirehtet` and accepts the same
+release-signing Gradle properties as v3.1. Namespace changes do not change the
+installed package identity.
 
-## Main Components
+## Rust v4 host
 
-Android-side code in [`app/`](app/):
+Use the release/CI toolchain, Rust 1.88:
 
-- [`GnirehtetActivity`](app/src/main/java/com/genymobile/gnirehtet/GnirehtetActivity.java)
-  receives the `START` and `STOP` intents
-- [`GnirehtetService`](app/src/main/java/com/genymobile/gnirehtet/GnirehtetService.java)
-  owns the VPN lifecycle
-- [`RelayTunnel`](app/src/main/java/com/genymobile/gnirehtet/RelayTunnel.java)
-  and [`PersistentRelayTunnel`](app/src/main/java/com/genymobile/gnirehtet/PersistentRelayTunnel.java)
-  manage the host relay connection
+```console
+cargo fmt --manifest-path host-rust/Cargo.toml --all -- --check
+cargo clippy --manifest-path host-rust/Cargo.toml --all-targets -- -D warnings
+cargo test --manifest-path host-rust/Cargo.toml --all-targets
+```
 
-Relay-side code in [`relay-java/`](relay-java/):
+The host listeners must remain loopback-only. ADB operations must use one
+configured executable, have deadlines, and roll back every partial mapping.
+Explicit Stop is successful only after Android acknowledges descriptor closure
+and all product mappings are absent. Unexpected host/cable loss must retain the
+Quest VPN and move to `degraded`.
 
-- [`Main`](relay-java/src/main/java/com/genymobile/gnirehtet/Main.java)
-  implements the CLI commands and reconnect behavior
-- [`Relay`](relay-java/src/main/java/com/genymobile/gnirehtet/relay/Relay.java)
-  owns the selector loop
-- [`Client`](relay-java/src/main/java/com/genymobile/gnirehtet/relay/Client.java)
-  represents one connected Android client
+The ignored synthetic soak test is opt-in:
 
-![archi](assets/archi.png)
+```console
+cargo test --manifest-path host-rust/Cargo.toml --test synthetic_udp -- \
+  --ignored --nocapture
+```
 
-## Quest 3 Behavior Notes
+## Protocol and dependency rules
 
-- `run` in this fork is intended to recover better after Quest cable reconnects.
-- Reconnect restores the tunnel, but it does not preserve existing TCP sessions.
-- The transport is still VPN-over-ADB, so it is not a full Ethernet bridge or
-  guaranteed same-LAN replacement for discovery-heavy apps.
+`GNR4` is a clean break from v3. Header and message fixtures must match between
+Kotlin and Rust. Reject bad magic, unknown versions/types, oversized frames,
+and stale sessions before unbounded allocation.
+
+Every release must include:
+
+- Android and Windows build/test results
+- protocol/parser property tests and fuzz results
+- dependency and license scan output
+- CycloneDX or SPDX SBOMs
+- SHA-256 checksums
+- reproducibility comparison for independently built artifacts
+- raw hardware-gate evidence or a clear statement that v4 remains experimental
+
+No diagnostics backend exists. Tests and product code must never write packet
+payloads to logs.
+
+The trust boundaries, failure policy, local command-channel requirement, and
+release supply-chain rules must remain enforced by code, tests, and workflows.
+
+## v4 Beta release
+
+The `Publish v4.0 Beta` workflow requires these repository
+secrets:
+
+- `ANDROID_RELEASE_KEYSTORE_BASE64`
+- `ANDROID_RELEASE_STORE_PASSWORD`
+- `ANDROID_RELEASE_KEY_ALIAS`
+- `ANDROID_RELEASE_KEY_PASSWORD`
+- `ANDROID_RELEASE_CERT_SHA256`
+
+The Android job fails closed unless the certificate, application ID, version,
+non-debuggable flag, arm64 ABI, native engine, and packaged notices all match.
+It builds twice and compares the signed APK payload independently of the APK
+signing block. The Windows job embeds that exact signed APK, verifies the byte
+sequence in the executable, performs a clean second build, and packages SBOMs,
+notices, and SHA-256 manifests.
+
+Local release-tool tests do not need signing material:
+
+```console
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/tests -v
+```
+
+Never print, copy, or commit the decoded keystore or its passwords. Disposable
+keys are suitable only for testing the release pipeline, not for an in-place
+upgrade artifact.

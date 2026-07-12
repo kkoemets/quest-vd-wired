@@ -1,0 +1,566 @@
+package com.genymobile.gnirehtet.v4
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ApplicationInfo
+import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
+import android.net.VpnService
+import android.os.Build
+import android.os.Handler
+import android.os.IBinder
+import android.os.Looper
+import android.os.ParcelFileDescriptor
+import android.os.Process
+import android.util.Log
+import java.io.FileDescriptor
+import java.io.IOException
+import java.io.PrintWriter
+import java.util.UUID
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.ThreadFactory
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
+
+internal fun canFinishRejectedStart(hasActiveResources: Boolean, teardownInProgress: Boolean): Boolean =
+    !hasActiveResources && !teardownInProgress
+
+internal fun stopTargetsGeneration(
+    expectedGeneration: Long?,
+    activeGeneration: Long?,
+    teardownInProgress: Boolean,
+    closingGeneration: Long,
+    expectedIsCurrent: Boolean,
+): Boolean = expectedGeneration == null ||
+    expectedIsCurrent ||
+    activeGeneration == expectedGeneration ||
+    (teardownInProgress && closingGeneration == expectedGeneration)
+
+class VdLinkVpnService : VpnService() {
+    private data class SessionResources(
+        val generation: Long,
+        val parameters: SessionParameters,
+        val vpnInterface: ParcelFileDescriptor,
+        val tunnel: NativeTunnel,
+        val engineStartLock: Any = Any(),
+        @Volatile var control: ControlSupervisor? = null,
+    )
+
+    private val lifecycleLock = Any()
+    private val generationGate = GenerationGate()
+    private val stopAcknowledgements = StopAcknowledgements()
+    private val mainHandler = Handler(Looper.getMainLooper())
+    // Native startup may be waiting for readiness while an explicit Stop must
+    // still tear the descriptor down promptly. Two workers cover that overlap
+    // without allowing lifecycle work to grow an unbounded thread pool.
+    private val worker: ExecutorService = Executors.newFixedThreadPool(2, LifecycleThreadFactory())
+    private val destroyed = AtomicBoolean()
+
+    private var active: SessionResources? = null
+    private var teardownInProgress = false
+    private var closingGeneration = 0L
+    private var terminalAfterTeardown = LifecycleState.STOPPED
+    @Volatile private var sessionId: UUID? = null
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        when (intent?.action) {
+            ACTION_STOP -> requestStop()
+            ACTION_START -> startVpn(intent)
+        }
+        return Service.START_NOT_STICKY
+    }
+
+    private fun startVpn(intent: Intent) {
+        val parameters = try {
+            SessionParameters.parse(
+                intent.getStringExtra(EXTRA_SESSION_ID),
+                intent.getStringExtra(EXTRA_VD_PACKAGE),
+                intent.getIntExtra(EXTRA_SOCKS_PORT, DEFAULT_SOCKS_PORT),
+                intent.getIntExtra(EXTRA_UDP_PORT, DEFAULT_UDP_PORT),
+                intent.getIntExtra(EXTRA_CONTROL_PORT, DEFAULT_CONTROL_PORT),
+                intent.getBooleanExtra(EXTRA_ALL_TRAFFIC, false),
+            )
+        } catch (error: RuntimeException) {
+            rejectStart(error)
+            return
+        }
+
+        val generation = synchronized(lifecycleLock) {
+            val existing = active
+            if (existing != null || teardownInProgress) {
+                if (existing?.parameters?.sessionId != parameters.sessionId) {
+                    lastError.set("Another wired-link session is already active")
+                    updateNotification()
+                }
+                return
+            }
+            stopAcknowledgements.reset()
+            generationGate.begin().also {
+                state.set(LifecycleState.PREPARING)
+                lastError.set(null)
+                sessionId = parameters.sessionId
+                controlRtt.reset()
+            }
+        }
+
+        try {
+            startForegroundCompat(buildNotification())
+        } catch (error: RuntimeException) {
+            failGeneration(generation, error)
+            return
+        }
+
+        var established: ParcelFileDescriptor? = null
+        try {
+            validateVdApplication(parameters.vdPackage)
+            val builder = Builder()
+                .setSession(getString(R.string.app_name))
+                .setMtu(MTU)
+                .setMetered(false)
+                .setUnderlyingNetworks(null)
+                .addAddress("10.0.0.2", 32)
+                .addRoute("0.0.0.0", 0)
+                .addDnsServer("1.1.1.1")
+
+            if (parameters.allTraffic) {
+                builder.addDisallowedApplication(packageName)
+            } else {
+                builder.addAllowedApplication(parameters.vdPackage)
+            }
+
+            established = builder.establish() ?: throw IllegalStateException("VPN permission is not prepared")
+            val resources = SessionResources(
+                generation,
+                parameters,
+                established,
+                HevTunnel(this),
+            )
+            val accepted = synchronized(lifecycleLock) {
+                if (generationGate.isCurrent(generation) && !teardownInProgress) {
+                    active = resources
+                    vpnDescriptorOpen.set(true)
+                    true
+                } else {
+                    false
+                }
+            }
+            if (!accepted) {
+                established.close()
+                return
+            }
+            established = null
+            worker.execute { initializeNativeEngine(resources) }
+        } catch (error: Throwable) {
+            try {
+                established?.close()
+            } catch (closeError: IOException) {
+                error.addSuppressed(closeError)
+            }
+            failGeneration(generation, error)
+        }
+    }
+
+    private fun validateVdApplication(vdPackage: String) {
+        val application = try {
+            packageManager.getApplicationInfo(vdPackage, 0)
+        } catch (error: PackageManager.NameNotFoundException) {
+            throw IllegalStateException("Virtual Desktop is not installed: $vdPackage", error)
+        }
+        val identity = VdAppIdentity(
+            application.packageName,
+            application.uid,
+            application.flags and (ApplicationInfo.FLAG_SYSTEM or ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0,
+            packageManager.getPackagesForUid(application.uid)?.toSet().orEmpty(),
+        )
+        VdAppIdentityValidator.validate(identity, packageName, Process.myUid())
+    }
+
+    private fun initializeNativeEngine(resources: SessionResources) {
+        try {
+            synchronized(resources.engineStartLock) {
+                if (!isCurrent(resources)) return
+                resources.tunnel.start(
+                    resources.vpnInterface.fd,
+                    resources.parameters.socksPort,
+                    resources.parameters.udpPort,
+                    MTU,
+                )
+            }
+            resources.tunnel.awaitReady(ENGINE_START_TIMEOUT_MS)
+            if (!isCurrent(resources)) return
+
+            lateinit var supervisor: ControlSupervisor
+            supervisor = ControlSupervisor(
+                resources.parameters.sessionId,
+                resources.parameters.controlPort,
+                object : ControlSupervisor.Listener {
+                    override fun shouldReportStarted(): Boolean = isCurrent(resources, supervisor)
+
+                    override fun onControlConnected() {
+                        if (isCurrent(resources, supervisor)) {
+                            state.set(LifecycleState.CONNECTED)
+                            lastError.set(null)
+                            updateNotification()
+                        }
+                    }
+
+                    override fun onControlDegraded(error: Exception?) {
+                        if (isCurrent(resources, supervisor)) {
+                            state.set(LifecycleState.DEGRADED)
+                            lastError.set(error?.message)
+                            updateNotification()
+                        }
+                    }
+
+                    override fun onControlRttSample(rttNanos: Long) {
+                        if (isCurrent(resources, supervisor)) controlRtt.record(rttNanos)
+                    }
+
+                    override fun onControlStopRequested(sendStopped: () -> Unit) {
+                        requestStop(resources.generation, sendStopped)
+                    }
+                },
+            )
+            val accepted = synchronized(lifecycleLock) {
+                if (generationGate.isCurrent(resources.generation) && active === resources) {
+                    resources.control = supervisor
+                    true
+                } else {
+                    false
+                }
+            }
+            if (accepted) supervisor.start() else supervisor.close()
+        } catch (error: Throwable) {
+            failGeneration(resources.generation, error)
+        }
+    }
+
+    private fun isCurrent(resources: SessionResources, supervisor: ControlSupervisor? = null): Boolean =
+        synchronized(lifecycleLock) {
+            generationGate.isCurrent(resources.generation) &&
+                active === resources &&
+                (supervisor == null || resources.control === supervisor)
+        }
+
+    private fun failGeneration(generation: Long, error: Throwable) {
+        synchronized(lifecycleLock) {
+            if (!generationGate.isCurrent(generation)) return
+        }
+        Log.e(TAG, "v4 VPN session failed", error)
+        lastError.set(error.message ?: error.javaClass.simpleName)
+        requestStop(generation, failure = error)
+    }
+
+    private fun finishWithoutResources(error: Throwable) {
+        Log.e(TAG, "Cannot prepare v4 VPN", error)
+        lastError.set(error.message ?: error.javaClass.simpleName)
+        state.set(LifecycleState.ERROR)
+        vpnDescriptorOpen.set(false)
+        mainHandler.post {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+        }
+    }
+
+    private fun rejectStart(error: Throwable) {
+        val mayFinish = synchronized(lifecycleLock) {
+            canFinishRejectedStart(active != null, teardownInProgress)
+        }
+        if (!mayFinish) {
+            Log.w(TAG, "Rejected malformed START without disturbing the current VPN session", error)
+            return
+        }
+        finishWithoutResources(error)
+    }
+
+    private fun requestStop(
+        expectedGeneration: Long? = null,
+        sendStopped: (() -> Unit)? = null,
+        failure: Throwable? = null,
+    ) {
+        var resourcesToClose: SessionResources? = null
+        var runAcknowledgement: (() -> Unit)? = null
+        var finishEmptyStop = false
+
+        synchronized(lifecycleLock) {
+            val matchesActive = stopTargetsGeneration(
+                expectedGeneration,
+                active?.generation,
+                teardownInProgress,
+                closingGeneration,
+                expectedGeneration?.let(generationGate::isCurrent) == true,
+            )
+            if (!matchesActive) {
+                return@synchronized
+            }
+
+            if (sendStopped != null) {
+                when (stopAcknowledgements.register(sendStopped)) {
+                    StopAcknowledgements.Registration.RUN_NOW -> runAcknowledgement = sendStopped
+                    StopAcknowledgements.Registration.REJECTED -> Unit
+                    StopAcknowledgements.Registration.QUEUED -> Unit
+                }
+            }
+
+            if (failure != null) {
+                terminalAfterTeardown = LifecycleState.ERROR
+                lastError.set(failure.message ?: failure.javaClass.simpleName)
+            }
+            if (teardownInProgress) return@synchronized
+
+            val resources = active
+            if (resources == null) {
+                expectedGeneration?.let(generationGate::invalidate)
+                vpnDescriptorOpen.set(false)
+                if (failure != null) {
+                    state.set(LifecycleState.ERROR)
+                } else if (state.get() != LifecycleState.ERROR) {
+                    state.set(LifecycleState.STOPPED)
+                    sessionId = null
+                }
+                finishEmptyStop = true
+                return@synchronized
+            }
+
+            active = null
+            generationGate.invalidate(resources.generation)
+            teardownInProgress = true
+            closingGeneration = resources.generation
+            terminalAfterTeardown = if (failure == null) LifecycleState.STOPPED else LifecycleState.ERROR
+            state.set(LifecycleState.STOPPING)
+            resourcesToClose = resources
+        }
+
+        runAcknowledgement?.let(::invokeAcknowledgement)
+        resourcesToClose?.let { worker.execute { teardown(it) } }
+        if (finishEmptyStop) {
+            mainHandler.post {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+            }
+        }
+    }
+
+    private fun teardown(resources: SessionResources) {
+        val errors = mutableListOf<Throwable>()
+        var descriptorClosed = false
+        var engineStopped = false
+        var stopRequested = false
+
+        synchronized(resources.engineStartLock) {
+            try {
+                resources.tunnel.requestStop()
+                stopRequested = true
+            } catch (error: Throwable) {
+                errors += error
+            }
+            if (stopRequested) {
+                try {
+                    engineStopped = resources.tunnel.awaitStopped(ENGINE_QUIESCE_BEFORE_CLOSE_TIMEOUT_MS)
+                } catch (error: Throwable) {
+                    errors += error
+                }
+            }
+            try {
+                resources.vpnInterface.close()
+                descriptorClosed = true
+                vpnDescriptorOpen.set(false)
+            } catch (error: Throwable) {
+                errors += error
+                vpnDescriptorOpen.set(true)
+            }
+        }
+
+        if (descriptorClosed) {
+            stopAcknowledgements.descriptorClosed().forEach(::invokeAcknowledgement)
+        } else {
+            stopAcknowledgements.descriptorCloseFailed()
+        }
+
+        if (!engineStopped) {
+            try {
+                if (!resources.tunnel.awaitStopped(ENGINE_STOP_TIMEOUT_MS)) {
+                    errors += IllegalStateException("HEV native engine did not stop within ${ENGINE_STOP_TIMEOUT_MS}ms after VPN closure")
+                }
+            } catch (error: Throwable) {
+                errors += error
+            }
+        }
+        try {
+            resources.control?.close()
+        } catch (error: Throwable) {
+            errors += error
+        }
+
+        synchronized(lifecycleLock) {
+            teardownInProgress = false
+            closingGeneration = 0L
+            val terminal = if (errors.isEmpty()) terminalAfterTeardown else LifecycleState.ERROR
+            state.set(terminal)
+            if (terminal == LifecycleState.STOPPED) sessionId = null
+            if (errors.isNotEmpty()) {
+                val detail = errors.joinToString("; ") { it.message ?: it.javaClass.simpleName }
+                val existing = lastError.get()
+                lastError.set(listOfNotNull(existing, detail).distinct().joinToString("; "))
+                errors.forEach { Log.e(TAG, "Resource teardown failure", it) }
+            }
+        }
+
+        if (destroyed.get()) worker.shutdown()
+
+        mainHandler.post {
+            updateNotification()
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+        }
+    }
+
+    private fun invokeAcknowledgement(acknowledgement: () -> Unit) {
+        try {
+            acknowledgement()
+        } catch (error: Throwable) {
+            Log.w(TAG, "Could not acknowledge STOP", error)
+        }
+    }
+
+    override fun onRevoke() {
+        requestStop()
+        super.onRevoke()
+    }
+
+    override fun onDestroy() {
+        destroyed.set(true)
+        requestStop(failure = if (state.get() == LifecycleState.ERROR) {
+            IllegalStateException(lastError.get() ?: "VPN service terminated with an error")
+        } else {
+            null
+        })
+        synchronized(lifecycleLock) {
+            if (!teardownInProgress) worker.shutdown()
+        }
+        super.onDestroy()
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = super.onBind(intent)
+
+    override fun dump(fd: FileDescriptor, writer: PrintWriter, args: Array<out String>) {
+        val resources = synchronized(lifecycleLock) { active }
+        val tunnel = resources?.tunnel
+        val stats = runCatching { tunnel?.stats() }.getOrNull()
+        val rtt = controlRtt.snapshot()
+        writer.println("gnirehtet.state=${state.get()}")
+        writer.println("vpnFdOpen=${vpnDescriptorOpen.get()}")
+        writer.println("sessionId=${sessionId ?: "none"}")
+        writer.println("lastError=${lastError.get() ?: "none"}")
+        writer.println("socksPort=${resources?.parameters?.socksPort ?: "none"}")
+        writer.println("udpPort=${resources?.parameters?.udpPort ?: "none"}")
+        writer.println("controlPort=${resources?.parameters?.controlPort ?: "none"}")
+        writer.println("controlRttSamples=${rtt.samples}")
+        writer.println("controlRttP99Us=${rtt.p99Micros}")
+        writer.println("controlRttMaxUs=${rtt.maxMicros}")
+        writer.println("controlRttHistogram=${rtt.histogram.joinToString(",")}")
+        if (stats != null && stats.size >= 4) {
+            writer.println("txPackets=${stats[0]} txBytes=${stats[1]} rxPackets=${stats[2]} rxBytes=${stats[3]}")
+        }
+    }
+
+    private fun buildNotification(): Notification {
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.createNotificationChannel(
+            NotificationChannel(CHANNEL_ID, getString(R.string.status_title), NotificationManager.IMPORTANCE_LOW),
+        )
+        val open = PendingIntent.getActivity(
+            this,
+            1,
+            Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        val stop = PendingIntent.getService(
+            this,
+            2,
+            Intent(this, VdLinkVpnService::class.java).setAction(ACTION_STOP),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        return Notification.Builder(this, CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_usb_24)
+            .setContentTitle(getString(R.string.status_title))
+            .setContentText(state.get().name.lowercase())
+            .setContentIntent(open)
+            .setOngoing(true)
+            .addAction(Notification.Action.Builder(null, getString(R.string.stop_link), stop).build())
+            .build()
+    }
+
+    private fun startForegroundCompat(notification: Notification) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
+    }
+
+    private fun updateNotification() {
+        try {
+            getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, buildNotification())
+        } catch (error: SecurityException) {
+            Log.w(TAG, "Notification permission is unavailable", error)
+        }
+    }
+
+    companion object {
+        const val ACTION_START = "com.genymobile.gnirehtet.v4.START"
+        const val ACTION_STOP = "com.genymobile.gnirehtet.v4.STOP"
+        const val EXTRA_ALL_TRAFFIC = "allTraffic"
+        const val EXTRA_VD_PACKAGE = "vdPackage"
+        const val EXTRA_SOCKS_PORT = "socksPort"
+        const val EXTRA_UDP_PORT = "udpPort"
+        const val EXTRA_CONTROL_PORT = "controlPort"
+        const val EXTRA_SESSION_ID = "sessionId"
+        const val DEFAULT_VD_PACKAGE = "VirtualDesktop.Android"
+        const val DEFAULT_SOCKS_PORT = 31_416
+        const val DEFAULT_UDP_PORT = 31_418
+        const val DEFAULT_CONTROL_PORT = 31_417
+        const val MTU = 1_500
+
+        val state: AtomicReference<LifecycleState> = AtomicReference(LifecycleState.STOPPED)
+        val lastError: AtomicReference<String?> = AtomicReference(null)
+        val vpnDescriptorOpen = AtomicBoolean(false)
+        internal val controlRtt = ControlRttMetrics()
+
+        private const val TAG = "VdLinkVpnService"
+        private const val CHANNEL_ID = "wired-vd-link"
+        private const val NOTIFICATION_ID = 31_416
+        private const val ENGINE_START_TIMEOUT_MS = 5_000
+        private const val ENGINE_QUIESCE_BEFORE_CLOSE_TIMEOUT_MS = 500
+        private const val ENGINE_STOP_TIMEOUT_MS = 1_500
+
+        fun start(context: Context, source: Intent) {
+            val intent = Intent(context, VdLinkVpnService::class.java)
+                .setAction(ACTION_START)
+                .putExtras(source)
+            context.startForegroundService(intent)
+        }
+
+        fun stop(context: Context) {
+            context.startService(
+                Intent(context, VdLinkVpnService::class.java).setAction(ACTION_STOP),
+            )
+        }
+    }
+
+    private class LifecycleThreadFactory : ThreadFactory {
+        private val sequence = AtomicInteger()
+
+        override fun newThread(task: Runnable): Thread = Thread(
+            task,
+            "gnr4-lifecycle-${sequence.incrementAndGet()}",
+        ).apply { isDaemon = true }
+    }
+}

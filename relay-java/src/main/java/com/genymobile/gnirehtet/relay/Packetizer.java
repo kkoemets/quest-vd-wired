@@ -17,7 +17,10 @@
 package com.genymobile.gnirehtet.relay;
 
 import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.net.SocketAddress;
 import java.nio.ByteBuffer;
+import java.nio.channels.DatagramChannel;
 import java.nio.channels.ReadableByteChannel;
 
 /**
@@ -25,13 +28,26 @@ import java.nio.channels.ReadableByteChannel;
  */
 public class Packetizer {
 
-    private final ByteBuffer buffer = ByteBuffer.allocate(IPv4Packet.MAX_PACKET_LENGTH);
+    private final ByteBuffer buffer;
     private final ByteBuffer payloadBuffer;
+    private final int maximumPacketLength;
 
     private final IPv4Header responseIPv4Header;
     private final TransportHeader responseTransportHeader;
 
     public Packetizer(IPv4Header ipv4Header, TransportHeader transportHeader) {
+        this(ipv4Header, transportHeader, IPv4Packet.MAX_PACKET_LENGTH - 1);
+    }
+
+    public Packetizer(IPv4Header ipv4Header, TransportHeader transportHeader, int maximumPacketLength) {
+        int headerLength = ipv4Header.getHeaderLength() + transportHeader.getHeaderLength();
+        if (maximumPacketLength < headerLength || maximumPacketLength >= IPv4Packet.MAX_PACKET_LENGTH) {
+            throw new IllegalArgumentException("Invalid maximum packet length: " + maximumPacketLength);
+        }
+        Diagnostics.increment("allocations.packetizer");
+        this.maximumPacketLength = maximumPacketLength;
+        // One probe byte makes oversized UDP datagrams detectable instead of silently truncated.
+        buffer = ByteBuffer.allocate(maximumPacketLength + 1);
         responseIPv4Header = ipv4Header.copyTo(buffer);
         responseTransportHeader = transportHeader.copyTo(buffer);
         payloadBuffer = buffer.slice();
@@ -51,7 +67,9 @@ public class Packetizer {
     }
 
     public IPv4Packet packetize(ReadableByteChannel channel, int maxChunkSize) throws IOException {
-        payloadBuffer.limit(maxChunkSize).position(0);
+        int maximumPayloadLength = maximumPacketLength - responseIPv4Header.getHeaderLength()
+                - responseTransportHeader.getHeaderLength();
+        payloadBuffer.limit(Math.min(maxChunkSize, maximumPayloadLength)).position(0);
         int payloadLength = channel.read(payloadBuffer);
         if (payloadLength == -1) {
             return null;
@@ -62,6 +80,30 @@ public class Packetizer {
 
     public IPv4Packet packetize(ReadableByteChannel channel) throws IOException {
         return packetize(channel, payloadBuffer.capacity());
+    }
+
+    /** Returns {@code null} when a non-blocking datagram channel has been drained. */
+    public IPv4Packet packetizeDatagram(DatagramChannel channel) throws IOException {
+        payloadBuffer.limit(payloadBuffer.capacity()).position(0);
+        SocketAddress source = channel.receive(payloadBuffer);
+        if (source == null) {
+            return null;
+        }
+        int packetLength = responseIPv4Header.getHeaderLength() + responseTransportHeader.getHeaderLength()
+                + payloadBuffer.position();
+        if (packetLength > maximumPacketLength) {
+            Diagnostics.increment("drops.udp_oversize_reply");
+            Diagnostics.add("drops.udp_oversize_reply_bytes", payloadBuffer.position());
+            return null;
+        }
+        if (!(source instanceof InetSocketAddress)) {
+            throw new IOException("Unsupported UDP reply address: " + source);
+        }
+        InetSocketAddress inetSource = (InetSocketAddress) source;
+        responseIPv4Header.setSource(Net.toIpv4Int(inetSource.getAddress()));
+        responseTransportHeader.setSourcePort(inetSource.getPort());
+        payloadBuffer.flip();
+        return inflate();
     }
 
     private IPv4Packet inflate() {
@@ -80,5 +122,9 @@ public class Packetizer {
         IPv4Packet packet = new IPv4Packet(buffer);
         packet.computeChecksums();
         return packet;
+    }
+
+    int getAllocatedBytes() {
+        return buffer.capacity();
     }
 }

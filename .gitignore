@@ -3,3 +3,28 @@ build/
 .idea/
 *.iml
 /local.properties
+
+# Local technical notes are intentionally not published
+/docs/
+/android-v4/README.md
+/benchmarks/README.md
+/benchmarks/comparators/*/README.md
+/benchmarks/windows/README.md
+/host-rust/README.md
+/host-rust/fuzz/README.md
+/protocol/fixtures/README.md
+
+# Local release outputs and signing material
+/dist/
+*.apk
+/.local-signing/
+
+# Rust build output
+/host-rust/target/
+/benchmarks/comparators/**/target/
+
+# Reproducibly fetched v4 Android dependencies and build output
+/android-v4/.deps/
+/android-v4/.gradle/
+/android-v4/.kotlin/
+/android-v4/**/build/

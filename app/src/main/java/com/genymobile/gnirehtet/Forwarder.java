@@ -30,6 +30,7 @@ import java.net.InetAddress;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class Forwarder {
 
@@ -44,6 +45,7 @@ public class Forwarder {
 
     private final FileDescriptor vpnFileDescriptor;
     private final PersistentRelayTunnel tunnel;
+    private final AtomicBoolean stopped = new AtomicBoolean();
 
     private Future<?> deviceToTunnelFuture;
     private Future<?> tunnelToDeviceFuture;
@@ -53,7 +55,13 @@ public class Forwarder {
         tunnel = new PersistentRelayTunnel(vpnService, listener);
     }
 
-    public void forward() {
+    public synchronized void forward() {
+        if (stopped.get()) {
+            throw new IllegalStateException("Forwarder already stopped");
+        }
+        if (deviceToTunnelFuture != null || tunnelToDeviceFuture != null) {
+            return;
+        }
         deviceToTunnelFuture = EXECUTOR_SERVICE.submit(new Runnable() {
             @Override
             public void run() {
@@ -62,7 +70,7 @@ public class Forwarder {
                 } catch (InterruptedIOException e) {
                     Log.d(TAG, "Device to tunnel interrupted");
                 } catch (IOException e) {
-                    Log.e(TAG, "Device to tunnel exception", e);
+                    logForwardingException("Device to tunnel exception", e);
                 }
             }
         });
@@ -72,19 +80,39 @@ public class Forwarder {
                 try {
                     forwardTunnelToDevice(tunnel);
                 } catch (InterruptedIOException e) {
-                    Log.d(TAG, "Device to tunnel interrupted");
+                    Log.d(TAG, "Tunnel to device interrupted");
                 } catch (IOException e) {
-                    Log.e(TAG, "Tunnel to device exception", e);
+                    logForwardingException("Tunnel to device exception", e);
                 }
             }
         });
     }
 
-    public void stop() {
-        tunnel.close();
-        tunnelToDeviceFuture.cancel(true);
-        deviceToTunnelFuture.cancel(true);
-        wakeUpReadWorkaround();
+    public synchronized void stop() {
+        if (!stopped.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            tunnel.close();
+        } finally {
+            cancel(tunnelToDeviceFuture);
+            cancel(deviceToTunnelFuture);
+            wakeUpReadWorkaround();
+        }
+    }
+
+    private static void cancel(Future<?> future) {
+        if (future != null) {
+            future.cancel(true);
+        }
+    }
+
+    private void logForwardingException(String message, IOException exception) {
+        if (stopped.get()) {
+            Log.d(TAG, message + " during shutdown");
+        } else {
+            Log.e(TAG, message, exception);
+        }
     }
 
     @SuppressWarnings("checkstyle:MagicNumber")
@@ -92,7 +120,7 @@ public class Forwarder {
         Log.d(TAG, "Device to tunnel forwarding started");
         FileInputStream vpnInput = new FileInputStream(vpnFileDescriptor);
         byte[] buffer = new byte[BUFSIZE];
-        while (true) {
+        while (!stopped.get()) {
             // blocking read
             int r = vpnInput.read(buffer);
             if (r == -1) {
@@ -121,7 +149,7 @@ public class Forwarder {
         IPPacketOutputStream packetOutputStream = new IPPacketOutputStream(vpnOutput);
 
         byte[] buffer = new byte[BUFSIZE];
-        while (true) {
+        while (!stopped.get()) {
             // blocking receive
             int w = tunnel.receive(buffer);
             if (w == -1) {
@@ -152,13 +180,18 @@ public class Forwarder {
         EXECUTOR_SERVICE.execute(new Runnable() {
             @Override
             public void run() {
+                DatagramSocket socket = null;
                 try {
-                    DatagramSocket socket = new DatagramSocket();
+                    socket = new DatagramSocket();
                     InetAddress dummyAddr = InetAddress.getByAddress(DUMMY_ADDRESS);
                     DatagramPacket packet = new DatagramPacket(new byte[0], 0, dummyAddr, DUMMY_PORT);
                     socket.send(packet);
                 } catch (IOException e) {
                     // ignore
+                } finally {
+                    if (socket != null) {
+                        socket.close();
+                    }
                 }
             }
         });

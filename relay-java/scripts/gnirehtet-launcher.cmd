@@ -90,7 +90,7 @@ echo.
 
 if exist "gnirehtet-get-adb.cmd" (
     echo [REPAIR] Installing or refreshing Android platform-tools in this folder.
-    call "gnirehtet-get-adb.cmd"
+    call "gnirehtet-get-adb.cmd" --force
 ) else (
     echo [WARN] gnirehtet-get-adb.cmd is missing. Download a fresh release zip.
 )
@@ -128,17 +128,22 @@ if not errorlevel 1 set "JAVA_OK=1"
 if exist "gnirehtet.jar" set "JAR_OK=1"
 if exist "gnirehtet.apk" set "APK_OK=1"
 
-if exist "%SCRIPT_DIR%adb.exe" (
+if defined ADB (
+    set "ADB_CMD=!ADB!"
+) else if exist "%SCRIPT_DIR%adb.exe" (
     set "ADB_CMD=%SCRIPT_DIR%adb.exe"
 ) else (
     for /f "delims=" %%A in ('where adb 2^>nul') do if not defined ADB_CMD set "ADB_CMD=%%A"
 )
 
 if defined ADB_CMD (
-    set "ADB_OK=1"
-    set "ADB=!ADB_CMD!"
-    for /f "delims=" %%S in ('"!ADB_CMD!" get-state 2^>nul') do if not defined DEVICE_STATE set "DEVICE_STATE=%%S"
-    if /I "!DEVICE_STATE!"=="device" set "DEVICE_OK=1"
+    "!ADB_CMD!" version >nul 2>&1
+    if not errorlevel 1 (
+        set "ADB_OK=1"
+        set "ADB=!ADB_CMD!"
+        for /f "delims=" %%S in ('"!ADB_CMD!" get-state 2^>nul') do if not defined DEVICE_STATE set "DEVICE_STATE=%%S"
+        if /I "!DEVICE_STATE!"=="device" set "DEVICE_OK=1"
+    )
 )
 
 if "!JAVA_OK!!ADB_OK!!JAR_OK!!APK_OK!"=="1111" set "REQUIRED_OK=1"

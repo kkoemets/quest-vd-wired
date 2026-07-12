@@ -25,6 +25,18 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name="com.genymobile.gnirehtet.GnirehtetStatusActivity"
+            android:exported="true"
+            android:icon="@drawable/ic_usb_24dp"
+            android:label="@string/wired_link_title">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
         <service
             android:name="com.genymobile.gnirehtet.GnirehtetService"
             android:enabled="true"

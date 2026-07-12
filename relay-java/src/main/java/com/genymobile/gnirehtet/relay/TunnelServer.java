@@ -42,11 +42,14 @@ public class TunnelServer {
         // will register the socket on the selector
         Client client = new Client(selector, socketChannel, this::removeClient);
         clients.add(client);
+        Diagnostics.increment("clients.active");
+        Diagnostics.increment("clients.accepted");
         Log.i(TAG, "Client #" + client.getId() + " connected");
     }
 
     private void removeClient(Client client) {
         clients.remove(client);
+        Diagnostics.add("clients.active", -1);
         Log.i(TAG, "Client #" + client.getId() + " disconnected");
     }
 
@@ -54,5 +57,19 @@ public class TunnelServer {
         for (Client client : clients) {
             client.cleanExpiredConnections();
         }
+    }
+
+    public void expireQueuedUdp(long nowNanos) {
+        for (Client client : clients) {
+            client.expireQueuedUdp(nowNanos);
+        }
+    }
+
+    public long getNextUdpExpiryNanos() {
+        long next = Long.MAX_VALUE;
+        for (Client client : clients) {
+            next = Math.min(next, client.getNextUdpExpiryNanos());
+        }
+        return next;
     }
 }

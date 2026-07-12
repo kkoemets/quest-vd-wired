@@ -18,9 +18,7 @@ package com.genymobile.gnirehtet;
 
 import android.content.Context;
 import android.content.Intent;
-import android.net.ConnectivityManager;
-import android.net.LinkAddress;
-import android.net.LinkProperties;
+import android.content.pm.PackageManager;
 import android.net.Network;
 import android.net.VpnService;
 import android.os.Build;
@@ -29,9 +27,12 @@ import android.os.Message;
 import android.os.ParcelFileDescriptor;
 import android.util.Log;
 
+import java.io.FileDescriptor;
 import java.io.IOException;
+import java.io.PrintWriter;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.net.InetAddress;
-import java.util.List;
 
 public class GnirehtetService extends VpnService {
 
@@ -49,9 +50,12 @@ public class GnirehtetService extends VpnService {
 
     private final Notifier notifier = new Notifier(this);
     private final Handler handler = new RelayTunnelConnectionStateHandler(this);
+    private final Object resourceLock = new Object();
 
     private ParcelFileDescriptor vpnInterface = null;
     private Forwarder forwarder;
+    private boolean shuttingDown;
+    private boolean shutdownComplete = true;
 
     public static void start(Context context, VpnConfiguration config) {
         Intent intent = new Intent(context, GnirehtetService.class);
@@ -65,11 +69,9 @@ public class GnirehtetService extends VpnService {
     }
 
     public static void stop(Context context) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            context.startForegroundService(createStopIntent(context));
-        } else {
-            context.startService(createStopIntent(context));
-        }
+        // Stopping the service invokes onDestroy(), which owns the shutdown transaction. This also
+        // avoids starting an otherwise absent foreground service just to tell it to stop.
+        context.stopService(new Intent(context, GnirehtetService.class));
     }
 
     static Intent createStopIntent(Context context) {
@@ -80,7 +82,7 @@ public class GnirehtetService extends VpnService {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        String action = intent.getAction();
+        String action = intent != null ? intent.getAction() : null;
         Log.d(TAG, "Received request " + action);
         if (ACTION_START_VPN.equals(action)) {
             if (isRunning()) {
@@ -93,19 +95,35 @@ public class GnirehtetService extends VpnService {
                 startVpn(config);
             }
         } else if (ACTION_CLOSE_VPN.equals(action)) {
-            close();
+            close(VpnLifecycle.State.STOPPED, "explicit stop requested");
+        } else if (!isRunning()) {
+            stopSelf(startId);
         }
         return START_NOT_STICKY;
     }
 
     private boolean isRunning() {
-        return vpnInterface != null;
+        synchronized (resourceLock) {
+            return vpnInterface != null && !shuttingDown;
+        }
     }
 
     private void startVpn(VpnConfiguration config) {
-        notifier.start();
-        if (setupVpn(config)) {
-            startForwarding();
+        synchronized (resourceLock) {
+            shuttingDown = false;
+            shutdownComplete = false;
+        }
+        VpnLifecycle.transition(VpnLifecycle.State.STARTING, "establishing VPN");
+        try {
+            notifier.start();
+            if (setupVpn(config)) {
+                startForwarding();
+            } else {
+                close(VpnLifecycle.State.ERROR, VpnLifecycle.getDetail());
+            }
+        } catch (RuntimeException e) {
+            Log.e(TAG, "Cannot start VPN", e);
+            close(VpnLifecycle.State.ERROR, "VPN startup exception: " + e.getClass().getSimpleName());
         }
     }
 
@@ -140,68 +158,160 @@ public class GnirehtetService extends VpnService {
         builder.setBlocking(true);
         builder.setMtu(MTU);
 
-        vpnInterface = builder.establish();
-        if (vpnInterface == null) {
+        if (!configureAllowedApplication(builder, config)) {
+            return false;
+        }
+        setUnmetered(builder);
+
+        ParcelFileDescriptor establishedInterface = builder.establish();
+        if (establishedInterface == null) {
             Log.w(TAG, "VPN starting failed, please retry");
             // establish() may return null if the application is not prepared or is revoked
+            VpnLifecycle.transition(VpnLifecycle.State.ERROR, "VPN permission missing or revoked");
             return false;
         }
 
-        setAsUndernlyingNetwork();
+        synchronized (resourceLock) {
+            vpnInterface = establishedInterface;
+        }
+        useDefaultUnderlyingNetworks();
         return true;
     }
 
+    private boolean configureAllowedApplication(Builder builder, VpnConfiguration config) {
+        if (config.isAllTraffic()) {
+            Log.w(TAG, "Diagnostic all-traffic VPN mode enabled");
+            return true;
+        }
+        String packageName = config.getAllowedApplication();
+        try {
+            builder.addAllowedApplication(packageName);
+            Log.i(TAG, "Routing only " + packageName + " through the wired link");
+            return true;
+        } catch (PackageManager.NameNotFoundException e) {
+            Log.e(TAG, "Allowed application is not installed: " + packageName, e);
+            VpnLifecycle.transition(VpnLifecycle.State.ERROR, "Virtual Desktop is not installed");
+            return false;
+        }
+    }
+
+    /**
+     * {@code Builder.setMetered(false)} was added in API 29, while this maintenance branch still
+     * compiles against API 28. Reflection keeps the v3 build compatible and applies the Quest-safe
+     * unmetered setting whenever the runtime supports it.
+     */
     @SuppressWarnings("checkstyle:MagicNumber")
-    private void setAsUndernlyingNetwork() {
+    private void setUnmetered(Builder builder) {
+        if (Build.VERSION.SDK_INT < 29) {
+            return;
+        }
+        try {
+            Method setMetered = Builder.class.getMethod("setMetered", Boolean.TYPE);
+            setMetered.invoke(builder, false);
+        } catch (NoSuchMethodException | IllegalAccessException | InvocationTargetException | SecurityException e) {
+            Log.w(TAG, "Cannot mark VPN as unmetered", e);
+        }
+    }
+
+    @SuppressWarnings("checkstyle:MagicNumber")
+    private void useDefaultUnderlyingNetworks() {
         if (Build.VERSION.SDK_INT >= 22) {
-            Network vpnNetwork = findVpnNetwork();
-            if (vpnNetwork != null) {
-                // so that applications knows that network is available
-                setUnderlyingNetworks(new Network[] {vpnNetwork});
+            // null is the documented system-managed default. The previous implementation supplied
+            // the VPN itself as its own underlying network, which is not a real carrier network.
+            boolean accepted = setUnderlyingNetworks((Network[]) null);
+            if (!accepted) {
+                Log.w(TAG, "System rejected the default underlying-network policy");
+            } else {
+                Log.d(TAG, "Underlying-network policy: system default");
             }
         } else {
             Log.w(TAG, "Cannot set underlying network, API version " + Build.VERSION.SDK_INT + " < 22");
         }
     }
 
-    private Network findVpnNetwork() {
-        ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
-        Network[] networks = cm.getAllNetworks();
-        for (Network network : networks) {
-            LinkProperties linkProperties = cm.getLinkProperties(network);
-            List<LinkAddress> addresses = linkProperties.getLinkAddresses();
-            for (LinkAddress addr : addresses) {
-                if (addr.getAddress().equals(VPN_ADDRESS)) {
-                    return network;
+    private void startForwarding() {
+        Forwarder newForwarder;
+        synchronized (resourceLock) {
+            newForwarder = new Forwarder(this, vpnInterface.getFileDescriptor(), new RelayTunnelListener(handler));
+            forwarder = newForwarder;
+        }
+        newForwarder.forward();
+    }
+
+    private void close(VpnLifecycle.State finalState, String detail) {
+        Forwarder forwarderToStop;
+        ParcelFileDescriptor interfaceToClose;
+        synchronized (resourceLock) {
+            if (shuttingDown) {
+                return;
+            }
+            if (shutdownComplete) {
+                stopSelf();
+                return;
+            }
+            shuttingDown = true;
+            VpnLifecycle.transition(VpnLifecycle.State.STOPPING, detail);
+            forwarderToStop = forwarder;
+            interfaceToClose = vpnInterface;
+            forwarder = null;
+            vpnInterface = null;
+        }
+
+        handler.removeCallbacksAndMessages(null);
+        try {
+            if (forwarderToStop != null) {
+                forwarderToStop.stop();
+            }
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Cannot stop forwarding cleanly", e);
+        } finally {
+            if (interfaceToClose != null) {
+                try {
+                    interfaceToClose.close();
+                } catch (IOException e) {
+                    Log.w(TAG, "Cannot close VPN file descriptor", e);
                 }
             }
+            try {
+                notifier.stop();
+            } catch (RuntimeException e) {
+                Log.w(TAG, "Cannot stop foreground notification", e);
+            }
+            synchronized (resourceLock) {
+                shuttingDown = false;
+                shutdownComplete = true;
+            }
+            VpnLifecycle.transition(finalState, detail);
+            stopSelf();
         }
-        return null;
     }
 
-    private void startForwarding() {
-        forwarder = new Forwarder(this, vpnInterface.getFileDescriptor(), new RelayTunnelListener(handler));
-        forwarder.forward();
-    }
-
-    private void close() {
-        if (!isRunning()) {
-            // already closed
-            return;
-        }
-
-        notifier.stop();
-
+    @Override
+    public void onRevoke() {
         try {
-            forwarder.stop();
-            forwarder = null;
-            vpnInterface.close();
-            vpnInterface = null;
-        } catch (IOException e) {
-            Log.w(TAG, "Cannot close VPN file descriptor", e);
+            close(VpnLifecycle.State.STOPPED, "VPN permission revoked");
+        } finally {
+            super.onRevoke();
         }
     }
 
+    @Override
+    public void onDestroy() {
+        try {
+            close(VpnLifecycle.State.STOPPED, "service destroyed");
+        } finally {
+            super.onDestroy();
+        }
+    }
+
+    @Override
+    protected void dump(FileDescriptor fd, PrintWriter writer, String[] args) {
+        boolean vpnFdOpen;
+        synchronized (resourceLock) {
+            vpnFdOpen = vpnInterface != null;
+        }
+        writer.println(VpnLifecycle.formatDumpLine(vpnFdOpen));
+    }
 
     private static final class RelayTunnelConnectionStateHandler extends Handler {
 
@@ -220,10 +330,12 @@ public class GnirehtetService extends VpnService {
             switch (message.what) {
                 case RelayTunnelListener.MSG_RELAY_TUNNEL_CONNECTED:
                     Log.d(TAG, "Relay tunnel connected");
+                    VpnLifecycle.transition(VpnLifecycle.State.RUNNING, "relay connected");
                     vpnService.notifier.setFailure(false);
                     break;
                 case RelayTunnelListener.MSG_RELAY_TUNNEL_DISCONNECTED:
                     Log.d(TAG, "Relay tunnel disconnected");
+                    VpnLifecycle.transition(VpnLifecycle.State.DEGRADED, "waiting for relay");
                     vpnService.notifier.setFailure(true);
                     break;
                 default:

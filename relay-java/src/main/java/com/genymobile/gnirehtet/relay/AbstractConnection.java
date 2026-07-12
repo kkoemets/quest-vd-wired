@@ -18,6 +18,7 @@ package com.genymobile.gnirehtet.relay;
 
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.util.function.Supplier;
 
 public abstract class AbstractConnection implements Connection {
 
@@ -65,7 +66,9 @@ public abstract class AbstractConnection implements Connection {
     }
 
     public void logv(String tag, String message, Throwable e) {
-        Log.v(tag, id + " " + message);
+        if (Log.isVerboseEnabled()) {
+            Log.v(tag, id + " " + message, e);
+        }
     }
 
     public void logv(String tag, String message) {
@@ -73,15 +76,25 @@ public abstract class AbstractConnection implements Connection {
     }
 
     public void logd(String tag, String message, Throwable e) {
-        Log.d(tag, id + " " + message);
+        if (Log.isDebugEnabled()) {
+            Log.d(tag, id + " " + message, e);
+        }
     }
 
     public void logd(String tag, String message) {
         logd(tag, message, null);
     }
 
+    public void logd(String tag, Supplier<String> message) {
+        if (Log.isDebugEnabled()) {
+            Log.d(tag, id + " " + message.get());
+        }
+    }
+
     public void logi(String tag, String message, Throwable e) {
-        Log.i(tag, id + " " + message);
+        if (Log.isInfoEnabled()) {
+            Log.i(tag, id + " " + message, e);
+        }
     }
 
     public void logi(String tag, String message) {
@@ -89,7 +102,9 @@ public abstract class AbstractConnection implements Connection {
     }
 
     public void logw(String tag, String message, Throwable e) {
-        Log.w(tag, id + " " + message);
+        if (Log.isWarningEnabled()) {
+            Log.w(tag, id + " " + message, e);
+        }
     }
 
     public void logw(String tag, String message) {
@@ -97,7 +112,9 @@ public abstract class AbstractConnection implements Connection {
     }
 
     public void loge(String tag, String message, Throwable e) {
-        Log.e(tag, id + " " + message);
+        if (Log.isErrorEnabled()) {
+            Log.e(tag, id + " " + message, e);
+        }
     }
 
     public void loge(String tag, String message) {

@@ -17,8 +17,11 @@
 package com.genymobile.gnirehtet.relay;
 
 import java.io.IOException;
+import java.net.SocketAddress;
 import java.nio.ByteBuffer;
+import java.nio.channels.DatagramChannel;
 import java.nio.channels.WritableByteChannel;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Circular buffer to store datagrams (preserving their boundaries).
@@ -41,26 +44,50 @@ public class DatagramBuffer {
 
     // every datagram is stored along with a header storing its length, on 16 bits
     private static final int HEADER_LENGTH = 2;
-    private static final int MAX_DATAGRAM_LENGTH = 1 << 16;
-    private static final int MAX_BLOCK_LENGTH = HEADER_LENGTH + MAX_DATAGRAM_LENGTH;
+    private static final int MAX_DATAGRAM_LENGTH = (1 << 16) - 1;
+    private static final int MAX_QUEUED_DATAGRAMS = 4096;
 
     private final byte[] data;
     private final ByteBuffer wrapper;
     private int head;
     private int tail;
     private final int circularBufferLength;
+    private final int maxDatagramLength;
+    private final long[] enqueueTimes;
+    private int timestampHead;
+    private int timestampTail;
+    private int datagramCount;
+    private int queuedPayloadBytes;
 
     public DatagramBuffer(int capacity) {
-        data = new byte[capacity + MAX_BLOCK_LENGTH];
+        this(capacity, MAX_DATAGRAM_LENGTH, MAX_QUEUED_DATAGRAMS);
+    }
+
+    public DatagramBuffer(int capacity, int maxDatagramLength, int maxQueuedDatagrams) {
+        if (capacity <= 0 || maxDatagramLength < 0 || maxDatagramLength > MAX_DATAGRAM_LENGTH
+                || maxQueuedDatagrams <= 0) {
+            throw new IllegalArgumentException("Invalid datagram buffer limits");
+        }
+        this.maxDatagramLength = maxDatagramLength;
+        data = new byte[capacity + HEADER_LENGTH + maxDatagramLength];
         wrapper = ByteBuffer.wrap(data);
         circularBufferLength = capacity + 1;
+        enqueueTimes = new long[maxQueuedDatagrams];
     }
 
     public boolean isEmpty() {
-        return head == tail;
+        return datagramCount == 0;
     }
 
     public boolean hasEnoughSpaceFor(int datagramLength) {
+        if (datagramLength < 0 || datagramLength > maxDatagramLength || datagramCount == enqueueTimes.length) {
+            return false;
+        }
+        if (datagramCount > 0 && head == tail) {
+            // The circular portion is full. The queued datagram which crossed the
+            // boundary is stored contiguously in the extra block at the end.
+            return false;
+        }
         if (head >= tail) {
             // there is at least the extra space for storing 1 packet
             return true;
@@ -74,35 +101,54 @@ public class DatagramBuffer {
     }
 
     public boolean writeTo(WritableByteChannel channel) throws IOException {
-        int length = readLength();
-        wrapper.limit(tail + length).position(tail);
-        tail += length;
-        if (tail >= circularBufferLength) {
-            tail = 0;
-        }
+        int length = peekLength();
+        wrapper.limit(tail + HEADER_LENGTH + length).position(tail + HEADER_LENGTH);
         int w = channel.write(wrapper);
+        if (w == 0 && length > 0) {
+            return true;
+        }
         if (w != length) {
             Log.e(TAG, "Cannot write the whole datagram to the channel (only " + w + "/" + length + ")");
             return false;
         }
+        removeFirst(length);
+        return true;
+    }
+
+    public boolean sendTo(DatagramChannel channel, SocketAddress destination) throws IOException {
+        int length = peekLength();
+        wrapper.limit(tail + HEADER_LENGTH + length).position(tail + HEADER_LENGTH);
+        int sent = channel.send(wrapper, destination);
+        if (sent == 0 && length > 0) {
+            return true;
+        }
+        if (sent != length) {
+            Log.e(TAG, "Cannot send the whole datagram (only " + sent + "/" + length + ")");
+            return false;
+        }
+        removeFirst(length);
         return true;
     }
 
     public boolean readFrom(ByteBuffer buffer) {
         int length = buffer.remaining();
-        if (length > MAX_DATAGRAM_LENGTH) {
+        if (length > maxDatagramLength) {
             throw new IllegalArgumentException("Datagram length (" + buffer.remaining() + ") may not be greater than "
-                    + MAX_DATAGRAM_LENGTH + " bytes");
+                    + maxDatagramLength + " bytes");
         }
         if (!hasEnoughSpaceFor(length)) {
             return false;
         }
         writeLength(length);
+        enqueueTimes[timestampHead] = System.nanoTime();
+        timestampHead = (timestampHead + 1) % enqueueTimes.length;
         buffer.get(data, head, length);
         head += length;
         if (head >= circularBufferLength) {
             head = 0;
         }
+        ++datagramCount;
+        queuedPayloadBytes += length;
         return true;
     }
 
@@ -112,9 +158,57 @@ public class DatagramBuffer {
         data[head++] = (byte) (length & 0xff);
     }
 
-    private int readLength() {
-        int length = ((data[tail] & 0xff) << 8) | (data[tail + 1] & 0xff);
-        tail += 2;
-        return length;
+    private int peekLength() {
+        return ((data[tail] & 0xff) << 8) | (data[tail + 1] & 0xff);
+    }
+
+    private void removeFirst(int length) {
+        tail += HEADER_LENGTH + length;
+        if (tail >= circularBufferLength) {
+            tail = 0;
+        }
+        timestampTail = (timestampTail + 1) % enqueueTimes.length;
+        --datagramCount;
+        queuedPayloadBytes -= length;
+        if (datagramCount == 0) {
+            head = 0;
+            tail = 0;
+            timestampHead = 0;
+            timestampTail = 0;
+        }
+    }
+
+    public int discardExpired(long maxAgeMillis) {
+        return discardExpired(maxAgeMillis, System.nanoTime());
+    }
+
+    int discardExpired(long maxAgeMillis, long nowNanos) {
+        int dropped = 0;
+        long maxAgeNanos = TimeUnit.MILLISECONDS.toNanos(maxAgeMillis);
+        while (datagramCount > 0 && nowNanos - enqueueTimes[timestampTail] > maxAgeNanos) {
+            int length = peekLength();
+            removeFirst(length);
+            ++dropped;
+            Diagnostics.increment("drops.udp_queue_age");
+            Diagnostics.add("drops.udp_queue_age_bytes", length);
+        }
+        return dropped;
+    }
+
+    public int getDatagramCount() {
+        return datagramCount;
+    }
+
+    public int getQueuedPayloadBytes() {
+        return queuedPayloadBytes;
+    }
+
+    public long getOldestAgeMillis() {
+        return datagramCount == 0 ? 0
+                : TimeUnit.NANOSECONDS.toMillis(Math.max(0, System.nanoTime() - enqueueTimes[timestampTail]));
+    }
+
+    int getAllocatedBytes() {
+        return data.length + enqueueTimes.length * Long.BYTES;
     }
 }

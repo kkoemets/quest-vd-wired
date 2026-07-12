@@ -16,19 +16,24 @@
 
 package com.genymobile.gnirehtet;
 
+import com.genymobile.gnirehtet.relay.Diagnostics;
 import com.genymobile.gnirehtet.relay.Log;
 
 import java.io.EOFException;
 import java.io.IOException;
 import java.net.Inet4Address;
 import java.net.InetSocketAddress;
+import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
-import java.nio.channels.ByteChannel;
+import java.nio.channels.Channels;
+import java.nio.channels.ClosedByInterruptException;
 import java.nio.channels.ReadableByteChannel;
-import java.nio.channels.SocketChannel;
 import java.nio.channels.WritableByteChannel;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 
 public class AdbMonitor {
@@ -45,69 +50,125 @@ public class AdbMonitor {
     private static final int LENGTH_FIELD_SIZE = 4;
     private static final int OKAY_SIZE = 4;
     private static final long RETRY_DELAY_ADB_DAEMON_OK = 1000;
-    private static final long RETRY_DELAY_ADB_DAEMON_KO = 5000;
+    // Keep detection comfortably inside the three-second reconnect gate once
+    // ADB becomes available again. The command itself still has a hard timeout.
+    private static final long RETRY_DELAY_ADB_DAEMON_KO = 1000;
+    private static final long ADB_COMMAND_TIMEOUT_MS = 15000;
+    private static final int ADB_CONNECT_TIMEOUT_MS = 5000;
+    private static final int ADB_HANDSHAKE_TIMEOUT_MS = 5000;
+    private static final int ADB_TRACK_POLL_TIMEOUT_MS = 1000;
 
     private List<String> connectedDevices = new ArrayList<>();
 
-    private AdbDevicesCallback callback;
+    private final AdbDevicesCallback callback;
+    private final String adbPath;
+    private final InetSocketAddress daemonAddress;
+    private final int connectTimeoutMs;
+    private final int handshakeTimeoutMs;
+    private final int trackPollTimeoutMs;
 
-    private static final byte[] BUFFER = new byte[BUFFER_SIZE]; // used only locally to avoid allocations, so static is ok
     private final ByteBuffer socketBuffer = ByteBuffer.allocate(BUFFER_SIZE);
 
     public AdbMonitor(AdbDevicesCallback callback) {
+        this(callback, getConfiguredAdbPath());
+    }
+
+    public AdbMonitor(AdbDevicesCallback callback, String adbPath) {
+        this(callback, adbPath, new InetSocketAddress(Inet4Address.getLoopbackAddress(), ADBD_PORT),
+                ADB_CONNECT_TIMEOUT_MS, ADB_HANDSHAKE_TIMEOUT_MS, ADB_TRACK_POLL_TIMEOUT_MS);
+    }
+
+    AdbMonitor(AdbDevicesCallback callback, String adbPath, InetSocketAddress daemonAddress,
+            int connectTimeoutMs, int handshakeTimeoutMs, int trackPollTimeoutMs) {
         this.callback = callback;
+        this.adbPath = adbPath;
+        this.daemonAddress = daemonAddress;
+        this.connectTimeoutMs = connectTimeoutMs;
+        this.handshakeTimeoutMs = handshakeTimeoutMs;
+        this.trackPollTimeoutMs = trackPollTimeoutMs;
     }
 
     public void monitor() {
-        while (true) {
+        while (!Thread.currentThread().isInterrupted()) {
             try {
                 trackDevices();
             } catch (Exception e) {
+                clearConnectedDevices();
+                if (Thread.currentThread().isInterrupted()) {
+                    break;
+                }
                 Log.e(TAG, "Failed to monitor adb devices", e);
                 repairAdbDaemon();
+            } finally {
+                // A new track-devices session must replay every connected device. Keeping
+                // stale state here used to suppress reconnect callbacks after adb restarted.
+                clearConnectedDevices();
             }
         }
     }
 
-    private void trackDevices() throws IOException {
-        SocketChannel socketChannel = SocketChannel.open();
-        try {
-            socketChannel.connect(new InetSocketAddress(Inet4Address.getLoopbackAddress(), ADBD_PORT));
-            trackDevicesOnChannel(socketChannel);
-        } finally {
-            socketChannel.close();
+    private static String getConfiguredAdbPath() {
+        String configured = System.getenv("ADB");
+        return configured != null ? configured : "adb";
+    }
+
+    void trackDevices() throws IOException {
+        try (Socket socket = new Socket()) {
+            socket.connect(daemonAddress, connectTimeoutMs);
+            socket.setSoTimeout(handshakeTimeoutMs);
+            ReadableByteChannel input = Channels.newChannel(socket.getInputStream());
+            WritableByteChannel output = Channels.newChannel(socket.getOutputStream());
+            startTracking(input, output);
+            socket.setSoTimeout(trackPollTimeoutMs);
+            trackPackets(input);
+        } catch (ClosedByInterruptException e) {
+            if (!Thread.currentThread().isInterrupted()) {
+                throw e;
+            }
         }
     }
 
-    private void trackDevicesOnChannel(ByteChannel channel) throws IOException {
+    private void startTracking(ReadableByteChannel input, WritableByteChannel output) throws IOException {
         socketBuffer.clear();
-        writeRequest(channel, TRACK_DEVICES_REQUEST);
+        writeRequest(output, TRACK_DEVICES_REQUEST);
         // the daemon initially sends "OKAY" if it understands the request
-        if (!consumeOkay(channel)) {
-            return;
+        if (!consumeOkay(input)) {
+            throw new IOException("ADB daemon rejected host:track-devices");
         }
-        while (true) {
-            String packet = nextPacket(channel);
-            handlePacket(packet);
+    }
+
+    private void trackPackets(ReadableByteChannel input) throws IOException {
+        while (!Thread.currentThread().isInterrupted()) {
+            try {
+                String packet = nextPacket(input);
+                handlePacket(packet);
+            } catch (SocketTimeoutException e) {
+                // A quiet track-devices stream is normal. The finite read deadline is
+                // only a cancellation point and prevents a wedged daemon from hiding interrupts.
+                Diagnostics.increment("adb.track_poll_timeouts");
+            }
         }
     }
 
     private static void writeRequest(WritableByteChannel channel, String request) throws IOException {
         ByteBuffer requestBuffer = ByteBuffer.wrap(request.getBytes(StandardCharsets.US_ASCII));
-        channel.write(requestBuffer);
+        while (requestBuffer.hasRemaining()) {
+            channel.write(requestBuffer);
+        }
     }
 
     private boolean consumeOkay(ReadableByteChannel channel) throws IOException {
+        byte[] response = new byte[OKAY_SIZE];
         while (channel.read(socketBuffer) != -1) {
             if (socketBuffer.position() < OKAY_SIZE) {
                 // not enough data
                 continue;
             }
             socketBuffer.flip();
-            socketBuffer.get(BUFFER, 0, OKAY_SIZE);
+            socketBuffer.get(response, 0, OKAY_SIZE);
             socketBuffer.compact();
             socketBuffer.flip();
-            String text = new String(BUFFER, 0, OKAY_SIZE, StandardCharsets.US_ASCII);
+            String text = new String(response, StandardCharsets.US_ASCII);
             return "OKAY".equals(text);
         }
         return false;
@@ -124,11 +185,13 @@ public class AdbMonitor {
 
     private void fillBufferFrom(ReadableByteChannel channel) throws IOException {
         socketBuffer.compact();
-        int r;
-        if (channel.read(socketBuffer) == -1) {
-            throw new EOFException("ADB daemon closed the track-devices connexion");
+        try {
+            if (channel.read(socketBuffer) == -1) {
+                throw new EOFException("ADB daemon closed the track-devices connection");
+            }
+        } finally {
+            socketBuffer.flip();
         }
-        socketBuffer.flip();
     }
 
     static String readPacket(ByteBuffer input) {
@@ -141,18 +204,21 @@ public class AdbMonitor {
         //  - 0036 indicates that the data is 0x36 (54) bytes length
         //  - the device with serial 0123456789abcdef is connected
         //  - the device with serial fedcba9876543210 is unauthorized
-        input.get(BUFFER, 0, LENGTH_FIELD_SIZE);
-        int length = parseLength(BUFFER);
-        if (length > BUFFER.length) {
+        input.mark();
+        byte[] lengthField = new byte[LENGTH_FIELD_SIZE];
+        input.get(lengthField);
+        int length = parseLength(lengthField);
+        if (length > BUFFER_SIZE - LENGTH_FIELD_SIZE) {
             throw new IllegalArgumentException("Packet size should not be that big: " + length);
         }
         if (input.remaining() < length) {
             // not enough data
-            input.rewind();
+            input.reset();
             return null;
         }
-        input.get(BUFFER, 0, length);
-        return new String(BUFFER, 0, length, StandardCharsets.UTF_8);
+        byte[] payload = new byte[length];
+        input.get(payload);
+        return new String(payload, StandardCharsets.UTF_8);
     }
 
     void handlePacket(String packet) {
@@ -163,6 +229,10 @@ public class AdbMonitor {
             }
         }
         connectedDevices = currentConnectedDevices;
+    }
+
+    void clearConnectedDevices() {
+        connectedDevices = Collections.emptyList();
     }
 
     private static List<String> parseConnectedDevices(String packet) {
@@ -188,12 +258,16 @@ public class AdbMonitor {
         int result = 0;
         for (int i = 0; i < LENGTH_FIELD_SIZE; ++i) {
             char c = (char) data[i];
-            result = (result << 4) + Character.digit(c, 0x10);
+            int digit = Character.digit(c, 0x10);
+            if (digit < 0) {
+                throw new IllegalArgumentException("Invalid ADB packet length field");
+            }
+            result = (result << 4) + digit;
         }
         return result;
     }
 
-    private static void repairAdbDaemon() {
+    private void repairAdbDaemon() {
         if (startAdbDaemon()) {
             sleep(RETRY_DELAY_ADB_DAEMON_OK);
         } else {
@@ -201,19 +275,20 @@ public class AdbMonitor {
         }
     }
 
-    private static boolean startAdbDaemon() {
-        Log.i(TAG, "Restarting adb deamon");
+    private boolean startAdbDaemon() {
+        Log.i(TAG, "Restarting adb daemon");
         try {
-            Process process = new ProcessBuilder("adb", "start-server")
-                    .redirectOutput(ProcessBuilder.Redirect.INHERIT)
-                    .redirectError(ProcessBuilder.Redirect.INHERIT).start();
-            int exitCode = process.waitFor();
-            if (exitCode != 0) {
+            ProcessRunner.Result result = ProcessRunner.runInherited(
+                    Arrays.asList(adbPath, "start-server"), ADB_COMMAND_TIMEOUT_MS);
+            if (result.getExitCode() != 0) {
                 Log.e(TAG, "Could not restart adb daemon (exited on error)");
                 return false;
             }
             return true;
         } catch (InterruptedException | IOException e) {
+            if (e instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
             Log.e(TAG, "Could not restart adb daemon", e);
             return false;
         }
@@ -223,7 +298,7 @@ public class AdbMonitor {
         try {
             Thread.sleep(delay);
         } catch (InterruptedException e) {
-            // should never happen
+            Thread.currentThread().interrupt();
         }
     }
 }

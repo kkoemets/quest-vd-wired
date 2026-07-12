@@ -1,0 +1,66 @@
+diff --git a/src/hev-config.c b/src/hev-config.c
+index 223ecbf..3cd2b71 100644
+--- a/src/hev-config.c
++++ b/src/hev-config.c
+@@ -175,6 +175,7 @@ hev_config_parse_socks5 (yaml_document_t *doc, yaml_node_t *base)
+     static char _pass[256];
+     const char *addr = NULL;
+     const char *port = NULL;
++    const char *udp_port = NULL;
+     const char *udpm = NULL;
+     const char *udpa = NULL;
+     const char *user = NULL;
+@@ -206,6 +207,8 @@ hev_config_parse_socks5 (yaml_document_t *doc, yaml_node_t *base)
+
+         if (0 == strcmp (key, "port"))
+             port = value;
++        else if (0 == strcmp (key, "udp-port"))
++            udp_port = value;
+         else if (0 == strcmp (key, "address"))
+             addr = value;
+         else if (0 == strcmp (key, "udp"))
+@@ -241,6 +244,7 @@ hev_config_parse_socks5 (yaml_document_t *doc, yaml_node_t *base)
+
+     strncpy (srv.addr, addr, 256 - 1);
+     srv.port = strtoul (port, NULL, 10);
++    srv.udp_port = udp_port ? strtoul (udp_port, NULL, 10) : srv.port;
+
+     if (pipe && (strcasecmp (pipe, "true") == 0))
+         srv.pipeline = 1;
+diff --git a/src/hev-config.h b/src/hev-config.h
+index bb98965..c30f28f 100644
+--- a/src/hev-config.h
++++ b/src/hev-config.h
+@@ -19,6 +19,7 @@ struct _HevConfigServer
+     unsigned int mark;
+     short udp_in_udp;
+     unsigned short port;
++    unsigned short udp_port;
+     unsigned char pipeline;
+     unsigned char fastopen;
+     char udp_addr[256];
+diff --git a/src/hev-socks5-session.c b/src/hev-socks5-session.c
+index e946fa6..c048c6a 100644
+--- a/src/hev-socks5-session.c
++++ b/src/hev-socks5-session.c
+@@ -21,14 +21,19 @@ hev_socks5_session_run (HevSocks5Session *self)
+ {
+     HevSocks5SessionIface *iface;
+     HevConfigServer *srv;
++    unsigned short port;
+     int res;
+
+     LOG_D ("%p socks5 session run", self);
+
+     srv = hev_config_get_socks5_server ();
++    port = srv->port;
++    if (HEV_SOCKS5 (self)->type == HEV_SOCKS5_TYPE_UDP_IN_TCP ||
++        HEV_SOCKS5 (self)->type == HEV_SOCKS5_TYPE_UDP_IN_UDP)
++        port = srv->udp_port;
+
+     res = hev_socks5_client_connect (HEV_SOCKS5_CLIENT (self), srv->addr,
+-                                     srv->port);
++                                     port);
+     if (res < 0) {
+         LOG_I ("%p socks5 session connect", self);
+         return;

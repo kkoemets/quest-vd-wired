@@ -1,298 +1,135 @@
-# Gnirehtet For Quest 3 Link Cable And Virtual Desktop (v3.0.0)
+# Wired Virtual Desktop for Meta Quest 3
 
-This project packages **gnirehtet** as a practical reverse-tethering tool for
-**Meta Quest 3 over Link cable / USB**. It is especially useful for
-**Virtual Desktop on Quest 3** when you want a wired PCVR setup without
-depending on Wi-Fi. The goal is simple: let the headset use the host
-computer's internet connection through `adb`, with Quest 3-focused reconnect
-and startup fixes.
+Use Virtual Desktop on your Quest 3 through a USB cable instead of relying on
+Quest Wi-Fi. The PC keeps its normal internet connection and shares it with the
+headset through the cable.
 
-This is still the same core model:
+This project is for one Quest 3 and a Windows 10 or Windows 11 PC. It does not
+need administrator access, a special network driver, SideQuest, or a rooted
+headset.
 
-- the Android app creates a VPN on the headset
-- the headset sends IPv4 traffic through `adb reverse`
-- the Java relay on the computer opens real TCP and UDP sockets on the host
+## Choose your download
 
-It does **not** require root on the headset or on the computer.
+### v3.1 Standard — recommended
 
-## Quest 3 Start Here
+This is the normal version for everyday use. It is the safer choice while the
+new version is tested by more people.
 
-If you only want the simple Quest 3 setup, read this section and ignore the
-advanced reference lower down.
+[Download v3.1 Standard](https://github.com/kkoemets/gnirehtet-quest-3-virtual-desktop-link-cable/releases/download/v3.1.0/gnirehtet-java-v3.1.0.zip)
 
-### What you need
+### v4.0 Beta — for testing
 
-- Meta Quest 3 with Developer Mode enabled
-- USB debugging enabled on the headset
-- a working USB / Link cable connection to the host computer
-- recent [Android platform-tools / `adb`][platform-tools]
-- Java on the host for running Gnirehtet
+This is the new version with a simpler tray app and a redesigned connection
+engine. It may still have bugs, so keep v3.1 Standard nearby.
 
-`adb` is mandatory for this project. Gnirehtet uses it to talk to the Quest,
-install the APK, create the `adb reverse` tunnel, start the client, stop the
-client, and recover after reconnects. Without platform-tools / `adb`, Gnirehtet
-cannot work.
+[Download v4.0 Beta](https://github.com/kkoemets/gnirehtet-quest-3-virtual-desktop-link-cable/releases/download/v4.0.0-beta.1/gnirehtet-v4.0.0-beta.1-windows-x64.zip)
 
-If `java -version` works on your computer, that is enough for the release
-bundle.
+### v3.0.0 Legacy — older fallback
 
-The first connection requires approving the USB debugging fingerprint prompt in
-the headset.
+This is the previous release, kept available for users who need to roll back.
+New users should choose v3.1 Standard instead.
 
-### What you do not need
+[Download v3.0.0 Legacy](https://github.com/kkoemets/gnirehtet-quest-3-virtual-desktop-link-cable/releases/download/v3.0.0/gnirehtet-java-v3.0.0.zip)
 
-- SideQuest for the normal setup path
-- a manual APK install on a fresh install
+If a download has not been published yet, check the
+[Releases page](https://github.com/kkoemets/gnirehtet-quest-3-virtual-desktop-link-cable/releases).
 
-SideQuest is not required because it is only another way to sideload APKs over
-`adb`. Gnirehtet already uses `adb` directly, and `gnirehtet run` installs the
-app automatically when needed and then starts it for you.
+## Before you start
 
-On Windows, if you only need `adb` for this project, download the
-[platform-tools archive][platform-tools-windows] and either keep `adb` in your
-PATH or place these files next to Gnirehtet:
+You need:
 
-- `adb.exe`
-- `AdbWinApi.dll`
-- `AdbWinUsbApi.dll`
+- a Meta Quest 3 with Developer Mode enabled;
+- USB debugging enabled on the headset;
+- a USB 3 data cable;
+- Virtual Desktop installed on the Quest;
+- Virtual Desktop Streamer running on the PC;
+- the PC connected to its normal internet network.
 
-The release bundle also includes `gnirehtet-run.cmd`, which checks Java,
-`adb`, bundled Gnirehtet files, and Quest authorization before starting. If
-`adb` / platform-tools are missing, the launcher offers a repair action that
-runs `gnirehtet-get-adb.cmd` and downloads Google's official Windows
-platform-tools into the same folder for you.
+The first time you connect the headset, put it on and accept the USB debugging
+prompt. Select **Always allow from this computer** if that choice is shown.
 
-It also includes a small `README.txt` in the zip for the basic Quest 3 setup
-flow.
+## Use v3.1 Standard
 
-### Fast setup
-
-1. Download the [latest release](https://github.com/kkoemets/gnirehtet/releases/latest) and extract it.
-2. Connect the Quest 3 by cable.
+1. Download and extract the v3.1 Standard zip.
+2. Connect the Quest 3 to the PC.
 3. Put on the headset and accept the USB debugging prompt.
-4. Start Gnirehtet.
+4. Double-click `gnirehtet-run.cmd`.
+5. If the launcher says a required Android tool is missing, press **R** to
+   repair it, then start again.
+6. Accept the VPN prompt inside the headset.
+7. Open Virtual Desktop on the Quest.
 
-On macOS and Linux:
+Keep the launcher window open while using the wired link. If it reports that
+Java is missing, install a current Java 11 or newer runtime and try again.
 
-```bash
-./gnirehtet run
-```
+## Use v4.0 Beta
 
-On Windows:
+1. Download and extract the v4.0 Beta zip.
+2. Connect the Quest 3 and accept the USB debugging prompt.
+3. Double-click `gnirehtet-vd.exe`.
+4. Find the Gnirehtet VD icon near the Windows clock.
+5. Right-click the icon and select **Start wired link**.
+6. Accept the VPN prompt inside the headset.
+7. Open Virtual Desktop on the Quest.
 
-- double-click `gnirehtet-run.cmd`
-- if the launcher reports missing `adb` / platform-tools, press `R` to repair
-  or run `gnirehtet-repair.cmd`
-- or run `gnirehtet run` in a terminal
+If the Beta reports a missing Android tool, choose **Repair** from the same
+tray menu and then try **Start wired link** again. To disconnect, choose
+**Stop wired link** from the tray or from the Gnirehtet notification on the
+Quest.
 
-On a fresh install, `run` installs the app automatically if it is missing. If
-you already had another Gnirehtet build installed on the headset and the first
-run fails to install, remove the old app once:
+## What success looks like
 
-```bash
-adb uninstall com.genymobile.gnirehtet
-```
+- The headset asks for VPN permission on the first start.
+- A VPN key appears while the wired link is active.
+- Virtual Desktop can reach the PC while Quest Wi-Fi is off.
+- The wired link reconnects after the cable is reattached and USB debugging is
+  accepted again.
 
-### What success looks like
+![Quest VPN permission request](assets/request.jpg)
 
-- the first launch asks the headset to allow the VPN connection
-- a key icon appears while Gnirehtet is active
-- `run` keeps the relay open in the current terminal or command window
-- with Quest Wi-Fi turned off, the headset still has internet access
+![Quest VPN key icon](assets/key.png)
 
-The original permission UI still looks like this:
+## Quick fixes
 
-![request](assets/request.jpg)
+### The headset is not found
 
-When active, Android shows the VPN key icon:
+Put on the Quest and look for the USB debugging prompt. Try another USB port or
+data cable if Windows still cannot see it. Disconnect other Android devices
+while setting this up.
 
-![key](assets/key.png)
+### Virtual Desktop cannot find the PC
 
-### Virtual Desktop order
+Make sure Virtual Desktop Streamer is running on Windows before opening Virtual
+Desktop on the Quest. If you force-closed the Streamer, start it again normally.
+The wired-link app will not start or restart Virtual Desktop for you.
 
-1. Start Virtual Desktop Streamer on the PC first.
-2. Start Gnirehtet and approve the Quest prompts.
-3. Turn off Quest Wi-Fi if you want the cable-only path.
-4. Open Virtual Desktop on the headset.
+### Performance suddenly becomes worse
 
-Community reports show that Virtual Desktop's network wording can be confusing
-on this setup. The more reliable signals are the Gnirehtet VPN prompt, the key
-icon, and the fact that the headset still has internet access with Wi-Fi
-disabled.
+First restart Virtual Desktop on the Quest. If that fixes it, the slowdown may
+be inside the Virtual Desktop session rather than the cable link. Beta testers
+can use the tray **Status** option and include that information in a bug report.
 
-### Common problems
+### The cable was unplugged
 
-- The download looks incomplete: download the latest release again from GitHub.
-- The window only shows `Starting relay server...`: `adb` often does not yet
-  see an authorized Quest. Run `adb devices`, put on the headset, accept the
-  USB debugging prompt, then try again.
-- Windows says `adb` is not found: run `gnirehtet-run.cmd` and press `R` to
-  repair, or run `gnirehtet-repair.cmd` from the release folder, then retry.
-- `adb devices` shows more than one device: pass the serial explicitly, for
-  example `./gnirehtet run 1WMHH...`.
-- The first install fails with a signature mismatch: uninstall any older
-  Gnirehtet app from the headset once, then retry.
-- The cable was unplugged and plugged back in: Gnirehtet attempts to recover
-  when `adb` comes back, but live TCP sessions are reset. If the headset asks
-  again for USB debugging authorization, approve it before expecting recovery.
-- Virtual Desktop cannot see the PC at all: confirm that Virtual Desktop
-  Streamer is already running on the PC before you launch Virtual Desktop on
-  the headset.
+Reconnect it, put on the headset, and approve USB debugging again if asked. The
+wired link keeps trying to reconnect. Use **Stop wired link** if you want to
+return the Quest to its normal network setup.
 
-Most Quest 3 users can stop reading here.
+### An older install will not update
 
-<details>
-<summary>Advanced CLI reference</summary>
+Official v3.1 Standard and v4.0 Beta releases use the same project signing
+identity and should update in place. Very old builds from another source may
+need to be removed once before installing this project.
 
-### Commands
+## Standard or Beta?
 
-The high-level entry point is still the `gnirehtet` CLI. On Windows, replace
-`./gnirehtet` with `gnirehtet`.
+Use **v3.1 Standard** if you mainly want to play. Use **v4.0 Beta** if you are
+comfortable reporting problems and switching back to Standard when needed.
+Both versions stay available from the Releases page during the Beta period.
 
-Start reverse tethering for one connected device:
+## Privacy
 
-```bash
-./gnirehtet run
-```
+The app does not upload diagnostics or record the contents of your network
+traffic. Support information is saved locally only when you ask for it.
 
-Start the relay only:
-
-```bash
-./gnirehtet relay
-```
-
-Install the APK:
-
-```bash
-./gnirehtet install [serial]
-```
-
-Start the client without running the relay:
-
-```bash
-./gnirehtet start [serial]
-```
-
-Stop the client:
-
-```bash
-./gnirehtet stop [serial]
-```
-
-Reset the `adb reverse` tunnel:
-
-```bash
-./gnirehtet tunnel [serial]
-```
-
-Monitor future device connections and auto-start them:
-
-```bash
-./gnirehtet autorun
-```
-
-If `adb devices` lists more than one device, pass the serial explicitly.
-
-### Manual commands
-
-If you prefer to drive the lower-level pieces yourself:
-
-Start the relay:
-
-```bash
-./gnirehtet relay
-```
-
-Install the APK:
-
-If you need to remove an older Gnirehtet app first:
-
-```bash
-adb uninstall com.genymobile.gnirehtet
-```
-
-Then install the app:
-
-```bash
-adb install -r gnirehtet.apk
-```
-
-Set up the tunnel and start the Quest client:
-
-```bash
-adb reverse localabstract:gnirehtet tcp:31416
-adb shell am start -a com.genymobile.gnirehtet.START \
-    -n com.genymobile.gnirehtet/.GnirehtetActivity
-```
-
-Stop the client:
-
-```bash
-adb shell am start -a com.genymobile.gnirehtet.STOP \
-    -n com.genymobile.gnirehtet/.GnirehtetActivity
-```
-
-### Environment variables
-
-Use a custom `adb` binary:
-
-```bash
-ADB=/path/to/adb ./gnirehtet run
-```
-
-Use a custom APK path:
-
-```bash
-GNIREHTET_APK=/path/to/gnirehtet.apk ./gnirehtet run
-```
-
-</details>
-
-<details>
-<summary>Project scope and limits</summary>
-
-### What this is not
-
-This project is useful for getting Quest 3 online over cable, but it is still
-not a true Ethernet bridge or same-LAN replacement.
-
-- It tunnels IPv4 traffic, not IPv6.
-- It uses Android `VpnService`, so some apps that expect real local network
-  behavior may still behave differently from Wi-Fi.
-- If the cable or `adb` connection drops, live TCP sessions are reset and must
-  reconnect. The reconnect path does not preserve in-flight sessions.
-
-### Quest 3 notes
-
-- `run` is intended to recover better after reconnects, but a reconnect still
-  rebuilds the tunnel instead of resuming existing flows.
-- If the headset asks again for USB debugging authorization after reconnect,
-  approve it before expecting the tunnel to recover.
-- Some apps may still be sensitive to discovery or same-LAN assumptions because
-  this is a VPN-over-ADB path, not a native Ethernet device.
-
-### Developers
-
-See [DEVELOP.md](DEVELOP.md) for build, release, and architecture details for
-this project.
-
-</details>
-
-[platform-tools]: https://developer.android.com/studio/releases/platform-tools
-[platform-tools-windows]: https://dl.google.com/android/repository/platform-tools-latest-windows.zip
-
-## License
-
-    Copyright (C) 2017 Genymobile
-
-    Licensed under the Apache License, Version 2.0 (the "License");
-    you may not use this file except in compliance with the License.
-    You may obtain a copy of the License at
-
-        http://www.apache.org/licenses/LICENSE-2.0
-
-    Unless required by applicable law or agreed to in writing, software
-    distributed under the License is distributed on an "AS IS" BASIS,
-    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-    See the License for the specific language governing permissions and
-    limitations under the License.
+This project is licensed under Apache License 2.0.
