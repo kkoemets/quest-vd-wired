@@ -22,7 +22,7 @@ import org.junit.Test;
 public class CommandLineArgumentsTest {
 
     private static final int ACCEPT_ALL = CommandLineArguments.PARAM_SERIAL | CommandLineArguments.PARAM_DNS_SERVER
-            | CommandLineArguments.PARAM_ROUTES;
+            | CommandLineArguments.PARAM_ROUTES | CommandLineArguments.PARAM_ALL_TRAFFIC;
 
     @Test
     public void testNoArgs() {
@@ -83,5 +83,16 @@ public class CommandLineArgumentsTest {
     @Test(expected = IllegalArgumentException.class)
     public void testNoRoutesParameter() {
         CommandLineArguments.parse(ACCEPT_ALL, "-r");
+    }
+
+    @Test
+    public void testAllTrafficParameter() {
+        CommandLineArguments args = CommandLineArguments.parse(ACCEPT_ALL, "--all-traffic");
+        Assert.assertTrue(args.isAllTraffic());
+    }
+
+    @Test(expected = IllegalArgumentException.class)
+    public void testDuplicateAllTrafficParameter() {
+        CommandLineArguments.parse(ACCEPT_ALL, "--all-traffic", "--all-traffic");
     }
 }

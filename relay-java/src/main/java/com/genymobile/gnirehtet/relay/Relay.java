@@ -20,6 +20,7 @@ import java.io.IOException;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 
 public class Relay {
 
@@ -41,11 +42,26 @@ public class Relay {
 
         Log.i(TAG, "Relay server started");
 
-        long nextCleaningDeadline = System.currentTimeMillis() + UDPConnection.IDLE_TIMEOUT;
+        long nextCleaningDeadline = System.currentTimeMillis() + CLEANING_INTERVAL;
         while (true) {
-            long timeout = Math.max(0, nextCleaningDeadline - System.currentTimeMillis());
+            long timeout = Math.max(1, nextCleaningDeadline - System.currentTimeMillis());
+            long nowNanos = System.nanoTime();
+            tunnelServer.expireQueuedUdp(nowNanos);
+            long nextUdpExpiryNanos = tunnelServer.getNextUdpExpiryNanos();
+            if (nextUdpExpiryNanos != Long.MAX_VALUE) {
+                long remainingNanos = Math.max(0, nextUdpExpiryNanos - nowNanos);
+                long udpTimeoutMillis = Math.max(1, TimeUnit.NANOSECONDS.toMillis(remainingNanos) + 1);
+                timeout = Math.min(timeout, udpTimeoutMillis);
+            }
+            long selectStart = System.nanoTime();
             selector.select(timeout);
+            long selectElapsed = System.nanoTime() - selectStart;
+            Diagnostics.recordMaximum("selector.select_duration_ns_max", selectElapsed);
+            Diagnostics.recordMaximum("selector.wakeup_delay_ns_max",
+                    Math.max(0, selectElapsed - TimeUnit.MILLISECONDS.toNanos(timeout)));
             Set<SelectionKey> selectedKeys = selector.selectedKeys();
+            Diagnostics.set("selector.ready_keys", selectedKeys.size());
+            tunnelServer.expireQueuedUdp(System.nanoTime());
 
             long now = System.currentTimeMillis();
             if (now >= nextCleaningDeadline || selectedKeys.isEmpty()) {
@@ -54,8 +70,10 @@ public class Relay {
             }
 
             for (SelectionKey selectedKey : selectedKeys) {
+                long handlerStart = System.nanoTime();
                 SelectionHandler selectionHandler = (SelectionHandler) selectedKey.attachment();
                 selectionHandler.onReady(selectedKey);
+                Diagnostics.recordMaximum("selector.handler_duration_ns_max", System.nanoTime() - handlerStart);
             }
             // by design, we handled everything
             selectedKeys.clear();

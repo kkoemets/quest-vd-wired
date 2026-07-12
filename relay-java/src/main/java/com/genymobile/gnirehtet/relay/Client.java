@@ -25,10 +25,16 @@ import java.nio.channels.SocketChannel;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 
 public class Client {
 
     private static final String TAG = Client.class.getSimpleName();
+    private static final int TUN_MTU = 0x4000;
+    private static final int CLIENT_QUEUE_PACKETS = 16;
+    private static final int CLIENT_QUEUE_BYTES = 8 * TUN_MTU;
+    private static final int MAX_PENDING_PACKET_SOURCES = 128;
+    private static final long MAX_UDP_QUEUE_AGE_NANOS = TimeUnit.MILLISECONDS.toNanos(10);
 
     private static int nextId = 0;
 
@@ -39,7 +45,7 @@ public class Client {
     private int interests;
 
     private final IPv4PacketBuffer clientToNetwork = new IPv4PacketBuffer();
-    private final StreamBuffer networkToClient = new StreamBuffer(16 * IPv4Packet.MAX_PACKET_LENGTH);
+    private final PacketQueue networkToClient = new PacketQueue(CLIENT_QUEUE_BYTES, CLIENT_QUEUE_PACKETS);
     private final Router router;
 
     private final List<PacketSource> pendingPacketSources = new ArrayList<>();
@@ -92,7 +98,13 @@ public class Client {
             close();
             return;
         }
-        pushToNetwork();
+        try {
+            pushToNetwork();
+        } catch (IOException | RuntimeException e) {
+            Diagnostics.increment("clients.closed_malformed_input");
+            Log.w(TAG, "Closing client after malformed packet input", e);
+            close();
+        }
     }
 
     private void processSend() {
@@ -111,7 +123,11 @@ public class Client {
 
     private boolean read() {
         try {
-            return clientToNetwork.readFrom(clientChannel) != -1;
+            int read = clientToNetwork.readFrom(clientChannel);
+            if (read > 0) {
+                Diagnostics.add("bytes.android_to_relay", read);
+            }
+            return read != -1;
         } catch (IOException e) {
             Log.e(TAG, "Cannot read", e);
             return false;
@@ -120,7 +136,17 @@ public class Client {
 
     private boolean write() {
         try {
-            return networkToClient.writeTo(clientChannel) != -1;
+            expireQueuedUdp(System.nanoTime());
+            int packetCountBefore = networkToClient.sizePackets();
+            int written = networkToClient.writeTo(clientChannel);
+            if (written > 0) {
+                Diagnostics.add("bytes.relay_to_android", written);
+                Diagnostics.add("client.queue_bytes", -written);
+            }
+            if (networkToClient.sizePackets() != packetCountBefore) {
+                Diagnostics.add("client.queue_packets", -1);
+            }
+            return written != -1;
         } catch (IOException e) {
             Log.e(TAG, "Cannot write", e);
             return false;
@@ -140,7 +166,7 @@ public class Client {
             }
             if (!pendingIdBuffer.hasRemaining()) {
                 // we don't need this buffer anymore, release it
-                Log.d(TAG, "Client id #" + id + " sent to client");
+                Log.d(TAG, () -> "Client id #" + id + " sent to client");
                 pendingIdBuffer = null;
             }
             return true;
@@ -150,7 +176,7 @@ public class Client {
         }
     }
 
-    private void pushToNetwork() {
+    private void pushToNetwork() throws IOException {
         IPv4Packet packet;
         while ((packet = clientToNetwork.asIPv4Packet()) != null) {
             router.sendToNetwork(packet);
@@ -166,12 +192,16 @@ public class Client {
             Log.e(TAG, "Cannot close client connection", e);
         }
         router.clear();
+        Diagnostics.add("client.pending_packet_sources", -pendingPacketSources.size());
+        Diagnostics.add("client.queue_bytes", -networkToClient.sizeBytes());
+        Diagnostics.add("client.queue_packets", -networkToClient.sizePackets());
+        pendingPacketSources.clear();
         closeListener.onClosed(this);
     }
 
     private void updateInterests() {
         int interestOps = SelectionKey.OP_READ; // we always want to read
-        if (!networkToClient.isEmpty()) {
+        if (mustSendId() || !networkToClient.isEmpty() || !pendingPacketSources.isEmpty()) {
             interestOps |= SelectionKey.OP_WRITE;
         }
         if (interests != interestOps) {
@@ -182,13 +212,37 @@ public class Client {
     }
 
     public boolean sendToClient(IPv4Packet packet) {
-        if (networkToClient.remaining() < packet.getRawLength()) {
+        long nowNanos = System.nanoTime();
+        expireQueuedUdp(nowNanos);
+        boolean udp = packet.getIpv4Header().getProtocol() == IPv4Header.Protocol.UDP;
+        if (!networkToClient.offer(packet.getRaw(), udp, nowNanos)) {
             Log.w(TAG, "Client buffer full");
+            Diagnostics.increment("drops.client_queue_full");
             return false;
         }
-        networkToClient.readFrom(packet.getRaw());
+        Diagnostics.add("client.queue_bytes", packet.getRawLength());
+        Diagnostics.increment("client.queue_packets");
+        Diagnostics.recordMaximum("client.queue_bytes_max", networkToClient.sizeBytes());
+        Diagnostics.recordMaximum("client.queue_packets_max", networkToClient.sizePackets());
         updateInterests();
         return true;
+    }
+
+    void expireQueuedUdp(long nowNanos) {
+        int packetCountBefore = networkToClient.sizePackets();
+        int discardedBytes = networkToClient.discardExpiredUdp(MAX_UDP_QUEUE_AGE_NANOS, nowNanos);
+        int discardedPackets = packetCountBefore - networkToClient.sizePackets();
+        if (discardedPackets > 0) {
+            Diagnostics.add("client.queue_bytes", -discardedBytes);
+            Diagnostics.add("client.queue_packets", -discardedPackets);
+            Diagnostics.add("drops.client_queue_age_udp", discardedPackets);
+            Diagnostics.add("drops.client_queue_age_udp_bytes", discardedBytes);
+            updateInterests();
+        }
+    }
+
+    long getNextUdpExpiryNanos() {
+        return networkToClient.getNextUdpExpiryNanos(MAX_UDP_QUEUE_AGE_NANOS);
     }
 
     public void consume(PacketSource source) {
@@ -198,7 +252,16 @@ public class Client {
             return;
         }
         assert !pendingPacketSources.contains(source);
+        if (pendingPacketSources.size() >= MAX_PENDING_PACKET_SOURCES) {
+            Diagnostics.increment("drops.pending_source_limit");
+            if (source instanceof AbstractConnection) {
+                ((AbstractConnection) source).close();
+            }
+            return;
+        }
         pendingPacketSources.add(source);
+        Diagnostics.increment("client.pending_packet_sources");
+        Diagnostics.recordMaximum("client.pending_packet_sources_max", pendingPacketSources.size());
     }
 
     private void processPending() {
@@ -208,8 +271,9 @@ public class Client {
             IPv4Packet packet = packetSource.get();
             if (sendToClient(packet)) {
                 packetSource.next();
-                Log.d(TAG, "Pending packet sent to client (" + packet.getRawLength() + ")");
+                Log.d(TAG, () -> "Pending packet sent to client (" + packet.getRawLength() + ")");
                 iterator.remove();
+                Diagnostics.add("client.pending_packet_sources", -1);
             } else {
                 Log.w(TAG, "Pending packet not sent to client (" + packet.getRawLength() + "), client buffer full again");
                 return;

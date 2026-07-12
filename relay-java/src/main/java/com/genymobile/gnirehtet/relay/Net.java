@@ -19,6 +19,7 @@ package com.genymobile.gnirehtet.relay;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.UnknownHostException;
+import java.nio.ByteBuffer;
 
 public final class Net {
     private Net() {
@@ -66,5 +67,13 @@ public final class Net {
 
     public static String toString(int ip, short port) {
         return toString(new InetSocketAddress(Net.toInetAddress(ip), Short.toUnsignedInt(port)));
+    }
+
+    public static int toIpv4Int(InetAddress address) {
+        byte[] raw = address.getAddress();
+        if (raw.length != Integer.BYTES) {
+            throw new IllegalArgumentException("Expected an IPv4 address: " + address);
+        }
+        return ByteBuffer.wrap(raw).getInt();
     }
 }

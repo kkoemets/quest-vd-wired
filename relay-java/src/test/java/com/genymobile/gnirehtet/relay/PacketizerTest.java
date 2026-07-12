@@ -21,8 +21,12 @@ import org.junit.Test;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.net.Inet4Address;
+import java.net.InetSocketAddress;
+import java.net.StandardProtocolFamily;
 import java.nio.ByteBuffer;
 import java.nio.channels.Channels;
+import java.nio.channels.DatagramChannel;
 import java.nio.channels.ReadableByteChannel;
 
 @SuppressWarnings("checkstyle:MagicNumber")
@@ -102,5 +106,64 @@ public class PacketizerTest {
         Assert.assertEquals(0x66, packetPayload.get());
         Assert.assertEquals(0x77, packetPayload.get());
         Assert.assertEquals((byte) 0x88, packetPayload.get());
+    }
+
+    @Test
+    public void testUnconnectedUdpReceivesRepliesFromMultipleSenders() throws Exception {
+        IPv4Packet referencePacket = new IPv4Packet(createMockPacket());
+        Packetizer packetizer = new Packetizer(
+                referencePacket.getIpv4Header(), referencePacket.getTransportHeader(), 0x4000);
+        packetizer.getResponseIPv4Header().swapSourceAndDestination();
+        packetizer.getResponseTransportHeader().swapSourceAndDestination();
+
+        try (DatagramChannel receiver = openBoundDatagramChannel();
+             DatagramChannel sender1 = openBoundDatagramChannel();
+             DatagramChannel sender2 = openBoundDatagramChannel()) {
+            InetSocketAddress receiverAddress = (InetSocketAddress) receiver.getLocalAddress();
+            send(sender1, receiverAddress, new byte[]{1, 2, 3});
+            assertReply(packetizer, receiver, sender1, new byte[]{1, 2, 3});
+
+            send(sender2, receiverAddress, new byte[]{4, 5});
+            assertReply(packetizer, receiver, sender2, new byte[]{4, 5});
+        }
+    }
+
+    @Test
+    public void testMtuSizedPacketizerAllocation() {
+        IPv4Packet referencePacket = new IPv4Packet(createMockPacket());
+        Packetizer packetizer = new Packetizer(
+                referencePacket.getIpv4Header(), referencePacket.getTransportHeader(), 0x4000);
+        Assert.assertEquals(0x4001, packetizer.getAllocatedBytes());
+    }
+
+    private static DatagramChannel openBoundDatagramChannel() throws IOException {
+        DatagramChannel channel = DatagramChannel.open(StandardProtocolFamily.INET);
+        channel.configureBlocking(false);
+        channel.bind(new InetSocketAddress(Inet4Address.getLoopbackAddress(), 0));
+        Assert.assertFalse(channel.isConnected());
+        return channel;
+    }
+
+    private static void send(DatagramChannel sender, InetSocketAddress destination, byte[] payload) throws IOException {
+        Assert.assertEquals(payload.length, sender.send(ByteBuffer.wrap(payload), destination));
+    }
+
+    private static void assertReply(Packetizer packetizer, DatagramChannel receiver, DatagramChannel sender,
+            byte[] expectedPayload) throws Exception {
+        IPv4Packet packet = null;
+        long deadline = System.nanoTime() + 1000000000L;
+        while (packet == null && System.nanoTime() < deadline) {
+            packet = packetizer.packetizeDatagram(receiver);
+            if (packet == null) {
+                Thread.yield();
+            }
+        }
+        Assert.assertNotNull(packet);
+        InetSocketAddress senderAddress = (InetSocketAddress) sender.getLocalAddress();
+        Assert.assertEquals(Net.toIpv4Int(senderAddress.getAddress()), packet.getIpv4Header().getSource());
+        Assert.assertEquals(senderAddress.getPort(), packet.getTransportHeader().getSourcePort());
+        byte[] actualPayload = new byte[packet.getPayloadLength()];
+        packet.getPayload().get(actualPayload);
+        Assert.assertArrayEquals(expectedPayload, actualPayload);
     }
 }

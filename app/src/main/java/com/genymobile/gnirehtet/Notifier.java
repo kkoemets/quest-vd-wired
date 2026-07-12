@@ -35,6 +35,10 @@ public class Notifier {
             notificationBuilder.setContentText(context.getString(R.string.relay_connected));
             notificationBuilder.setSmallIcon(R.drawable.ic_usb_24dp);
         }
+        notificationBuilder.setContentIntent(createStatusIntent());
+        notificationBuilder.setCategory(Notification.CATEGORY_SERVICE);
+        notificationBuilder.setOngoing(true);
+        notificationBuilder.setOnlyAlertOnce(true);
         notificationBuilder.addAction(createStopAction());
         return notificationBuilder.build();
     }
@@ -54,11 +58,6 @@ public class Notifier {
         getNotificationManager().createNotificationChannel(channel);
     }
 
-    @TargetApi(26)
-    private void deleteNotificationChannel() {
-        getNotificationManager().deleteNotificationChannel(CHANNEL_ID);
-    }
-
     public void start() {
         failure = false; // reset failure flag
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -69,9 +68,6 @@ public class Notifier {
 
     public void stop() {
         context.stopForeground(true);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            deleteNotificationChannel();
-        }
     }
 
     public void setFailure(boolean failure) {
@@ -84,12 +80,25 @@ public class Notifier {
 
     private Notification.Action createStopAction() {
         Intent stopIntent = GnirehtetService.createStopIntent(context);
-        PendingIntent stopPendingIntent = PendingIntent.getService(context, 0, stopIntent, PendingIntent.FLAG_ONE_SHOT);
+        PendingIntent stopPendingIntent = PendingIntent.getService(context, 0, stopIntent, getPendingIntentFlags());
         // the non-deprecated constructor is not available in API 21
         @SuppressWarnings("deprecation")
         Notification.Action.Builder actionBuilder = new Notification.Action.Builder(R.drawable.ic_close_24dp, context.getString(R.string.stop_vpn),
                 stopPendingIntent);
         return actionBuilder.build();
+    }
+
+    private PendingIntent createStatusIntent() {
+        Intent statusIntent = new Intent(context, GnirehtetStatusActivity.class);
+        return PendingIntent.getActivity(context, 0, statusIntent, getPendingIntentFlags());
+    }
+
+    private static int getPendingIntentFlags() {
+        int flags = PendingIntent.FLAG_UPDATE_CURRENT;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            flags |= PendingIntent.FLAG_IMMUTABLE;
+        }
+        return flags;
     }
 
     private NotificationManager getNotificationManager() {

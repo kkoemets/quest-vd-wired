@@ -1,0 +1,1525 @@
+use std::{
+    fmt,
+    io::{self, Read},
+    path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, RecvTimeoutError, SyncSender, TryRecvError},
+        Arc,
+    },
+    thread,
+    time::{Duration, Instant},
+};
+
+#[cfg(target_os = "windows")]
+use std::fs;
+
+use crate::protocol::SessionId;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use wait_timeout::ChildExt;
+
+pub const ANDROID_PACKAGE: &str = "com.genymobile.gnirehtet";
+pub const ANDROID_CONTROL_ACTIVITY: &str = "com.genymobile.gnirehtet/.v4.AdbControlActivity";
+pub const ANDROID_VPN_SERVICE: &str = "com.genymobile.gnirehtet/.v4.VdLinkVpnService";
+pub const ACTION_START_V4: &str = "com.genymobile.gnirehtet.v4.START";
+pub const ACTION_STOP_V4: &str = "com.genymobile.gnirehtet.v4.STOP";
+pub const VIRTUAL_DESKTOP_PACKAGE: &str = "VirtualDesktop.Android";
+pub const ANDROID_VERSION_CODE: &str = "40";
+pub const ANDROID_VERSION_NAME: &str = "4.0.0-beta.1";
+pub const PLATFORM_TOOLS_VERSION: &str = "37.0.0";
+pub const PLATFORM_TOOLS_WINDOWS_URL: &str =
+    "https://dl.google.com/android/repository/platform-tools_r37.0.0-win.zip";
+pub const PLATFORM_TOOLS_WINDOWS_SHA256: &str =
+    "4fe305812db074cea32903a489d061eb4454cbc90a49e8fea677f4b7af764918";
+pub const SOCKS_PORT: u16 = 31_416;
+pub const CONTROL_PORT: u16 = 31_417;
+pub const UDP_STREAM_PORT: u16 = 31_418;
+pub const ADB_MAPPING_COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
+const ADB_INSTALL_TIMEOUT: Duration = Duration::from_secs(90);
+const MAX_ADB_OUTPUT_BYTES: usize = 1024 * 1024;
+const OUTPUT_TRUNCATED_MARKER: &[u8] = b"\n[ADB output truncated]\n";
+const OUTPUT_CHANNEL_CAPACITY: usize = 16;
+const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const CHILD_TERMINATION_GRACE: Duration = Duration::from_millis(100);
+const OUTPUT_EVENT_DRAIN_BUDGET: usize = 64;
+#[cfg(target_os = "windows")]
+const PLATFORM_TOOLS_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReverseMapping {
+    pub remote: u16,
+    pub local: u16,
+}
+
+pub const REVERSE_MAPPINGS: [ReverseMapping; 3] = [
+    ReverseMapping {
+        remote: CONTROL_PORT,
+        local: CONTROL_PORT,
+    },
+    ReverseMapping {
+        remote: SOCKS_PORT,
+        local: SOCKS_PORT,
+    },
+    // HEV's FWD UDP extension gets a dedicated ADB stream so TCP proxy
+    // traffic cannot starve latency-sensitive datagrams at the host acceptor.
+    ReverseMapping {
+        remote: UDP_STREAM_PORT,
+        local: UDP_STREAM_PORT,
+    },
+];
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdbOutput {
+    pub status: i32,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+impl AdbOutput {
+    pub fn success(stdout: impl Into<String>) -> Self {
+        Self {
+            status: 0,
+            stdout: stdout.into(),
+            stderr: String::new(),
+        }
+    }
+
+    pub fn is_success(&self) -> bool {
+        self.status == 0
+    }
+}
+
+pub trait AdbExecutor: Send + Sync {
+    fn execute(&self, args: &[String], timeout: Duration) -> Result<AdbOutput, AdbError>;
+}
+
+#[derive(Clone, Debug)]
+pub struct SystemAdb {
+    program: PathBuf,
+}
+
+impl SystemAdb {
+    pub fn new(program: impl Into<PathBuf>) -> Self {
+        Self {
+            program: program.into(),
+        }
+    }
+
+    pub fn program(&self) -> &Path {
+        &self.program
+    }
+}
+
+impl AdbExecutor for SystemAdb {
+    fn execute(&self, args: &[String], timeout: Duration) -> Result<AdbOutput, AdbError> {
+        let child = Command::new(&self.program)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|source| AdbError::Spawn {
+                program: self.program.clone(),
+                source,
+            })?;
+        collect_child_output(child, timeout)
+    }
+}
+
+fn collect_child_output(mut child: Child, timeout: Duration) -> Result<AdbOutput, AdbError> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .unwrap_or_else(Instant::now);
+    let mut containment = match CommandContainment::assign(&child) {
+        Ok(containment) => containment,
+        Err(error) => {
+            terminate_direct_child(&mut child);
+            return Err(AdbError::Containment(error));
+        }
+    };
+    let mut stdout = child.stdout.take().ok_or_else(|| {
+        terminate_child_tree(&mut child, &mut containment, None);
+        AdbError::Read("ADB stdout was not captured".into())
+    })?;
+    let mut stderr = child.stderr.take().ok_or_else(|| {
+        terminate_child_tree(&mut child, &mut containment, None);
+        AdbError::Read("ADB stderr was not captured".into())
+    })?;
+
+    let (sender, receiver) = mpsc::sync_channel(OUTPUT_CHANNEL_CAPACITY);
+    let mut output_readers = OutputReaders::default();
+    let stdout_sender = sender.clone();
+    let stdout_cancelled = output_readers.cancelled.clone();
+    let stdout_reader = thread::Builder::new()
+        .name("adb-stdout".into())
+        .spawn(move || {
+            stream_output(
+                &mut stdout,
+                OutputStream::Stdout,
+                stdout_sender,
+                &stdout_cancelled,
+            )
+        })
+        .map_err(|error| {
+            terminate_child_tree(&mut child, &mut containment, None);
+            AdbError::Read(format!("could not start ADB stdout reader: {error}"))
+        })?;
+    output_readers.handles.push(stdout_reader);
+    let stderr_sender = sender.clone();
+    let stderr_cancelled = output_readers.cancelled.clone();
+    let stderr_reader = thread::Builder::new()
+        .name("adb-stderr".into())
+        .spawn(move || {
+            stream_output(
+                &mut stderr,
+                OutputStream::Stderr,
+                stderr_sender,
+                &stderr_cancelled,
+            )
+        })
+        .map_err(|error| {
+            terminate_child_tree(&mut child, &mut containment, Some(&output_readers));
+            AdbError::Read(format!("could not start ADB stderr reader: {error}"))
+        })?;
+    output_readers.handles.push(stderr_reader);
+    drop(sender);
+
+    let mut status = None;
+    let mut stdout = OutputAccumulator::default();
+    let mut stderr = OutputAccumulator::default();
+    let mut readers_done = [false; 2];
+
+    loop {
+        for _ in 0..OUTPUT_EVENT_DRAIN_BUDGET {
+            match receiver.try_recv() {
+                Ok(event) => {
+                    if let Err(error) =
+                        apply_output_event(event, &mut stdout, &mut stderr, &mut readers_done)
+                    {
+                        terminate_child_tree(&mut child, &mut containment, Some(&output_readers));
+                        return Err(error);
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    if !readers_done.iter().all(|done| *done) {
+                        terminate_child_tree(&mut child, &mut containment, Some(&output_readers));
+                        return Err(AdbError::Read(
+                            "ADB output reader stopped without reporting completion".into(),
+                        ));
+                    }
+                    break;
+                }
+            }
+        }
+
+        if status.is_none() {
+            status = match child.try_wait() {
+                Ok(status) => status,
+                Err(error) => {
+                    terminate_child_tree(&mut child, &mut containment, Some(&output_readers));
+                    return Err(AdbError::Wait(error));
+                }
+            };
+        }
+        if let Some(status) = status.filter(|_| readers_done.iter().all(|done| *done)) {
+            containment.disarm().map_err(AdbError::Containment)?;
+            return Ok(AdbOutput {
+                status: status.code().unwrap_or(-1),
+                stdout: String::from_utf8_lossy(&stdout.finish()).into_owned(),
+                stderr: String::from_utf8_lossy(&stderr.finish()).into_owned(),
+            });
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            terminate_child_tree(&mut child, &mut containment, Some(&output_readers));
+            return Err(AdbError::Timeout(timeout));
+        }
+        let wait = CHILD_POLL_INTERVAL.min(deadline.saturating_duration_since(now));
+        match receiver.recv_timeout(wait) {
+            Ok(event) => {
+                if let Err(error) =
+                    apply_output_event(event, &mut stdout, &mut stderr, &mut readers_done)
+                {
+                    terminate_child_tree(&mut child, &mut containment, Some(&output_readers));
+                    return Err(error);
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                if !readers_done.iter().all(|done| *done) {
+                    terminate_child_tree(&mut child, &mut containment, Some(&output_readers));
+                    return Err(AdbError::Read(
+                        "ADB output reader stopped without reporting completion".into(),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+fn read_bounded_output(reader: &mut impl Read) -> io::Result<Vec<u8>> {
+    let mut captured = OutputAccumulator::default();
+    let mut buffer = [0; 16 * 1024];
+    loop {
+        let length = reader.read(&mut buffer)?;
+        if length == 0 {
+            break;
+        }
+        captured.push(&buffer[..length]);
+    }
+    Ok(captured.finish())
+}
+
+#[derive(Clone, Copy)]
+enum OutputStream {
+    Stdout,
+    Stderr,
+}
+
+impl OutputStream {
+    fn index(self) -> usize {
+        match self {
+            Self::Stdout => 0,
+            Self::Stderr => 1,
+        }
+    }
+}
+
+enum OutputEvent {
+    Chunk(OutputStream, Vec<u8>),
+    Finished(OutputStream),
+    Failed(OutputStream, io::Error),
+}
+
+#[derive(Default)]
+struct OutputAccumulator {
+    captured: Vec<u8>,
+    truncated: bool,
+}
+
+impl OutputAccumulator {
+    fn push(&mut self, bytes: &[u8]) {
+        let remaining = MAX_ADB_OUTPUT_BYTES.saturating_sub(self.captured.len());
+        let retained = remaining.min(bytes.len());
+        self.captured.extend_from_slice(&bytes[..retained]);
+        self.truncated |= retained < bytes.len();
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        if self.truncated {
+            let retained = MAX_ADB_OUTPUT_BYTES.saturating_sub(OUTPUT_TRUNCATED_MARKER.len());
+            self.captured.truncate(retained);
+            self.captured.extend_from_slice(OUTPUT_TRUNCATED_MARKER);
+        }
+        self.captured
+    }
+}
+
+#[derive(Default)]
+struct OutputReaders {
+    cancelled: Arc<AtomicBool>,
+    handles: Vec<thread::JoinHandle<()>>,
+}
+
+impl OutputReaders {
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        cancel_synchronous_output_reads(&self.handles);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn cancel_synchronous_output_reads(_readers: &[thread::JoinHandle<()>]) {}
+
+#[cfg(target_os = "windows")]
+fn cancel_synchronous_output_reads(readers: &[thread::JoinHandle<()>]) {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::IO::CancelSynchronousIo;
+
+    for reader in readers {
+        unsafe {
+            CancelSynchronousIo(reader.as_raw_handle().cast());
+        }
+    }
+}
+
+fn stream_output(
+    reader: &mut impl Read,
+    stream: OutputStream,
+    sender: SyncSender<OutputEvent>,
+    cancelled: &AtomicBool,
+) {
+    let mut buffer = [0; 16 * 1024];
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        match reader.read(&mut buffer) {
+            Ok(0) => {
+                let _ = sender.send(OutputEvent::Finished(stream));
+                return;
+            }
+            Ok(length) => {
+                if cancelled.load(Ordering::Acquire) {
+                    return;
+                }
+                if sender
+                    .send(OutputEvent::Chunk(stream, buffer[..length].to_vec()))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            Err(error) => {
+                let _ = sender.send(OutputEvent::Failed(stream, error));
+                return;
+            }
+        }
+    }
+}
+
+fn apply_output_event(
+    event: OutputEvent,
+    stdout: &mut OutputAccumulator,
+    stderr: &mut OutputAccumulator,
+    readers_done: &mut [bool; 2],
+) -> Result<(), AdbError> {
+    match event {
+        OutputEvent::Chunk(OutputStream::Stdout, bytes) => stdout.push(&bytes),
+        OutputEvent::Chunk(OutputStream::Stderr, bytes) => stderr.push(&bytes),
+        OutputEvent::Finished(stream) => readers_done[stream.index()] = true,
+        OutputEvent::Failed(stream, error) => {
+            readers_done[stream.index()] = true;
+            return Err(AdbError::Read(format!(
+                "ADB {} capture failed: {error}",
+                match stream {
+                    OutputStream::Stdout => "stdout",
+                    OutputStream::Stderr => "stderr",
+                }
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn terminate_child_tree(
+    child: &mut Child,
+    containment: &mut CommandContainment,
+    output_readers: Option<&OutputReaders>,
+) {
+    containment.terminate();
+    if let Some(output_readers) = output_readers {
+        output_readers.cancel();
+    }
+    terminate_direct_child(child);
+}
+
+fn terminate_direct_child(child: &mut Child) {
+    if !child.try_wait().is_ok_and(|status| status.is_some()) {
+        let _ = child.kill();
+        let _ = child.wait_timeout(CHILD_TERMINATION_GRACE);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+struct CommandContainment;
+
+#[cfg(not(target_os = "windows"))]
+impl CommandContainment {
+    fn assign(_child: &Child) -> io::Result<Self> {
+        Ok(Self)
+    }
+
+    fn terminate(&mut self) {}
+
+    fn disarm(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "windows")]
+struct CommandContainment {
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    armed: bool,
+}
+
+#[cfg(target_os = "windows")]
+impl CommandContainment {
+    fn assign(child: &Child) -> io::Result<Self> {
+        use std::{ffi::c_void, os::windows::io::AsRawHandle, ptr::null};
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+
+        let handle = unsafe { CreateJobObjectW(null(), null()) };
+        if handle.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let containment = Self {
+            handle,
+            armed: true,
+        };
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if unsafe {
+            SetInformationJobObject(
+                handle,
+                JobObjectExtendedLimitInformation,
+                (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast::<c_void>(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if unsafe { AssignProcessToJobObject(handle, child.as_raw_handle().cast()) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(containment)
+    }
+
+    fn terminate(&mut self) {
+        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+
+        if self.armed {
+            unsafe {
+                TerminateJobObject(self.handle, 1);
+            }
+        }
+    }
+
+    fn disarm(&mut self) -> io::Result<()> {
+        use std::ffi::c_void;
+        use windows_sys::Win32::System::JobObjects::{
+            JobObjectExtendedLimitInformation, SetInformationJobObject,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        };
+
+        if !self.armed {
+            return Ok(());
+        }
+        let limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        if unsafe {
+            SetInformationJobObject(
+                self.handle,
+                JobObjectExtendedLimitInformation,
+                (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast::<c_void>(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        self.armed = false;
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for CommandContainment {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.handle);
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct AdbController {
+    executor: Arc<dyn AdbExecutor>,
+    command_timeout: Duration,
+    mapping_timeout: Duration,
+    install_timeout: Duration,
+    stop_timeout: Duration,
+    poll_interval: Duration,
+}
+
+impl fmt::Debug for AdbController {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AdbController")
+            .field("command_timeout", &self.command_timeout)
+            .field("stop_timeout", &self.stop_timeout)
+            .field("poll_interval", &self.poll_interval)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AdbController {
+    pub fn new(executor: Arc<dyn AdbExecutor>) -> Self {
+        Self::with_timing(
+            executor,
+            Duration::from_secs(8),
+            Duration::from_secs(5),
+            Duration::from_millis(100),
+        )
+    }
+
+    pub fn with_timing(
+        executor: Arc<dyn AdbExecutor>,
+        command_timeout: Duration,
+        stop_timeout: Duration,
+        poll_interval: Duration,
+    ) -> Self {
+        Self {
+            executor,
+            command_timeout,
+            mapping_timeout: command_timeout.min(ADB_MAPPING_COMMAND_TIMEOUT),
+            install_timeout: command_timeout.max(ADB_INSTALL_TIMEOUT),
+            stop_timeout,
+            poll_interval,
+        }
+    }
+
+    pub fn install_matching_apk(&self, apk: &Path) -> Result<(), TransactionError> {
+        self.run_checked_with(&strings(&["-d", "get-state"]), self.mapping_timeout)
+            .map_err(|failure| TransactionError::single("device_check", failure))?;
+        let args = vec![
+            "-d".into(),
+            "install".into(),
+            "-r".into(),
+            apk.as_os_str().to_string_lossy().into_owned(),
+        ];
+        self.run_checked_with(&args, self.install_timeout)
+            .map_err(|failure| TransactionError::single("apk_install", failure))?;
+        let package = self
+            .run_checked(&strings(&[
+                "-d",
+                "shell",
+                "dumpsys",
+                "package",
+                ANDROID_PACKAGE,
+            ]))
+            .map_err(|failure| TransactionError::single("apk_verify", failure))?;
+        let has_code = package.stdout.lines().any(|line| {
+            line.trim()
+                .strip_prefix("versionCode=")
+                .and_then(|value| value.split_whitespace().next())
+                == Some(ANDROID_VERSION_CODE)
+        });
+        let has_name = package
+            .stdout
+            .lines()
+            .any(|line| line.trim() == format!("versionName={ANDROID_VERSION_NAME}"));
+        if !has_code || !has_name {
+            return Err(TransactionError::new(
+                "apk_verify",
+                vec![format!(
+                    "installed {ANDROID_PACKAGE} does not match versionCode={ANDROID_VERSION_CODE}, versionName={ANDROID_VERSION_NAME}"
+                )],
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn start(
+        &self,
+        session_id: SessionId,
+        all_traffic: bool,
+    ) -> Result<StartReceipt, TransactionError> {
+        let allowed_package = VIRTUAL_DESKTOP_PACKAGE;
+        self.run_checked_with(&strings(&["-d", "get-state"]), self.mapping_timeout)
+            .map_err(|failure| TransactionError::single("device_check", failure))?;
+
+        let mut failures = Vec::new();
+        for mapping in REVERSE_MAPPINGS {
+            if let Err(error) = self.add_mapping(mapping) {
+                failures.push(error.to_string());
+                break;
+            }
+        }
+        if !failures.is_empty() {
+            self.remove_all_mappings(&mut failures);
+            return Err(TransactionError::new("reverse_setup", failures));
+        }
+        match self.mapping_health() {
+            Ok(health) if health.is_healthy() => {}
+            Ok(health) => {
+                failures.push(format!(
+                    "reverse mappings missing after add: {:?}",
+                    health.missing
+                ));
+                self.remove_all_mappings(&mut failures);
+                return Err(TransactionError::new("reverse_verify", failures));
+            }
+            Err(error) => {
+                failures.push(format!("reverse mapping verification failed: {error}"));
+                self.remove_all_mappings(&mut failures);
+                return Err(TransactionError::new("reverse_verify", failures));
+            }
+        }
+
+        let all_traffic_value = if all_traffic { "true" } else { "false" };
+        let args = vec![
+            "-d".into(),
+            "shell".into(),
+            "am".into(),
+            "start".into(),
+            "-W".into(),
+            "-n".into(),
+            ANDROID_CONTROL_ACTIVITY.into(),
+            "-a".into(),
+            ACTION_START_V4.into(),
+            "--es".into(),
+            "sessionId".into(),
+            session_id.to_string(),
+            "--es".into(),
+            "vdPackage".into(),
+            allowed_package.into(),
+            "--ei".into(),
+            "socksPort".into(),
+            SOCKS_PORT.to_string(),
+            "--ei".into(),
+            "udpPort".into(),
+            UDP_STREAM_PORT.to_string(),
+            "--ei".into(),
+            "controlPort".into(),
+            CONTROL_PORT.to_string(),
+            "--ez".into(),
+            "allTraffic".into(),
+            all_traffic_value.into(),
+        ];
+        if let Err(error) = self.run_checked(&args) {
+            failures.push(error.to_string());
+            let rollback = self.run_checked(&strings(&[
+                "-d",
+                "shell",
+                "am",
+                "start",
+                "-W",
+                "-n",
+                ANDROID_CONTROL_ACTIVITY,
+                "-a",
+                ACTION_STOP_V4,
+            ]));
+            if let Err(rollback) = rollback {
+                failures.push(format!("Android start rollback: {rollback}"));
+            }
+            if let Err(verification) = self.verify_vpn_closed() {
+                failures.push(format!(
+                    "Android start rollback verification: {verification}"
+                ));
+            }
+            self.remove_all_mappings(&mut failures);
+            return Err(TransactionError::new("android_start", failures));
+        }
+
+        Ok(StartReceipt {
+            session_id,
+            all_traffic,
+            allowed_package: allowed_package.to_owned(),
+            mappings: REVERSE_MAPPINGS.to_vec(),
+        })
+    }
+
+    /// Requests an explicit VPN stop, verifies the service released the VPN,
+    /// then removes every product-owned reverse mapping. Mapping cleanup is
+    /// attempted even when the stop request or verification fails.
+    pub fn stop(&self) -> Result<(), TransactionError> {
+        let mut failures = Vec::new();
+        let args = strings(&[
+            "-d",
+            "shell",
+            "am",
+            "start",
+            "-W",
+            "-n",
+            ANDROID_CONTROL_ACTIVITY,
+            "-a",
+            ACTION_STOP_V4,
+        ]);
+        let request_error = self.run_checked(&args).err();
+        if let Err(error) = self.verify_vpn_closed() {
+            if let Some(request_error) = request_error {
+                failures.push(format!("stop request: {request_error}"));
+            }
+            failures.push(format!("VPN closure verification: {error}"));
+        }
+        self.remove_all_mappings(&mut failures);
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(TransactionError::new("stop", failures))
+        }
+    }
+
+    pub fn repair_mappings(&self) -> Result<(), TransactionError> {
+        let health = self
+            .mapping_health()
+            .map_err(|failure| TransactionError::single("repair_probe", failure))?;
+        self.repair_missing_mappings(&health.missing)
+    }
+
+    pub fn repair_missing_mappings(
+        &self,
+        missing: &[ReverseMapping],
+    ) -> Result<(), TransactionError> {
+        let mut failures = Vec::new();
+        for mapping in missing.iter().copied() {
+            if !REVERSE_MAPPINGS.contains(&mapping) {
+                failures.push(format!("refusing non-product reverse mapping {mapping:?}"));
+                continue;
+            }
+            if let Err(error) = self.add_mapping(mapping) {
+                failures.push(error.to_string());
+            }
+        }
+        match self.mapping_health() {
+            Ok(health) if health.is_healthy() => {}
+            Ok(health) => failures.push(format!(
+                "reverse mappings missing after repair: {:?}",
+                health.missing
+            )),
+            Err(error) => failures.push(format!("reverse mapping verification failed: {error}")),
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(TransactionError::new("repair", failures))
+        }
+    }
+
+    /// Completes the happy-path GNR4 stop transaction: STOPPED is only sent by
+    /// Android after it closes the VPN descriptor, and this performs a second
+    /// dumpsys verification before removing product-owned reverse mappings.
+    pub fn finish_control_stop(&self) -> Result<(), TransactionError> {
+        let mut failures = Vec::new();
+        if let Err(error) = self.verify_vpn_closed() {
+            failures.push(format!("VPN closure verification: {error}"));
+        }
+        self.remove_all_mappings(&mut failures);
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(TransactionError::new("control_stop", failures))
+        }
+    }
+
+    pub fn mapping_health(&self) -> Result<MappingHealth, AdbError> {
+        let output =
+            self.run_checked_with(&strings(&["-d", "reverse", "--list"]), self.mapping_timeout)?;
+        let missing = REVERSE_MAPPINGS
+            .iter()
+            .copied()
+            .filter(|mapping| {
+                let expected = (
+                    format!("tcp:{}", mapping.remote),
+                    format!("tcp:{}", mapping.local),
+                );
+                !parse_reverse_list(&output.stdout).any(|actual| actual == expected)
+            })
+            .collect();
+        Ok(MappingHealth { missing })
+    }
+
+    pub fn device_state(&self) -> Result<String, AdbError> {
+        Ok(self
+            .run_checked_with(&strings(&["-d", "get-state"]), self.mapping_timeout)?
+            .stdout
+            .trim()
+            .to_owned())
+    }
+
+    pub fn android_status(&self) -> Result<AndroidVpnStatus, AdbError> {
+        let output = self.run_checked(&strings(&[
+            "-d",
+            "shell",
+            "dumpsys",
+            "activity",
+            "service",
+            ANDROID_VPN_SERVICE,
+        ]))?;
+        Ok(AndroidVpnStatus::parse(&output.stdout))
+    }
+
+    fn verify_vpn_closed(&self) -> Result<(), AdbError> {
+        let deadline = Instant::now() + self.stop_timeout;
+        loop {
+            let output = self.run_checked(&strings(&[
+                "-d",
+                "shell",
+                "dumpsys",
+                "activity",
+                "service",
+                ANDROID_VPN_SERVICE,
+            ]))?;
+            let normalized = output.stdout.to_ascii_lowercase();
+            let service_absent = normalized.trim().is_empty()
+                || normalized.contains("no services match")
+                || normalized.contains("no service records found");
+            if service_absent || vpn_descriptor_explicitly_closed(&output.stdout) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(AdbError::VpnStillActive);
+            }
+            thread::sleep(
+                self.poll_interval
+                    .min(deadline.saturating_duration_since(Instant::now())),
+            );
+        }
+    }
+
+    fn add_mapping(&self, mapping: ReverseMapping) -> Result<(), AdbError> {
+        self.run_checked_with(
+            &[
+                "-d".into(),
+                "reverse".into(),
+                format!("tcp:{}", mapping.remote),
+                format!("tcp:{}", mapping.local),
+            ],
+            self.mapping_timeout,
+        )?;
+        Ok(())
+    }
+
+    fn remove_all_mappings(&self, failures: &mut Vec<String>) {
+        for mapping in REVERSE_MAPPINGS {
+            let args = [
+                "-d".into(),
+                "reverse".into(),
+                "--remove".into(),
+                format!("tcp:{}", mapping.remote),
+            ];
+            match self.executor.execute(&args, self.mapping_timeout) {
+                Ok(output) if output.is_success() => {}
+                Ok(output) if mapping_was_already_absent(&output) => {}
+                Ok(output) => failures.push(format!(
+                    "remove tcp:{}: ADB exited with {}: {}",
+                    mapping.remote,
+                    output.status,
+                    output.stderr.trim()
+                )),
+                Err(error) => failures.push(format!("remove tcp:{}: {error}", mapping.remote)),
+            }
+        }
+        match self.run_checked_with(&strings(&["-d", "reverse", "--list"]), self.mapping_timeout) {
+            Ok(output) => {
+                let owned: Vec<_> = parse_reverse_list(&output.stdout)
+                    .filter(|(remote, _)| {
+                        REVERSE_MAPPINGS
+                            .iter()
+                            .any(|mapping| remote == &format!("tcp:{}", mapping.remote))
+                    })
+                    .collect();
+                if !owned.is_empty() {
+                    failures.push(format!(
+                        "product reverse mappings remain after removal: {owned:?}"
+                    ));
+                }
+            }
+            Err(error) => failures.push(format!("could not verify reverse removal: {error}")),
+        }
+    }
+
+    fn run_checked(&self, args: &[String]) -> Result<AdbOutput, AdbError> {
+        self.run_checked_with(args, self.command_timeout)
+    }
+
+    fn run_checked_with(&self, args: &[String], timeout: Duration) -> Result<AdbOutput, AdbError> {
+        let output = self.executor.execute(args, timeout)?;
+        if output.is_success() {
+            Ok(output)
+        } else {
+            Err(AdbError::CommandFailed {
+                status: output.status,
+                stderr: output.stderr.trim().to_owned(),
+            })
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StartReceipt {
+    pub session_id: SessionId,
+    pub all_traffic: bool,
+    pub allowed_package: String,
+    pub mappings: Vec<ReverseMapping>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MappingHealth {
+    pub missing: Vec<ReverseMapping>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct AndroidVpnStatus {
+    pub present: bool,
+    pub state: Option<String>,
+    pub vpn_fd_open: Option<bool>,
+    pub session_id: Option<String>,
+    pub last_error: Option<String>,
+    pub tx_packets: Option<u64>,
+    pub tx_bytes: Option<u64>,
+    pub rx_packets: Option<u64>,
+    pub rx_bytes: Option<u64>,
+    pub control_rtt_samples: Option<u64>,
+    pub control_rtt_p99_us: Option<u64>,
+    pub control_rtt_max_us: Option<u64>,
+    pub control_rtt_histogram: Vec<u64>,
+}
+
+impl AndroidVpnStatus {
+    fn parse(output: &str) -> Self {
+        let mut status = Self::default();
+        for line in output.lines().map(str::trim) {
+            if line.contains("ServiceRecord") || line.contains("app=ProcessRecord") {
+                status.present = true;
+            }
+            if let Some(value) = line.strip_prefix("gnirehtet.state=") {
+                status.present = true;
+                status.state = Some(value.to_ascii_lowercase());
+            } else if let Some(value) = line.strip_prefix("vpnFdOpen=") {
+                status.present = true;
+                status.vpn_fd_open = value.parse().ok();
+            } else if let Some(value) = line.strip_prefix("sessionId=") {
+                status.present = true;
+                status.session_id = (value != "none").then(|| value.to_owned());
+            } else if let Some(value) = line.strip_prefix("lastError=") {
+                status.present = true;
+                status.last_error = (value != "none").then(|| value.to_owned());
+            } else if let Some(value) = line.strip_prefix("controlRttSamples=") {
+                status.control_rtt_samples = value.parse().ok();
+            } else if let Some(value) = line.strip_prefix("controlRttP99Us=") {
+                status.control_rtt_p99_us = value.parse().ok();
+            } else if let Some(value) = line.strip_prefix("controlRttMaxUs=") {
+                status.control_rtt_max_us = value.parse().ok();
+            } else if let Some(value) = line.strip_prefix("controlRttHistogram=") {
+                status.control_rtt_histogram = value
+                    .split(',')
+                    .filter_map(|count| count.trim().parse().ok())
+                    .collect();
+            } else if line.starts_with("txPackets=") {
+                for field in line.split_whitespace() {
+                    let Some((key, value)) = field.split_once('=') else {
+                        continue;
+                    };
+                    let value = value.parse().ok();
+                    match key {
+                        "txPackets" => status.tx_packets = value,
+                        "txBytes" => status.tx_bytes = value,
+                        "rxPackets" => status.rx_packets = value,
+                        "rxBytes" => status.rx_bytes = value,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        status
+    }
+}
+
+impl MappingHealth {
+    pub fn is_healthy(&self) -> bool {
+        self.missing.is_empty()
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum AdbError {
+    #[error("failed to start {program}: {source}")]
+    Spawn {
+        program: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("ADB command exceeded {0:?}")]
+    Timeout(Duration),
+    #[error("failed while waiting for ADB: {0}")]
+    Wait(std::io::Error),
+    #[error("failed to contain ADB subprocess tree: {0}")]
+    Containment(std::io::Error),
+    #[error("failed to capture ADB output: {0}")]
+    Read(String),
+    #[error("ADB exited with {status}: {stderr}")]
+    CommandFailed { status: i32, stderr: String },
+    #[error("Android still reports an active VPN after the stop deadline")]
+    VpnStillActive,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Error)]
+#[error("ADB {phase} transaction failed: {failures:?}")]
+pub struct TransactionError {
+    pub phase: &'static str,
+    pub failures: Vec<String>,
+}
+
+impl TransactionError {
+    fn new(phase: &'static str, failures: Vec<String>) -> Self {
+        Self { phase, failures }
+    }
+
+    fn single(phase: &'static str, failure: AdbError) -> Self {
+        Self::new(phase, vec![failure.to_string()])
+    }
+}
+
+fn strings(values: &[&str]) -> Vec<String> {
+    values.iter().map(|value| (*value).to_owned()).collect()
+}
+
+fn mapping_was_already_absent(output: &AdbOutput) -> bool {
+    let message = format!("{} {}", output.stdout, output.stderr).to_ascii_lowercase();
+    [
+        "cannot remove listener",
+        "listener not found",
+        "no such listener",
+        "not found",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
+}
+
+fn vpn_descriptor_explicitly_closed(output: &str) -> bool {
+    let mut saw_closed = false;
+    for value in output
+        .lines()
+        .map(str::trim)
+        .filter_map(|line| line.strip_prefix("vpnFdOpen="))
+    {
+        match value.parse::<bool>() {
+            Ok(true) | Err(_) => return false,
+            Ok(false) => saw_closed = true,
+        }
+    }
+    saw_closed
+}
+
+fn parse_reverse_list(output: &str) -> impl Iterator<Item = (String, String)> + '_ {
+    output.lines().filter_map(|line| {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.len() != 3 {
+            return None;
+        }
+        let remote = fields[1];
+        let local = fields[2];
+        (remote.starts_with("tcp:") && local.starts_with("tcp:"))
+            .then(|| (remote.to_owned(), local.to_owned()))
+    })
+}
+
+#[cfg(target_os = "windows")]
+pub fn repair_adb_if_missing(
+    configured: PathBuf,
+    app_root: &Path,
+) -> Result<PathBuf, AdbBootstrapError> {
+    let configured_adb = SystemAdb::new(configured.clone());
+    if configured_adb
+        .execute(&["version".into()], Duration::from_secs(3))
+        .is_ok_and(|output| output.is_success())
+    {
+        return Ok(configured);
+    }
+
+    if let Some(adb) = verified_local_adb(app_root) {
+        if adb != configured
+            && SystemAdb::new(adb.clone())
+                .execute(&["version".into()], Duration::from_secs(3))
+                .is_ok_and(|output| output.is_success())
+        {
+            return Ok(adb);
+        }
+    }
+
+    let install_root = app_root.join(format!("platform-tools-{PLATFORM_TOOLS_VERSION}"));
+    let platform_tools = install_root.join("platform-tools");
+    let adb = platform_tools.join("adb.exe");
+    let api_dll = platform_tools.join("AdbWinApi.dll");
+    let usb_dll = platform_tools.join("AdbWinUsbApi.dll");
+    let marker = install_root.join(".verified-sha256");
+    let required = [adb.as_path(), api_dll.as_path(), usb_dll.as_path()];
+    fs::create_dir_all(app_root)?;
+    if install_root.exists() {
+        fs::remove_dir_all(&install_root)?;
+    }
+    let archive = app_root.join(format!("platform-tools-{PLATFORM_TOOLS_VERSION}-win.zip"));
+    let script = "$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; Invoke-WebRequest -Uri $env:GNR4_ADB_URL -OutFile $env:GNR4_ADB_ARCHIVE; $actual=(Get-FileHash -Algorithm SHA256 -LiteralPath $env:GNR4_ADB_ARCHIVE).Hash.ToLowerInvariant(); if($actual -ne $env:GNR4_ADB_SHA){Remove-Item -Force $env:GNR4_ADB_ARCHIVE -ErrorAction SilentlyContinue; throw ('SHA-256 mismatch: '+$actual)}; Expand-Archive -LiteralPath $env:GNR4_ADB_ARCHIVE -DestinationPath $env:GNR4_ADB_DEST -Force";
+    let child = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ])
+        .env("GNR4_ADB_URL", PLATFORM_TOOLS_WINDOWS_URL)
+        .env("GNR4_ADB_SHA", PLATFORM_TOOLS_WINDOWS_SHA256)
+        .env("GNR4_ADB_ARCHIVE", &archive)
+        .env("GNR4_ADB_DEST", &install_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let output = collect_child_output(child, PLATFORM_TOOLS_DOWNLOAD_TIMEOUT)
+        .map_err(|error| AdbBootstrapError::PowerShell(error.to_string()))?;
+    let _ = fs::remove_file(&archive);
+    if !output.is_success() {
+        let _ = fs::remove_dir_all(&install_root);
+        return Err(AdbBootstrapError::PowerShell(
+            output.stderr.trim().to_owned(),
+        ));
+    }
+    if !required.iter().all(|path| path.is_file()) {
+        let _ = fs::remove_dir_all(&install_root);
+        return Err(AdbBootstrapError::IncompleteArchive);
+    }
+    fs::write(&marker, format!("{PLATFORM_TOOLS_WINDOWS_SHA256}\n"))?;
+    Ok(adb)
+}
+
+/// Resolves ADB consistently for every command and for the spawned host:
+/// explicit override, checksum-marked local platform-tools, then PATH.
+pub fn resolve_adb_program(configured: Option<PathBuf>, app_root: &Path) -> PathBuf {
+    configured
+        .or_else(|| verified_local_adb(app_root))
+        .unwrap_or_else(|| PathBuf::from("adb"))
+}
+
+#[cfg(target_os = "windows")]
+fn verified_local_adb(app_root: &Path) -> Option<PathBuf> {
+    let install_root = app_root.join(format!("platform-tools-{PLATFORM_TOOLS_VERSION}"));
+    let platform_tools = install_root.join("platform-tools");
+    let adb = platform_tools.join("adb.exe");
+    let api_dll = platform_tools.join("AdbWinApi.dll");
+    let usb_dll = platform_tools.join("AdbWinUsbApi.dll");
+    let required = [adb.as_path(), api_dll.as_path(), usb_dll.as_path()];
+    let marker = install_root.join(".verified-sha256");
+    (required.iter().all(|path| path.is_file())
+        && fs::read_to_string(marker)
+            .ok()
+            .is_some_and(|value| value.trim() == PLATFORM_TOOLS_WINDOWS_SHA256))
+    .then_some(adb)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn verified_local_adb(_app_root: &Path) -> Option<PathBuf> {
+    None
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn repair_adb_if_missing(
+    configured: PathBuf,
+    _app_root: &Path,
+) -> Result<PathBuf, AdbBootstrapError> {
+    Ok(configured)
+}
+
+#[derive(Debug, Error)]
+pub enum AdbBootstrapError {
+    #[error("ADB bootstrap I/O failed: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("official platform-tools download failed: {0}")]
+    PowerShell(String),
+    #[error("verified platform-tools archive did not contain adb.exe and its required DLLs")]
+    IncompleteArchive,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::VecDeque, io::Cursor, sync::Mutex};
+
+    use super::*;
+
+    #[derive(Default)]
+    struct MockAdb {
+        calls: Mutex<Vec<Vec<String>>>,
+        timeouts: Mutex<Vec<(Vec<String>, Duration)>>,
+        results: Mutex<VecDeque<Result<AdbOutput, AdbError>>>,
+    }
+
+    impl MockAdb {
+        fn with_results(results: Vec<Result<AdbOutput, AdbError>>) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                timeouts: Mutex::new(Vec::new()),
+                results: Mutex::new(results.into()),
+            }
+        }
+    }
+
+    impl AdbExecutor for MockAdb {
+        fn execute(&self, args: &[String], timeout: Duration) -> Result<AdbOutput, AdbError> {
+            self.calls.lock().unwrap().push(args.to_vec());
+            self.timeouts.lock().unwrap().push((args.to_vec(), timeout));
+            self.results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Ok(AdbOutput::success("")))
+        }
+    }
+
+    fn controller(mock: Arc<MockAdb>) -> AdbController {
+        AdbController::with_timing(
+            mock,
+            Duration::from_millis(10),
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+    }
+
+    #[test]
+    fn failed_start_rolls_back_every_mapping() {
+        let mock = Arc::new(MockAdb::with_results(vec![
+            Ok(AdbOutput::success("device")),
+            Ok(AdbOutput::success("")),
+            Ok(AdbOutput {
+                status: 1,
+                stdout: String::new(),
+                stderr: "reverse refused".into(),
+            }),
+        ]));
+        let result = controller(mock.clone()).start(SessionId([7; 16]), false);
+        assert!(result.is_err());
+        let calls = mock.calls.lock().unwrap();
+        for mapping in REVERSE_MAPPINGS {
+            assert!(calls.iter().any(|args| {
+                args.windows(2)
+                    .any(|pair| pair == ["--remove", &format!("tcp:{}", mapping.remote)])
+            }));
+        }
+    }
+
+    #[test]
+    fn stop_cleanup_runs_even_when_stop_request_fails() {
+        let mock = Arc::new(MockAdb::with_results(vec![
+            Ok(AdbOutput {
+                status: 1,
+                stdout: String::new(),
+                stderr: "service unavailable".into(),
+            }),
+            Ok(AdbOutput::success(format!(
+                "ServiceRecord {{{ANDROID_VPN_SERVICE}}}\ngnirehtet.state=CONNECTED\nvpnFdOpen=true"
+            ))),
+        ]));
+        let result = controller(mock.clone()).stop();
+        assert!(result.is_err());
+        let calls = mock.calls.lock().unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|args| args.iter().any(|arg| arg == "--remove"))
+                .count(),
+            REVERSE_MAPPINGS.len()
+        );
+    }
+
+    #[test]
+    fn already_stopped_is_idempotent_even_if_activity_command_fails() {
+        let mock = Arc::new(MockAdb::with_results(vec![
+            Ok(AdbOutput {
+                status: 1,
+                stdout: String::new(),
+                stderr: "activity not running".into(),
+            }),
+            Ok(AdbOutput::success("No services match")),
+        ]));
+        controller(mock).stop().unwrap();
+    }
+
+    #[test]
+    fn start_uses_the_android_v4_contract() {
+        let mock = Arc::new(MockAdb::with_results(vec![
+            Ok(AdbOutput::success("device")),
+            Ok(AdbOutput::success("")),
+            Ok(AdbOutput::success("")),
+            Ok(AdbOutput::success("")),
+            Ok(AdbOutput::success(
+                "UsbFfs tcp:31417 tcp:31417\nUsbFfs tcp:31416 tcp:31416\nUsbFfs tcp:31418 tcp:31418\n",
+            )),
+            Ok(AdbOutput::success("Starting")),
+        ]));
+        let receipt = controller(mock.clone())
+            .start(SessionId([0x11; 16]), false)
+            .unwrap();
+        assert_eq!(receipt.allowed_package, VIRTUAL_DESKTOP_PACKAGE);
+        let calls = mock.calls.lock().unwrap();
+        let start = calls
+            .iter()
+            .find(|args| args.iter().any(|arg| arg == ACTION_START_V4))
+            .unwrap();
+        for required in [
+            ANDROID_CONTROL_ACTIVITY,
+            "sessionId",
+            "vdPackage",
+            VIRTUAL_DESKTOP_PACKAGE,
+            "socksPort",
+            "31416",
+            "udpPort",
+            "31418",
+            "controlPort",
+            "31417",
+            "allTraffic",
+            "false",
+        ] {
+            assert!(
+                start.iter().any(|arg| arg == required),
+                "missing {required}"
+            );
+        }
+        assert!(start
+            .windows(3)
+            .any(|arguments| { arguments == ["--es", "vdPackage", VIRTUAL_DESKTOP_PACKAGE] }));
+    }
+
+    #[test]
+    fn adb_output_capture_is_bounded_while_draining_the_stream() {
+        let input = vec![b'x'; MAX_ADB_OUTPUT_BYTES * 2];
+        let captured = read_bounded_output(&mut Cursor::new(input)).unwrap();
+        assert_eq!(captured.len(), MAX_ADB_OUTPUT_BYTES);
+        assert!(captured.ends_with(OUTPUT_TRUNCATED_MARKER));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn subprocess_capture_preserves_both_streams_and_exit_status() {
+        let child = Command::new("sh")
+            .args(["-c", "printf stdout; printf stderr >&2; exit 7"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let output = collect_child_output(child, Duration::from_secs(1)).unwrap();
+        assert_eq!(output.status, 7);
+        assert_eq!(output.stdout, "stdout");
+        assert_eq!(output.stderr, "stderr");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inherited_output_pipe_cannot_extend_the_command_deadline() {
+        let child = Command::new("sh")
+            .args(["-c", "(trap '' HUP; sleep 1) &"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        let result = collect_child_output(child, Duration::from_millis(25));
+        assert!(matches!(result, Err(AdbError::Timeout(_))));
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn stopped_state_does_not_override_an_open_vpn_descriptor() {
+        let mock = Arc::new(MockAdb::with_results(vec![Ok(AdbOutput::success(
+            format!(
+                "ServiceRecord {{{ANDROID_VPN_SERVICE}}}\ngnirehtet.state=STOPPED\nvpnFdOpen=true"
+            ),
+        ))]));
+        let result = controller(mock).finish_control_stop();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn contradictory_descriptor_fields_fail_closed() {
+        let mock = Arc::new(MockAdb::with_results(vec![Ok(AdbOutput::success(
+            format!(
+                "ServiceRecord {{{ANDROID_VPN_SERVICE}}}\ngnirehtet.state=STOPPED\nvpnFdOpen=true\nvpnFdOpen=false"
+            ),
+        ))]));
+        assert!(controller(mock).finish_control_stop().is_err());
+    }
+
+    #[test]
+    fn descriptor_field_alone_marks_the_v4_service_present() {
+        let status = AndroidVpnStatus::parse("vpnFdOpen=true\n");
+        assert!(status.present);
+        assert_eq!(status.vpn_fd_open, Some(true));
+    }
+
+    #[test]
+    fn install_verifies_matching_package_version() {
+        let mock = Arc::new(MockAdb::with_results(vec![
+            Ok(AdbOutput::success("device")),
+            Ok(AdbOutput::success("Success")),
+            Ok(AdbOutput::success(
+                "versionCode=40 minSdk=29 targetSdk=36\nversionName=4.0.0-beta.1\n",
+            )),
+        ]));
+        AdbController::new(mock.clone())
+            .install_matching_apk(Path::new("embedded.apk"))
+            .unwrap();
+        let calls = mock.calls.lock().unwrap();
+        assert!(calls.iter().any(|args| {
+            args.iter()
+                .map(String::as_str)
+                .eq(["-d", "install", "-r", "embedded.apk"])
+        }));
+        assert!(calls.iter().any(|args| {
+            args.iter().map(String::as_str).eq([
+                "-d",
+                "shell",
+                "dumpsys",
+                "package",
+                ANDROID_PACKAGE,
+            ])
+        }));
+        drop(calls);
+        let timeouts = mock.timeouts.lock().unwrap();
+        assert!(timeouts.iter().any(|(args, timeout)| {
+            args.iter().any(|argument| argument == "install") && *timeout == ADB_INSTALL_TIMEOUT
+        }));
+        assert!(timeouts.iter().any(|(args, timeout)| {
+            args.iter().any(|argument| argument == "get-state")
+                && *timeout == ADB_MAPPING_COMMAND_TIMEOUT
+        }));
+    }
+
+    #[test]
+    fn health_requires_all_owned_mappings() {
+        let stdout =
+            "UsbFfs tcp:31416 tcp:31416\nUsbFfs tcp:31417 tcp:31417\nUsbFfs tcp:31418 tcp:31418\n";
+        let mock = Arc::new(MockAdb::with_results(vec![Ok(AdbOutput::success(stdout))]));
+        assert!(controller(mock).mapping_health().unwrap().is_healthy());
+    }
+
+    #[test]
+    fn health_rejects_prefix_and_substring_false_positives() {
+        let stdout =
+            "UsbFfs tcp:314160 tcp:314160\nUsbFfs tcp:31417 tcp:314170\nmalformed tcp:31416 tcp:31416 extra\n";
+        let mock = Arc::new(MockAdb::with_results(vec![Ok(AdbOutput::success(stdout))]));
+        let health = controller(mock).mapping_health().unwrap();
+        assert_eq!(health.missing.len(), REVERSE_MAPPINGS.len());
+    }
+
+    #[test]
+    fn pinned_platform_tools_digest_is_lowercase_sha256() {
+        assert_eq!(PLATFORM_TOOLS_WINDOWS_SHA256.len(), 64);
+        assert!(PLATFORM_TOOLS_WINDOWS_SHA256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()));
+        assert!(PLATFORM_TOOLS_WINDOWS_URL.starts_with("https://dl.google.com/"));
+    }
+
+    #[test]
+    fn explicit_adb_override_wins_deterministically() {
+        let directory = tempfile::tempdir().unwrap();
+        let configured = directory.path().join("configured-adb");
+        assert_eq!(
+            resolve_adb_program(Some(configured.clone()), directory.path()),
+            configured
+        );
+    }
+
+    #[test]
+    fn parses_payload_free_android_rtt_and_traffic_status() {
+        let status = AndroidVpnStatus::parse(
+            "gnirehtet.state=CONNECTED\nvpnFdOpen=true\nsessionId=00112233-4455-6677-8899-aabbccddeeff\nlastError=none\ntxPackets=10 txBytes=20 rxPackets=30 rxBytes=40\ncontrolRttSamples=5\ncontrolRttP99Us=2000\ncontrolRttMaxUs=3000\ncontrolRttHistogram=1,2,2,0,0,0,0,0,0,0\n",
+        );
+        assert!(status.present);
+        assert_eq!(status.state.as_deref(), Some("connected"));
+        assert_eq!(status.tx_bytes, Some(20));
+        assert_eq!(status.control_rtt_p99_us, Some(2_000));
+        assert_eq!(status.control_rtt_histogram.len(), 10);
+    }
+}

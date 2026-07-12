@@ -1,0 +1,36 @@
+[package]
+name = "gnirehtet-vd-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+gnirehtet-vd = { path = "../crates/gnirehtet-vd" }
+
+[[bin]]
+name = "gnr4_frame"
+path = "fuzz_targets/gnr4_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "hev_udp_frame"
+path = "fuzz_targets/hev_udp_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "socks_request"
+path = "fuzz_targets/socks_request.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

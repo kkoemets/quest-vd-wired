@@ -80,7 +80,8 @@ public class PersistentRelayTunnel implements Tunnel {
 
     @Override
     public void close() {
-        stopped.set(true);
-        provider.invalidateTunnel();
+        if (stopped.compareAndSet(false, true)) {
+            provider.close();
+        }
     }
 }

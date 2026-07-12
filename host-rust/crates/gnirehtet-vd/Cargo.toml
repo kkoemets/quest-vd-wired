@@ -1,0 +1,33 @@
+[package]
+name = "gnirehtet-vd"
+build = "build.rs"
+description = "Quest 3 / Virtual Desktop wired-link host"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+name = "gnirehtet_vd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gnirehtet-vd"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+wait-timeout.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[dev-dependencies]
+proptest = "1.5"
+tempfile = "3.12"

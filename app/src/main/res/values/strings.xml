@@ -2,5 +2,8 @@
     <string name="app_name" translatable="false">Gnirehtet</string>
     <string name="relay_connected">Reverse tethering enabled</string>
     <string name="relay_disconnected">Disconnected from the relay server</string>
-    <string name="stop_vpn">Stop Gnirehtet</string>
+    <string name="stop_vpn">Stop wired link</string>
+    <string name="wired_link_title">Quest wired link</string>
+    <string name="wired_link_status">Status: %1$s\n%2$s</string>
+    <string name="stop_requested">Status: STOPPING\nStop requested</string>
 </resources>

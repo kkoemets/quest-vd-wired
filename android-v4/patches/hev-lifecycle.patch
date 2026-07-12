@@ -1,0 +1,531 @@
+diff --git a/src/hev-jni.c b/src/hev-jni.c
+index 9698555..0553ed2 100644
+--- a/src/hev-jni.c
++++ b/src/hev-jni.c
+@@ -1,9 +1,9 @@
+ /*
+  ============================================================================
+  Name        : hev-jni.c
+- Author      : hev <r@hev.cc>
++ Author      : hev <r@hev.cc>, gnirehtet-vd contributors
+  Copyright   : Copyright (c) 2019 - 2023 hev
+- Description : Jave Native Interface
++ Description : Android JNI lifecycle bridge
+  ============================================================================
+  */
+
+@@ -12,15 +12,14 @@
+ #include <jni.h>
+ #include <pthread.h>
+
+-#include <stdio.h>
++#include <errno.h>
++#include <stdint.h>
+ #include <stdlib.h>
+-#include <signal.h>
+ #include <string.h>
++#include <time.h>
+
+ #include "hev-main.h"
+
+-#include "hev-jni.h"
+-
+ /* clang-format off */
+ #ifndef PKGNAME
+ #define PKGNAME hev/htproxy
+@@ -34,137 +33,283 @@
+ #define STR_ARG(c) #c
+ #define N_ELEMENTS(arr) (sizeof (arr) / sizeof ((arr)[0]))
+
++enum
++{
++    STATE_STOPPED = 0,
++    STATE_STARTING = 1,
++    STATE_RUNNING = 2,
++    STATE_STOPPING = 3,
++    STATE_FAILED = 4,
++};
++
+ typedef struct _ThreadData ThreadData;
+
+ struct _ThreadData
+ {
+     char *path;
+     int fd;
++    uint64_t generation;
+ };
+
+-static int is_working;
+-static JavaVM *java_vm;
+-static pthread_t work_thread;
+-static pthread_mutex_t mutex;
+-static pthread_key_t current_jni_env;
+-
+-static void native_start_service (JNIEnv *env, jobject thiz, jstring conig_path,
+-                                  jint fd);
+-static void native_stop_service (JNIEnv *env, jobject thiz);
++static int state = STATE_STOPPED;
++static int exit_code;
++static uint64_t generation;
++static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t state_changed = PTHREAD_COND_INITIALIZER;
++
++static jlong native_start_service (JNIEnv *env, jobject thiz,
++                                   jstring config_path, jint fd);
++static jint native_await_ready (JNIEnv *env, jobject thiz, jlong token,
++                                jint timeout_ms);
++static jboolean native_stop_service (JNIEnv *env, jobject thiz, jlong token);
++static jint native_await_stopped (JNIEnv *env, jobject thiz, jlong token,
++                                  jint timeout_ms);
+ static jlongArray native_get_stats (JNIEnv *env, jobject thiz);
+
+ static JNINativeMethod native_methods[] = {
+-    { "TProxyStartService", "(Ljava/lang/String;I)V",
++    { "TProxyStartService", "(Ljava/lang/String;I)J",
+       (void *)native_start_service },
+-    { "TProxyStopService", "()V", (void *)native_stop_service },
++    { "TProxyAwaitReady", "(JI)I", (void *)native_await_ready },
++    { "TProxyStopService", "(J)Z", (void *)native_stop_service },
++    { "TProxyAwaitStopped", "(JI)I", (void *)native_await_stopped },
+     { "TProxyGetStats", "()[J", (void *)native_get_stats },
+ };
+
+-static void
+-detach_current_thread (void *env)
+-{
+-    (*java_vm)->DetachCurrentThread (java_vm);
+-}
+-
+ jint
+ JNI_OnLoad (JavaVM *vm, void *reserved)
+ {
+     JNIEnv *env = NULL;
+     jclass klass;
+
+-    java_vm = vm;
+-    if (JNI_OK != (*vm)->GetEnv (vm, (void **)&env, JNI_VERSION_1_4)) {
++    if (JNI_OK != (*vm)->GetEnv (vm, (void **)&env, JNI_VERSION_1_6))
+         return 0;
+-    }
+
+     klass = (*env)->FindClass (env, STR (PKGNAME) "/" STR (CLSNAME));
+-    (*env)->RegisterNatives (env, klass, native_methods,
+-                             N_ELEMENTS (native_methods));
++    if (!klass)
++        return 0;
++    if ((*env)->RegisterNatives (env, klass, native_methods,
++                                 N_ELEMENTS (native_methods)) != 0) {
++        (*env)->DeleteLocalRef (env, klass);
++        return 0;
++    }
+     (*env)->DeleteLocalRef (env, klass);
+
+-    pthread_key_create (&current_jni_env, detach_current_thread);
+-    pthread_mutex_init (&mutex, NULL);
++    return JNI_VERSION_1_6;
++}
++
++static void
++deadline_from_now (struct timespec *deadline, int timeout_ms)
++{
++    clock_gettime (CLOCK_REALTIME, deadline);
++    deadline->tv_sec += timeout_ms / 1000;
++    deadline->tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
++    if (deadline->tv_nsec >= 1000000000L) {
++        deadline->tv_sec++;
++        deadline->tv_nsec -= 1000000000L;
++    }
++}
+
+-    return JNI_VERSION_1_4;
++static int
++ready_callback (void *data)
++{
++    ThreadData *tdata = data;
++    int cancelled;
++
++    pthread_mutex_lock (&mutex);
++    cancelled = tdata->generation != generation || state == STATE_STOPPING;
++    if (!cancelled)
++        state = STATE_RUNNING;
++    pthread_cond_broadcast (&state_changed);
++    pthread_mutex_unlock (&mutex);
++
++    return cancelled;
+ }
+
+ static void *
+ thread_handler (void *data)
+ {
+     ThreadData *tdata = data;
++    int result;
+
+-    hev_socks5_tunnel_main (tdata->path, tdata->fd);
++    result = hev_socks5_tunnel_main_with_ready (
++        tdata->path, tdata->fd, ready_callback, tdata);
++
++    pthread_mutex_lock (&mutex);
++    if (tdata->generation == generation) {
++        exit_code = result;
++        if (state == STATE_STOPPING || result == 0)
++            state = STATE_STOPPED;
++        else
++            state = STATE_FAILED;
++        pthread_cond_broadcast (&state_changed);
++    }
++    pthread_mutex_unlock (&mutex);
+
+     free (tdata->path);
+     free (tdata);
+-
+     return NULL;
+ }
+
+-static void
++static jlong
+ native_start_service (JNIEnv *env, jobject thiz, jstring config_path, jint fd)
+ {
+-    const jbyte *bytes;
+-    ThreadData *tdata;
+-    int res;
++    const char *bytes = NULL;
++    ThreadData *tdata = NULL;
++    pthread_t thread;
++    uint64_t token = 0;
+
+     pthread_mutex_lock (&mutex);
+-
+-    if (is_working)
++    if (state == STATE_STARTING || state == STATE_RUNNING ||
++        state == STATE_STOPPING)
+         goto exit;
+
+-    tdata = malloc (sizeof (ThreadData));
++    tdata = calloc (1, sizeof (*tdata));
++    if (!tdata)
++        goto failed;
++
++    bytes = (*env)->GetStringUTFChars (env, config_path, NULL);
++    if (!bytes)
++        goto failed;
++    tdata->path = strdup (bytes);
++    (*env)->ReleaseStringUTFChars (env, config_path, bytes);
++    bytes = NULL;
++    if (!tdata->path)
++        goto failed;
++
++    generation++;
++    if (generation == 0)
++        generation++;
++    token = generation;
++    tdata->generation = token;
+     tdata->fd = fd;
+-
+-    bytes = (const jbyte *)(*env)->GetStringUTFChars (env, config_path, NULL);
+-    tdata->path = strdup ((const char *)bytes);
+-    (*env)->ReleaseStringUTFChars (env, config_path, (const char *)bytes);
+-
+-    res = pthread_create (&work_thread, NULL, thread_handler, tdata);
+-    if (res != 0) {
++    exit_code = 0;
++    state = STATE_STARTING;
++
++    if (pthread_create (&thread, NULL, thread_handler, tdata) != 0)
++        goto failed;
++    pthread_detach (thread);
++    tdata = NULL;
++    goto exit;
++
++failed:
++    if (bytes)
++        (*env)->ReleaseStringUTFChars (env, config_path, bytes);
++    if (tdata) {
+         free (tdata->path);
+         free (tdata);
+-        goto exit;
+     }
++    token = 0;
++    exit_code = -1;
++    state = STATE_FAILED;
++    pthread_cond_broadcast (&state_changed);
+
+-    is_working = 1;
+ exit:
+     pthread_mutex_unlock (&mutex);
++    return (jlong)token;
+ }
+
+-static void
+-native_stop_service (JNIEnv *env, jobject thiz)
++static jint
++native_await_ready (JNIEnv *env, jobject thiz, jlong token, jint timeout_ms)
+ {
++    struct timespec deadline;
++    int wait_result = 0;
++    int result;
++
++    if (timeout_ms < 0)
++        return -3;
++    deadline_from_now (&deadline, timeout_ms);
++
+     pthread_mutex_lock (&mutex);
++    while ((uint64_t)token == generation && state == STATE_STARTING &&
++           wait_result != ETIMEDOUT) {
++        wait_result = pthread_cond_timedwait (&state_changed, &mutex, &deadline);
++    }
++    if ((uint64_t)token != generation)
++        result = -2;
++    else if (state == STATE_RUNNING)
++        result = 1;
++    else if (state == STATE_STARTING)
++        result = 0;
++    else
++        result = -1;
++    pthread_mutex_unlock (&mutex);
++    return result;
++}
+
+-    if (!is_working)
+-        goto exit;
++static jboolean
++native_stop_service (JNIEnv *env, jobject thiz, jlong token)
++{
++    int accepted = 0;
+
+-    hev_socks5_tunnel_quit ();
+-    pthread_join (work_thread, NULL);
++    pthread_mutex_lock (&mutex);
++    if ((uint64_t)token == generation) {
++        accepted = 1;
++        if (state == STATE_STARTING) {
++            state = STATE_STOPPING;
++            pthread_cond_broadcast (&state_changed);
++        } else if (state == STATE_RUNNING) {
++            state = STATE_STOPPING;
++            pthread_cond_broadcast (&state_changed);
++            /* Serialize the global quit signal with generation changes. */
++            hev_socks5_tunnel_quit ();
++        }
++    }
++    pthread_mutex_unlock (&mutex);
+
+-    is_working = 0;
+-exit:
++    return accepted ? JNI_TRUE : JNI_FALSE;
++}
++
++static jint
++native_await_stopped (JNIEnv *env, jobject thiz, jlong token, jint timeout_ms)
++{
++    struct timespec deadline;
++    int wait_result = 0;
++    int result;
++
++    if (timeout_ms < 0)
++        return -3;
++    deadline_from_now (&deadline, timeout_ms);
++
++    pthread_mutex_lock (&mutex);
++    while ((uint64_t)token == generation &&
++           (state == STATE_STARTING || state == STATE_RUNNING ||
++            state == STATE_STOPPING) &&
++           wait_result != ETIMEDOUT) {
++        wait_result = pthread_cond_timedwait (&state_changed, &mutex, &deadline);
++    }
++    if ((uint64_t)token != generation)
++        result = -2;
++    else if (state == STATE_STOPPED)
++        result = 1;
++    else if (state == STATE_FAILED)
++        result = -1;
++    else
++        result = 0;
+     pthread_mutex_unlock (&mutex);
++    return result;
+ }
+
+ static jlongArray
+ native_get_stats (JNIEnv *env, jobject thiz)
+ {
+-    size_t tx_packets, rx_packets, tx_bytes, rx_bytes;
+-    jlongArray res;
++    size_t tx_packets = 0, rx_packets = 0, tx_bytes = 0, rx_bytes = 0;
+     jlong array[4];
++    jlongArray result;
++
++    pthread_mutex_lock (&mutex);
++    if (state == STATE_RUNNING)
++        hev_socks5_tunnel_stats (&tx_packets, &tx_bytes, &rx_packets,
++                                 &rx_bytes);
++    pthread_mutex_unlock (&mutex);
+
+-    hev_socks5_tunnel_stats (&tx_packets, &tx_bytes, &rx_packets, &rx_bytes);
+     array[0] = tx_packets;
+     array[1] = tx_bytes;
+     array[2] = rx_packets;
+     array[3] = rx_bytes;
+-
+-    res = (*env)->NewLongArray (env, 4);
+-    (*env)->SetLongArrayRegion (env, res, 0, 4, array);
+-
+-    return res;
++    result = (*env)->NewLongArray (env, 4);
++    if (result)
++        (*env)->SetLongArrayRegion (env, result, 0, 4, array);
++    return result;
+ }
+
+ #endif /* ANDROID */
+diff --git a/src/hev-main.c b/src/hev-main.c
+index 38dcae0..e87059e 100644
+--- a/src/hev-main.c
++++ b/src/hev-main.c
+@@ -27,7 +27,9 @@
+ #include "hev-main.h"
+
+ static int
+-hev_socks5_tunnel_main_inner (int tun_fd)
++hev_socks5_tunnel_main_inner (int tun_fd,
++                              HevSocks5TunnelReadyCallback ready_callback,
++                              void *ready_data)
+ {
+     const char *pid_file;
+     const char *log_file;
+@@ -49,12 +51,16 @@ hev_socks5_tunnel_main_inner (int tun_fd)
+     hev_socks5_set_udp_recv_buffer_size (res);
+
+     res = hev_logger_init (log_level, log_file);
+-    if (res < 0)
+-        return -2;
++    if (res < 0) {
++        res = -2;
++        goto config_fini;
++    }
+
+     res = hev_socks5_logger_init (log_level, log_file);
+-    if (res < 0)
+-        return -3;
++    if (res < 0) {
++        res = -3;
++        goto logger_fini;
++    }
+
+     nofile = hev_config_get_misc_limit_nofile ();
+     res = set_limit_nofile (nofile);
+@@ -66,24 +72,37 @@ hev_socks5_tunnel_main_inner (int tun_fd)
+         run_as_daemon (pid_file);
+
+     res = hev_task_system_init ();
+-    if (res < 0)
+-        return -4;
++    if (res < 0) {
++        res = -4;
++        goto socks5_logger_fini;
++    }
+
+     lwip_init ();
+
+     res = hev_socks5_tunnel_init (tun_fd);
+-    if (res < 0)
+-        return -5;
++    if (res < 0) {
++        res = -5;
++        goto task_system_fini;
++    }
++
++    if (ready_callback && ready_callback (ready_data) != 0)
++        goto exit;
+
+     hev_socks5_tunnel_run ();
++    res = 0;
+
++exit:
+     hev_socks5_tunnel_fini ();
++task_system_fini:
++    hev_task_system_fini ();
++socks5_logger_fini:
+     hev_socks5_logger_fini ();
++logger_fini:
+     hev_logger_fini ();
++config_fini:
+     hev_config_fini ();
+-    hev_task_system_fini ();
+
+-    return 0;
++    return res;
+ }
+
+ int
+@@ -93,7 +112,7 @@ hev_socks5_tunnel_main_from_file (const char *config_path, int tun_fd)
+     if (res < 0)
+         return -1;
+
+-    return hev_socks5_tunnel_main_inner (tun_fd);
++    return hev_socks5_tunnel_main_inner (tun_fd, NULL, NULL);
+ }
+
+ int
+@@ -104,7 +123,19 @@ hev_socks5_tunnel_main_from_str (const unsigned char *config_str,
+     if (res < 0)
+         return -1;
+
+-    return hev_socks5_tunnel_main_inner (tun_fd);
++    return hev_socks5_tunnel_main_inner (tun_fd, NULL, NULL);
++}
++
++int
++hev_socks5_tunnel_main_with_ready (
++    const char *config_path, int tun_fd,
++    HevSocks5TunnelReadyCallback ready_callback, void *ready_data)
++{
++    int res = hev_config_init_from_file (config_path);
++    if (res < 0)
++        return -1;
++
++    return hev_socks5_tunnel_main_inner (tun_fd, ready_callback, ready_data);
+ }
+
+ int
+diff --git a/src/hev-main.h b/src/hev-main.h
+index 49896b9..b72ca2c 100644
+--- a/src/hev-main.h
++++ b/src/hev-main.h
+@@ -16,6 +16,12 @@
+ extern "C" {
+ #endif
+
++typedef int (*HevSocks5TunnelReadyCallback) (void *data);
++
++int hev_socks5_tunnel_main_with_ready (
++    const char *config_path, int tun_fd,
++    HevSocks5TunnelReadyCallback ready_callback, void *ready_data);
++
+ /**
+  * hev_socks5_tunnel_main:
+  * @config_path: config file path
+diff --git a/src/hev-socks5-tunnel.c b/src/hev-socks5-tunnel.c
+index 50cf41a..ec3c1a4 100644
+--- a/src/hev-socks5-tunnel.c
++++ b/src/hev-socks5-tunnel.c
+@@ -695,16 +695,13 @@ hev_socks5_tunnel_stop (void)
+
+     LOG_D ("socks5 tunnel stop");
+
+-    for (;;) {
+-        fd = READ_ONCE (event_fds[1]);
+-        if (fd >= 0)
+-            break;
+-        /* Wait for async initialization */
+-        usleep (100 * 1000);
+-    }
++    fd = READ_ONCE (event_fds[1]);
++    if (fd < 0)
++        return;
+
+     res = write (fd, &res, 1);
+-    assert (res > 0 && "socks5 tunnel write event");
++    if (res < 0)
++        LOG_W ("socks5 tunnel write event");
+ }
+
+ void

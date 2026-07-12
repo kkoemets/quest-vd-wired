@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">Gnirehtet VD</string>
+    <string name="status_title">Wired Virtual Desktop link</string>
+    <string name="stop_link">Stop wired link</string>
+</resources>

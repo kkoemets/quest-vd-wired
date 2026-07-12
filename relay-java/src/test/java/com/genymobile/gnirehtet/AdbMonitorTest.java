@@ -19,9 +19,18 @@ package com.genymobile.gnirehtet;
 import org.junit.Assert;
 import org.junit.Test;
 
+import java.io.InputStream;
+import java.net.Inet4Address;
+import java.net.InetSocketAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
+@SuppressWarnings("checkstyle:MagicNumber")
 public class AdbMonitorTest {
 
     private static ByteBuffer toByteBuffer(String s) {
@@ -110,5 +119,121 @@ public class AdbMonitorTest {
         Assert.assertEquals("0123456789ABCDEF", pSerials[0]);
         Assert.assertEquals("FEDCBA9876543210", pSerials[1]);
         Assert.assertEquals("FEDCBA9876543210", pSerials[2]);
+    }
+
+    @Test
+    public void testClearConnectedDevicesReplaysDeviceAfterMonitorReconnect() {
+        final int[] callbackCount = new int[1];
+        AdbMonitor monitor = new AdbMonitor((serial) -> ++callbackCount[0]);
+        String packet = "0123456789ABCDEF\tdevice\n";
+
+        monitor.handlePacket(packet);
+        monitor.clearConnectedDevices();
+        monitor.handlePacket(packet);
+
+        Assert.assertEquals(2, callbackCount[0]);
+    }
+
+    @Test
+    public void testHandshakeDeadline() throws Exception {
+        try (ServerSocket server = new ServerSocket(0, 1, Inet4Address.getLoopbackAddress())) {
+            Thread peer = new Thread(() -> acceptAndRemainSilent(server), "silent-adb-peer");
+            peer.setDaemon(true);
+            peer.start();
+            AdbMonitor monitor = new AdbMonitor((serial) -> { }, "adb",
+                    new InetSocketAddress(Inet4Address.getLoopbackAddress(), server.getLocalPort()), 1000, 50, 50);
+
+            try {
+                monitor.trackDevices();
+                Assert.fail("Expected handshake timeout");
+            } catch (java.net.SocketTimeoutException expected) {
+                // expected
+            }
+        }
+    }
+
+    @Test
+    public void testRejectedHandshakeFailsInsteadOfTightLooping() throws Exception {
+        try (ServerSocket server = new ServerSocket(0, 1, Inet4Address.getLoopbackAddress())) {
+            Thread peer = new Thread(() -> acceptAndReply(server, "FAIL"), "rejecting-adb-peer");
+            peer.setDaemon(true);
+            peer.start();
+            AdbMonitor monitor = new AdbMonitor((serial) -> { }, "adb",
+                    new InetSocketAddress(Inet4Address.getLoopbackAddress(), server.getLocalPort()), 1000, 1000, 50);
+
+            try {
+                monitor.trackDevices();
+                Assert.fail("Expected rejected handshake");
+            } catch (java.io.IOException expected) {
+                Assert.assertTrue(expected.getMessage().contains("rejected"));
+            }
+        }
+    }
+
+    @Test
+    public void testTrackReadDeadlineMakesInterruptPrompt() throws Exception {
+        CountDownLatch handshakeSent = new CountDownLatch(1);
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        try (ServerSocket server = new ServerSocket(0, 1, Inet4Address.getLoopbackAddress())) {
+            Thread peer = new Thread(() -> acceptTrackRequest(server, handshakeSent), "tracking-adb-peer");
+            peer.setDaemon(true);
+            peer.start();
+            AdbMonitor monitor = new AdbMonitor((serial) -> { }, "adb",
+                    new InetSocketAddress(Inet4Address.getLoopbackAddress(), server.getLocalPort()), 1000, 1000, 50);
+            Thread tracking = new Thread(() -> {
+                try {
+                    monitor.trackDevices();
+                } catch (Throwable throwable) {
+                    failure.set(throwable);
+                }
+            }, "adb-monitor-test");
+            tracking.start();
+            Assert.assertTrue(handshakeSent.await(1, TimeUnit.SECONDS));
+            tracking.interrupt();
+            tracking.join(1000);
+
+            Assert.assertFalse("tracking thread ignored interrupt", tracking.isAlive());
+            Assert.assertNull(failure.get());
+        }
+    }
+
+    private static void acceptAndRemainSilent(ServerSocket server) {
+        try (Socket ignored = server.accept()) {
+            Thread.sleep(1000);
+        } catch (Exception ignored) {
+            // The client closing the test socket is expected.
+        }
+    }
+
+    private static void acceptAndReply(ServerSocket server, String reply) {
+        try (Socket socket = server.accept()) {
+            socket.getOutputStream().write(reply.getBytes(StandardCharsets.US_ASCII));
+            socket.getOutputStream().flush();
+        } catch (Exception ignored) {
+            // The test assertion reports client-side failures.
+        }
+    }
+
+    private static void acceptTrackRequest(ServerSocket server, CountDownLatch handshakeSent) {
+        try (Socket socket = server.accept()) {
+            InputStream input = socket.getInputStream();
+            byte[] request = new byte[22];
+            int offset = 0;
+            while (offset < request.length) {
+                int count = input.read(request, offset, request.length - offset);
+                if (count == -1) {
+                    return;
+                }
+                offset += count;
+            }
+            socket.getOutputStream().write("OKAY0000".getBytes(StandardCharsets.US_ASCII));
+            socket.getOutputStream().flush();
+            handshakeSent.countDown();
+            while (input.read() != -1) {
+                // Wait for the monitor to close after observing its interrupt.
+            }
+        } catch (Exception ignored) {
+            // The client closing the test socket is expected.
+        }
     }
 }

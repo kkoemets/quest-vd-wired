@@ -23,7 +23,7 @@ public class ConnectionId {
     private final short sourcePort;
     private final int destIp;
     private final short destPort;
-    private final String idString;
+    private String idString;
 
     public ConnectionId(IPv4Header.Protocol protocol, int sourceIp, short sourcePort, int destIp, short destPort) {
         this.protocol = protocol;
@@ -31,9 +31,6 @@ public class ConnectionId {
         this.sourcePort = sourcePort;
         this.destIp = destIp;
         this.destPort = destPort;
-
-        // compute the String representation only once
-        idString = protocol + " " + Net.toString(sourceIp, sourcePort) + " -> " + Net.toString(destIp, destPort);
     }
 
     public IPv4Header.Protocol getProtocol() {
@@ -86,6 +83,11 @@ public class ConnectionId {
 
     @Override
     public String toString() {
+        if (idString == null) {
+            // Flow lookup is based exclusively on the primitive fields. Format an address
+            // only when a message is actually emitted.
+            idString = protocol + " " + Net.toString(sourceIp, sourcePort) + " -> " + Net.toString(destIp, destPort);
+        }
         return idString;
     }
 

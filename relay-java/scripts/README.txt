@@ -1,4 +1,4 @@
-Gnirehtet For Quest 3 Link Cable And Virtual Desktop
+Gnirehtet v3.1 Standard for Quest 3 and Virtual Desktop
 
 Quick start
 
@@ -27,7 +27,8 @@ Included Windows helpers
 - gnirehtet-launcher.cmd status shows the same dependency / Quest status
   without starting the tunnel.
 - gnirehtet-get-adb.cmd downloads Google's official Android platform-tools
-  into this folder. It does not ship adb in the release zip.
+  into this folder. The downloader pins version 37.0.0 and verifies its
+  SHA-256 before extraction. It does not ship adb in the release zip.
 
 Notes
 
@@ -36,7 +37,5 @@ Notes
 - Java still needs to be installed separately if the launcher reports it
   missing.
 
-More help
-
-- Full project guide: README.md in the repository
-- Developer/build notes: DEVELOP.md in the repository
+This is the recommended everyday release. v4.0 Beta is available separately
+for users who want to test the new tray app.

@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gnirehtet-vd.invalid/schemas/benchmark-result-v1.json",
+  "title": "Gnirehtet VD dataplane benchmark result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "candidate",
+    "commit",
+    "startedAt",
+    "durationSeconds",
+    "rawAdbCeilingBitsPerSecond",
+    "forwardBitsPerSecond",
+    "reverseBitsPerSecond",
+    "relayDrops",
+    "staleDrops",
+    "controlRttMs",
+    "udpQueueResidenceMs",
+    "host",
+    "artifacts",
+    "hardwareEvidence"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "candidate": {
+      "enum": ["optimized-java", "hev-rust", "tun2proxy-rust", "raw-ip-rust"]
+    },
+    "commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "startedAt": { "type": "string", "format": "date-time" },
+    "durationSeconds": { "type": "integer", "minimum": 1 },
+    "rawAdbCeilingBitsPerSecond": { "type": "integer", "minimum": 1 },
+    "forwardBitsPerSecond": { "type": "integer", "minimum": 0 },
+    "reverseBitsPerSecond": { "type": "integer", "minimum": 0 },
+    "relayDrops": { "type": "integer", "minimum": 0 },
+    "staleDrops": { "type": "integer", "minimum": 0 },
+    "controlRttMs": { "$ref": "#/$defs/percentiles" },
+    "udpQueueResidenceMs": { "$ref": "#/$defs/percentiles" },
+    "host": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cpuCorePercent", "rssBytes", "rssGrowthBytes"],
+      "properties": {
+        "cpuCorePercent": { "type": "number", "minimum": 0 },
+        "rssBytes": { "type": "integer", "minimum": 0 },
+        "rssGrowthBytes": { "type": "integer" }
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "sha256"],
+        "properties": {
+          "path": { "type": "string", "minLength": 1 },
+          "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+        }
+      }
+    },
+    "hardwareEvidence": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "questVersion",
+            "windowsVersion",
+            "streamerVersion",
+            "usbTopology",
+            "settings",
+            "thermalArtifact"
+          ],
+          "properties": {
+            "questVersion": { "type": "string", "minLength": 1 },
+            "windowsVersion": { "type": "string", "minLength": 1 },
+            "streamerVersion": { "type": "string", "minLength": 1 },
+            "usbTopology": { "type": "string", "minLength": 1 },
+            "settings": { "type": "object" },
+            "thermalArtifact": { "type": "string", "minLength": 1 }
+          }
+        }
+      ]
+    }
+  },
+  "$defs": {
+    "percentiles": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["p50", "p99", "p999", "max"],
+      "properties": {
+        "p50": { "type": "number", "minimum": 0 },
+        "p99": { "type": "number", "minimum": 0 },
+        "p999": { "type": "number", "minimum": 0 },
+        "max": { "type": "number", "minimum": 0 }
+      }
+    }
+  }
+}
