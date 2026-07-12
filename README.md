@@ -15,24 +15,24 @@ headset.
 This is the latest version and the recommended download. It starts from a
 simple icon near the Windows clock and reconnects automatically.
 
-[Download v4.0.0](https://github.com/kkoemets/gnirehtet-quest-3-virtual-desktop-link-cable/releases/download/v4.0.0/gnirehtet-v4.0.0-windows-x64.zip)
+[Download v4.0.0](https://github.com/kkoemets/quest-vd-wired/releases/download/v4.0.0/gnirehtet-v4.0.0-windows-x64.zip)
 
 ### v3.1.0 Legacy — older Java version
 
 This is the previous Java version, kept available for users who need to roll
 back. New users should choose v4.0.0.
 
-[Download v3.1.0 Legacy](https://github.com/kkoemets/gnirehtet-quest-3-virtual-desktop-link-cable/releases/download/v3.1.0/gnirehtet-java-v3.1.0.zip)
+[Download v3.1.0 Legacy](https://github.com/kkoemets/quest-vd-wired/releases/download/v3.1.0/gnirehtet-java-v3.1.0.zip)
 
 ### v3.0.0 Legacy — older fallback
 
 This older release remains available as an additional fallback. New users
 should choose v4.0.0 instead.
 
-[Download v3.0.0 Legacy](https://github.com/kkoemets/gnirehtet-quest-3-virtual-desktop-link-cable/releases/download/v3.0.0/gnirehtet-java-v3.0.0.zip)
+[Download v3.0.0 Legacy](https://github.com/kkoemets/quest-vd-wired/releases/download/v3.0.0/gnirehtet-java-v3.0.0.zip)
 
 If a download has not been published yet, check the
-[Releases page](https://github.com/kkoemets/gnirehtet-quest-3-virtual-desktop-link-cable/releases).
+[Releases page](https://github.com/kkoemets/quest-vd-wired/releases).
 
 ## Before you start
 
@@ -82,6 +82,9 @@ Java 11 or newer runtime.
 - Virtual Desktop can reach the PC while Quest Wi-Fi is off.
 - The wired link reconnects after the cable is reattached and USB debugging is
   accepted again.
+
+If this wired link helps you, starring the project on GitHub makes it easier for
+other Quest users to find.
 
 ![Quest VPN permission request](assets/request.jpg)
 
