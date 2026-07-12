@@ -546,6 +546,10 @@ where
         }
         Ok::<(), UdpRelayError>(())
     });
+    // Dropping the outer relay future (for example when the control heartbeat
+    // degrades on headset sleep) must not detach either stream task.
+    let _task_abort_guard =
+        AbortTasksOnDrop(vec![reader_task.abort_handle(), writer_task.abort_handle()]);
 
     let mut ipv4_buffer = vec![0; MAX_UDP_PAYLOAD];
     let mut ipv6_buffer = vec![0; MAX_UDP_PAYLOAD];
@@ -653,6 +657,16 @@ where
 
 struct FlowGuard(UdpStats);
 
+struct AbortTasksOnDrop(Vec<tokio::task::AbortHandle>);
+
+impl Drop for AbortTasksOnDrop {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
+}
+
 impl Drop for FlowGuard {
     fn drop(&mut self) {
         self.0 .0.active_flows.fetch_sub(1, Ordering::Relaxed);
@@ -746,6 +760,46 @@ mod tests {
         assert_eq!(separate.snapshot().dropped_queue_full, 1);
         drop(first);
         assert_eq!(stats.snapshot().queued_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn cancelling_udp_association_drops_all_stream_tasks_and_accounting() {
+        let (client, relay) = tokio::io::duplex(64 * 1024);
+        let (mut client_reader, _client_writer) = tokio::io::split(client);
+        let (relay_reader, relay_writer) = tokio::io::split(relay);
+        let stats = UdpStats::default();
+        let relay_stats = stats.clone();
+        let task = tokio::spawn(async move {
+            relay_fwd_udp(
+                relay_reader,
+                relay_writer,
+                FwdUdpConfig::default(),
+                relay_stats,
+            )
+            .await
+        });
+
+        time::timeout(Duration::from_millis(500), async {
+            while stats.snapshot().active_flows != 1 {
+                time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        task.abort();
+        let _ = task.await;
+
+        time::timeout(Duration::from_millis(500), async {
+            while stats.snapshot().active_flows != 0 || stats.snapshot().queued_bytes != 0 {
+                time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let closed = time::timeout(Duration::from_millis(500), client_reader.read_u8())
+            .await
+            .expect("detached UDP stream task kept the association open");
+        assert!(closed.is_err());
     }
 
     proptest! {

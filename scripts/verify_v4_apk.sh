@@ -56,7 +56,7 @@ version_name="$("$apkanalyzer" manifest version-name "$apk")"
 min_sdk="$("$apkanalyzer" manifest min-sdk "$apk")"
 target_sdk="$("$apkanalyzer" manifest target-sdk "$apk")"
 debuggable="$("$apkanalyzer" manifest debuggable "$apk" | tr '[:upper:]' '[:lower:]')"
-if [[ "$version_code" != "41" || "$version_name" != "4.0.0-beta.2" ]]; then
+if [[ "$version_code" != "42" || "$version_name" != "4.0.0-beta.3" ]]; then
     echo "APK version is not the exact v4 Beta identity" >&2
     exit 1
 fi

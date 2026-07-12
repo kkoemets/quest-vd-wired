@@ -35,7 +35,7 @@ use crate::{
     control::{ControlConfig, ControlHandle, ControlServer, StateObserver},
     diagnostics::Diagnostics,
     protocol::SessionId,
-    socks::{SocksCommandPolicy, SocksConfig, SocksServer},
+    socks::{RelayGate, SocksCommandPolicy, SocksConfig, SocksServer},
     state::{HostState, StateSnapshot},
 };
 
@@ -533,9 +533,12 @@ impl HostRuntime {
         let diagnostics = Diagnostics::open(&self.config.paths.logs)?;
         let store = StateStore::new(&self.config.paths.status);
         write_daemon_identity(&self.config.paths.daemon_pid, self.config.session_id)?;
+        let relay_gate = RelayGate::default();
         let observer_store = store.clone();
         let observer_diagnostics = diagnostics.clone();
+        let observer_relay_gate = relay_gate.clone();
         let observer: StateObserver = Arc::new(move |snapshot| {
+            observer_relay_gate.set_enabled(snapshot.state == HostState::Connected);
             if let Err(error) = observer_store.write(snapshot, Some(std::process::id())) {
                 let _ = observer_diagnostics.record(
                     "state_persistence_error",
@@ -565,13 +568,15 @@ impl HostRuntime {
             command_policy: SocksCommandPolicy::ConnectOnly,
             ..Default::default()
         })?
-        .with_diagnostics(diagnostics.clone());
+        .with_diagnostics(diagnostics.clone())
+        .with_relay_gate(relay_gate.clone());
         let udp_socks = SocksServer::new(SocksConfig {
             bind: self.config.udp_bind,
             command_policy: SocksCommandPolicy::FwdUdpOnly,
             ..Default::default()
         })?
-        .with_diagnostics(diagnostics.clone());
+        .with_diagnostics(diagnostics.clone())
+        .with_relay_gate(relay_gate);
         let metrics_tcp_socks = tcp_socks.clone();
         let metrics_udp_socks = udp_socks.clone();
         let metrics_control = control.clone();

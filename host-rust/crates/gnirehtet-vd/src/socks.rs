@@ -13,7 +13,7 @@ use thiserror::Error;
 use tokio::{
     io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::Semaphore,
+    sync::{watch, Semaphore},
     time,
 };
 
@@ -115,6 +115,58 @@ pub struct SocksServer {
     stats: SocksStats,
     udp_stats: UdpStats,
     diagnostics: Option<Diagnostics>,
+    relay_gate: Option<RelayGate>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RelayGateState {
+    enabled: bool,
+    generation: u64,
+}
+
+/// Invalidates every active relay flow when the authenticated control session
+/// degrades, while keeping the listeners alive for a fresh wake connection.
+#[derive(Clone, Debug)]
+pub struct RelayGate {
+    sender: watch::Sender<RelayGateState>,
+}
+
+impl Default for RelayGate {
+    fn default() -> Self {
+        let (sender, _) = watch::channel(RelayGateState::default());
+        Self { sender }
+    }
+}
+
+impl RelayGate {
+    pub fn set_enabled(&self, enabled: bool) {
+        self.sender.send_if_modified(|state| {
+            if state.enabled == enabled {
+                return false;
+            }
+            state.enabled = enabled;
+            state.generation = state.generation.saturating_add(1);
+            true
+        });
+    }
+
+    fn active_generation(&self) -> Option<u64> {
+        let state = *self.sender.borrow();
+        state.enabled.then_some(state.generation)
+    }
+
+    async fn wait_for_invalidation(&self, generation: u64) {
+        let mut receiver = self.sender.subscribe();
+        loop {
+            let state = *receiver.borrow_and_update();
+            if !state.enabled || state.generation != generation {
+                return;
+            }
+            if receiver.changed().await.is_err() {
+                return;
+            }
+        }
+    }
 }
 
 impl SocksServer {
@@ -133,11 +185,17 @@ impl SocksServer {
             stats: SocksStats::default(),
             udp_stats: UdpStats::default(),
             diagnostics: None,
+            relay_gate: None,
         })
     }
 
     pub fn with_diagnostics(mut self, diagnostics: Diagnostics) -> Self {
         self.diagnostics = Some(diagnostics);
+        self
+    }
+
+    pub fn with_relay_gate(mut self, relay_gate: RelayGate) -> Self {
+        self.relay_gate = Some(relay_gate);
         self
     }
 
@@ -160,6 +218,16 @@ impl SocksServer {
         let permits = Arc::new(Semaphore::new(self.config.max_connections));
         loop {
             let (stream, _) = listener.accept().await?;
+            let relay_lease = match &self.relay_gate {
+                Some(gate) => match gate.active_generation() {
+                    Some(generation) => Some((gate.clone(), generation)),
+                    None => {
+                        self.stats.rejected.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                },
+                None => None,
+            };
             let permit = match permits.clone().try_acquire_owned() {
                 Ok(permit) => permit,
                 Err(_) => {
@@ -171,7 +239,15 @@ impl SocksServer {
             let server = self.clone();
             tokio::spawn(async move {
                 server.stats.active.fetch_add(1, Ordering::Relaxed);
-                let result = server.handle(stream).await;
+                let result = match relay_lease {
+                    Some((gate, generation)) => {
+                        tokio::select! {
+                            result = server.handle(stream) => result,
+                            _ = gate.wait_for_invalidation(generation) => Err(SocksError::RelayInactive),
+                        }
+                    }
+                    None => server.handle(stream).await,
+                };
                 server.stats.active.fetch_sub(1, Ordering::Relaxed);
                 drop(permit);
                 if let (Err(error), Some(diagnostics)) = (result, &server.diagnostics) {
@@ -425,6 +501,8 @@ pub enum SocksError {
     ConnectTimeout,
     #[error("SOCKS authentication or request timed out")]
     HandshakeTimeout,
+    #[error("relay session became inactive")]
+    RelayInactive,
     #[error(transparent)]
     Frame(#[from] HevFrameError),
     #[error(transparent)]
@@ -444,6 +522,7 @@ impl SocksError {
             Self::UnsupportedAddressType(_) => "unsupported_address_type",
             Self::ConnectTimeout => "connect_timeout",
             Self::HandshakeTimeout => "handshake_timeout",
+            Self::RelayInactive => "relay_inactive",
             Self::Frame(_) => "udp_frame",
             Self::Udp(_) => "udp_relay",
             Self::Io(_) => "io",
@@ -478,6 +557,21 @@ mod tests {
             request.destination,
             Endpoint::Socket("127.0.0.1:4660".parse().unwrap())
         );
+    }
+
+    async fn connect_through_socks(address: SocketAddr, destination: SocketAddr) -> TcpStream {
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client.write_all(&[5, 1, 0]).await.unwrap();
+        let mut auth = [0; 2];
+        client.read_exact(&mut auth).await.unwrap();
+        assert_eq!(auth, [5, 0]);
+        let mut request = vec![5, CMD_CONNECT, 0];
+        request.extend_from_slice(&encode_endpoint(&Endpoint::Socket(destination)).unwrap());
+        client.write_all(&request).await.unwrap();
+        let mut reply = [0; 10];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], 0);
+        client
     }
 
     #[tokio::test]
@@ -515,6 +609,73 @@ mod tests {
         client.read_exact(&mut echoed).await.unwrap();
         assert_eq!(&echoed, b"ping");
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn lifecycle_gate_closes_old_tcp_flows_and_reopens_the_same_listener() {
+        let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_address = echo.local_addr().unwrap();
+        let echo_task = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = echo.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let (mut reader, mut writer) = stream.split();
+                    let _ = io::copy(&mut reader, &mut writer).await;
+                });
+            }
+        });
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let gate = RelayGate::default();
+        gate.set_enabled(true);
+        let server = SocksServer::new(SocksConfig {
+            bind: address,
+            ..Default::default()
+        })
+        .unwrap()
+        .with_relay_gate(gate.clone());
+        let stats = server.clone();
+        let task = tokio::spawn(server.serve_on(listener));
+
+        let mut first = connect_through_socks(address, echo_address).await;
+        first.write_all(b"before-sleep").await.unwrap();
+        let mut echoed = [0; 12];
+        first.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"before-sleep");
+        assert_eq!(stats.stats().active_connections, 1);
+
+        gate.set_enabled(false);
+        let closed = time::timeout(Duration::from_millis(500), first.read_u8())
+            .await
+            .expect("old flow stayed open after lifecycle degradation");
+        assert!(closed.is_err());
+        time::timeout(Duration::from_millis(500), async {
+            while stats.stats().active_connections != 0 {
+                time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let mut rejected = TcpStream::connect(address).await.unwrap();
+        rejected.write_all(&[5, 1, 0]).await.unwrap();
+        let mut auth = [0; 2];
+        let rejected_read =
+            time::timeout(Duration::from_millis(500), rejected.read_exact(&mut auth))
+                .await
+                .expect("degraded relay left a new connection pending");
+        assert!(rejected_read.is_err());
+
+        gate.set_enabled(true);
+        let mut second = connect_through_socks(address, echo_address).await;
+        second.write_all(b"after-wake").await.unwrap();
+        let mut echoed = [0; 10];
+        second.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"after-wake");
+
+        task.abort();
+        echo_task.abort();
     }
 
     async fn assert_command_rejected(policy: SocksCommandPolicy, command: u8) {

@@ -175,8 +175,8 @@ class CommandLineToolsTest(unittest.TestCase):
                 "#!/bin/sh\n"
                 "case \"$2\" in\n"
                 "application-id) echo com.genymobile.gnirehtet ;;\n"
-                "version-code) echo 41 ;;\n"
-                "version-name) echo 4.0.0-beta.2 ;;\n"
+                "version-code) echo 42 ;;\n"
+                "version-name) echo 4.0.0-beta.3 ;;\n"
                 "min-sdk) echo 29 ;;\n"
                 "target-sdk) echo 36 ;;\n"
                 "debuggable) echo false ;;\n"
@@ -299,8 +299,8 @@ class ReleasePolicyTest(unittest.TestCase):
         self.assertTrue((REPOSITORY / "release").is_file())
         self.assertTrue((REPOSITORY / "scripts/build_v4_android_rc.sh").is_file())
         self.assertTrue((REPOSITORY / "scripts/build_v4_windows_rc.ps1").is_file())
-        self.assertIn('versionName = "4.0.0-beta.2"', android_v4)
-        self.assertIn('version = "4.0.0-beta.2"', rust_v4)
+        self.assertIn('versionName = "4.0.0-beta.3"', android_v4)
+        self.assertIn('version = "4.0.0-beta.3"', rust_v4)
 
 
 if __name__ == "__main__":
