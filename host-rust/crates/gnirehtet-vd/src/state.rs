@@ -7,6 +7,7 @@ use crate::protocol::SessionId;
 
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 pub const HEARTBEAT_MISS_LIMIT: u32 = 3;
+pub const HEADSET_SUSPENDED_REASON: &str = "headset is asleep; VPN remains active";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -113,6 +114,16 @@ impl StateMachine {
             self.state = HostState::Degraded;
             self.reason = Some(reason.into());
         }
+    }
+
+    pub fn peer_suspended(&mut self, session_id: SessionId) -> Result<(), TransitionError> {
+        self.require_session(session_id)?;
+        self.require_state(&[HostState::Connected, HostState::Degraded])?;
+        self.state = HostState::Degraded;
+        self.last_heartbeat = None;
+        self.missed_heartbeats = 0;
+        self.reason = Some(HEADSET_SUSPENDED_REASON.into());
+        Ok(())
     }
 
     pub fn begin_stop(&mut self) -> Result<(), TransitionError> {
@@ -230,6 +241,21 @@ mod tests {
             .unwrap();
         assert_eq!(machine.state(), HostState::Connected);
         assert_eq!(machine.snapshot().missed_heartbeats, 0);
+    }
+
+    #[test]
+    fn authenticated_suspend_is_distinct_from_transport_loss() {
+        let session = SessionId([3; 16]);
+        let mut machine = StateMachine::new();
+        machine.begin_start(session).unwrap();
+        machine.peer_started(session, Instant::now()).unwrap();
+
+        machine.peer_suspended(session).unwrap();
+
+        let snapshot = machine.snapshot();
+        assert_eq!(snapshot.state, HostState::Degraded);
+        assert_eq!(snapshot.reason.as_deref(), Some(HEADSET_SUSPENDED_REASON));
+        assert_eq!(snapshot.missed_heartbeats, 0);
     }
 
     #[test]

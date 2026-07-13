@@ -12,6 +12,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.min
 
 internal fun nextControlReconnectDelayMs(current: Long): Long {
@@ -44,6 +45,9 @@ class ControlSupervisor(
     private val sequence = AtomicLong()
     private val writeLock = Any()
     private val pauseLock = Object()
+    private val suspendAcknowledgement = AtomicReference<CountDownLatch?>()
+    private val controlReady = AtomicBoolean()
+    private val stopRequested = AtomicBoolean()
     @Volatile private var socket: Socket? = null
     @Volatile private var thread: Thread? = null
 
@@ -60,10 +64,31 @@ class ControlSupervisor(
     }
 
     fun suspend() {
+        var connected: Socket? = null
+        var acknowledgement: CountDownLatch? = null
         synchronized(pauseLock) {
             if (!paused.compareAndSet(false, true)) return
-            socket?.close()
+            connected = socket
+            if (controlReady.get() && connected != null && !connected!!.isClosed) {
+                acknowledgement = CountDownLatch(1)
+                suspendAcknowledgement.set(acknowledgement)
+            }
         }
+        if (acknowledgement != null) {
+            runCatching {
+                write(connected!!, Gnr4Frame(Gnr4MessageType.SUSPEND, sessionId))
+            }.onFailure {
+                suspendAcknowledgement.compareAndSet(acknowledgement, null)
+                acknowledgement = null
+            }
+        }
+        try {
+            acknowledgement?.await(SUSPEND_ACK_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+        suspendAcknowledgement.compareAndSet(acknowledgement, null)
+        if (!stopRequested.get()) connected?.close()
     }
 
     fun resume() {
@@ -98,12 +123,17 @@ class ControlSupervisor(
                     synchronized(pauseLock) {
                         if (!isActiveSocket(connected) || !listener.shouldReportStarted()) return@use
                         write(connected, Gnr4Frame(Gnr4MessageType.STARTED, sessionId))
+                        controlReady.set(true)
                         listener.onControlConnected()
                     }
                     delayMs = 250L
                     var missed = 0
                     val outstandingHeartbeats = linkedMapOf<Long, Long>()
-                    while (running.get() && !paused.get() && !connected.isClosed) {
+                    while (
+                        running.get() &&
+                        (!paused.get() || suspendAcknowledgement.get() != null) &&
+                        !connected.isClosed
+                    ) {
                         try {
                             val frame = Gnr4.read(connected.getInputStream(), sessionId)
                             when (frame.type) {
@@ -123,7 +153,13 @@ class ControlSupervisor(
                                     }
                                 }
                                 Gnr4MessageType.STATUS -> missed = 0
+                                Gnr4MessageType.SUSPENDED -> {
+                                    missed = 0
+                                    suspendAcknowledgement.getAndSet(null)?.countDown()
+                                }
                                 Gnr4MessageType.STOP -> {
+                                    stopRequested.set(true)
+                                    suspendAcknowledgement.getAndSet(null)?.countDown()
                                     val acknowledgementSent = CountDownLatch(1)
                                     val acknowledgementClaimed = AtomicBoolean()
                                     listener.onControlStopRequested {
@@ -142,6 +178,7 @@ class ControlSupervisor(
                                 else -> Unit
                             }
                         } catch (_: SocketTimeoutException) {
+                            if (paused.get()) continue
                             val heartbeatSequence = sequence.incrementAndGet()
                             val sentAt = System.nanoTime()
                             while (outstandingHeartbeats.size >= MAX_OUTSTANDING_HEARTBEATS) {
@@ -169,6 +206,8 @@ class ControlSupervisor(
                     delayMs = nextControlReconnectDelayMs(delayMs)
                 }
             } finally {
+                controlReady.set(false)
+                suspendAcknowledgement.getAndSet(null)?.countDown()
                 synchronized(pauseLock) {
                     socket = null
                 }
@@ -180,6 +219,8 @@ class ControlSupervisor(
         synchronized(pauseLock) {
             if (!running.compareAndSet(true, false)) return
             paused.set(false)
+            controlReady.set(false)
+            suspendAcknowledgement.getAndSet(null)?.countDown()
             socket?.close()
             pauseLock.notifyAll()
         }
@@ -227,6 +268,7 @@ class ControlSupervisor(
         private const val TAG = "Gnr4Control"
         private const val CONNECT_TIMEOUT_MS = 1_000
         private const val STOP_ACK_TIMEOUT_MS = 5_000L
+        private const val SUSPEND_ACK_TIMEOUT_MS = 500L
         private const val MAX_OUTSTANDING_HEARTBEATS = 8
         private val IPV4_LOOPBACK = java.net.InetAddress.getByAddress(byteArrayOf(127, 0, 0, 1))
     }

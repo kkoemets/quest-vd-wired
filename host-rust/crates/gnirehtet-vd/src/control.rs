@@ -26,6 +26,7 @@ use crate::{
 };
 
 pub type StateObserver = Arc<dyn Fn(&StateSnapshot) + Send + Sync>;
+pub type SuspendObserver = Arc<dyn Fn() + Send + Sync>;
 
 struct ControlCommand {
     deadline: Instant,
@@ -141,6 +142,7 @@ pub struct ControlServer {
     state: Arc<Mutex<StateMachine>>,
     diagnostics: Option<Diagnostics>,
     observer: Arc<RwLock<Option<StateObserver>>>,
+    suspend_observer: Arc<RwLock<Option<SuspendObserver>>>,
     publication: Arc<Mutex<()>>,
     commands: Arc<Mutex<mpsc::Receiver<ControlCommand>>>,
     handle: ControlHandle,
@@ -157,12 +159,14 @@ impl ControlServer {
         let state = Arc::new(Mutex::new(machine));
         let (command_tx, command_rx) = mpsc::channel(4);
         let observer = Arc::new(RwLock::new(None));
+        let suspend_observer = Arc::new(RwLock::new(None));
         let publication = Arc::new(Mutex::new(()));
         Ok(Self {
             config,
             state: state.clone(),
             diagnostics: None,
             observer: observer.clone(),
+            suspend_observer,
             commands: Arc::new(Mutex::new(command_rx)),
             handle: ControlHandle {
                 sender: command_tx,
@@ -182,6 +186,13 @@ impl ControlServer {
 
     pub fn with_observer(self, observer: StateObserver) -> Self {
         if let Ok(mut slot) = self.observer.write() {
+            *slot = Some(observer);
+        }
+        self
+    }
+
+    pub fn with_suspend_observer(self, observer: SuspendObserver) -> Self {
+        if let Ok(mut slot) = self.suspend_observer.write() {
             *slot = Some(observer);
         }
         self
@@ -252,7 +263,7 @@ impl ControlServer {
             self.config.session_id,
             serde_json::to_vec(&json!({
                 "protocol": VERSION,
-                "capabilities": ["heartbeat", "status", "explicit_stop"]
+                "capabilities": ["heartbeat", "status", "explicit_stop", "explicit_suspend"]
             }))?,
         )
         .write_to(&mut writer)
@@ -358,12 +369,31 @@ impl ControlServer {
                                 serde_json::to_vec(&snapshot)?,
                             ).write_to(&mut writer).await?;
                         }
+                        MessageType::Suspend => {
+                            if !frame.payload.is_empty() {
+                                break Err(ControlError::InvalidSuspendPayload(frame.payload.len()));
+                            }
+                            self.state.lock().await.peer_suspended(frame.session_id)?;
+                            if let Some(observer) = self
+                                .suspend_observer
+                                .read()
+                                .ok()
+                                .and_then(|observer| observer.clone())
+                            {
+                                observer();
+                            }
+                            self.publish().await;
+                            Frame::new(MessageType::Suspended, frame.session_id, Vec::new())
+                                .write_to(&mut writer).await?;
+                            break Ok(());
+                        }
                         MessageType::Error => {
                             self.state.lock().await.fail("Android peer reported an error");
                             self.publish().await;
                         }
                         MessageType::Hello
                         | MessageType::HelloAck
+                        | MessageType::Suspended
                         | MessageType::Stop => break Err(ControlError::UnexpectedMessage(frame.message_type)),
                     }
                 }
@@ -516,6 +546,8 @@ pub enum ControlError {
     ReadTimeout(&'static str),
     #[error("HEARTBEAT payload must be 16 bytes, got {0}")]
     InvalidHeartbeatPayload(usize),
+    #[error("SUSPEND payload must be empty, got {0} bytes")]
+    InvalidSuspendPayload(usize),
     #[error("control command lane is unavailable")]
     CommandUnavailable,
     #[error("control stop was rejected: {0}")]
@@ -542,6 +574,7 @@ impl ControlError {
             Self::UnsolicitedStopped => "unsolicited_stopped",
             Self::ReadTimeout(_) => "read_timeout",
             Self::InvalidHeartbeatPayload(_) => "invalid_heartbeat_payload",
+            Self::InvalidSuspendPayload(_) => "invalid_suspend_payload",
             Self::CommandUnavailable => "command_unavailable",
             Self::CommandRejected(_) => "command_rejected",
             Self::StopTimeout => "stop_timeout",
@@ -557,7 +590,7 @@ impl ControlError {
 mod tests {
     use std::sync::Mutex as StdMutex;
 
-    use tokio::net::TcpStream;
+    use tokio::{io::AsyncReadExt, net::TcpStream};
 
     use super::*;
 
@@ -671,6 +704,91 @@ mod tests {
         assert_eq!(echo.message_type, MessageType::Heartbeat);
         assert_eq!(echo.payload, heartbeat_payload);
         assert_eq!(state.lock().await.state(), HostState::Connected);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn authenticated_suspend_is_acknowledged_and_notifies_the_flow_gate() {
+        let session = SessionId([0x3a; 16]);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bind = listener.local_addr().unwrap();
+        let notifications = Arc::new(AtomicU64::new(0));
+        let observed_notifications = notifications.clone();
+        let server = ControlServer::new(ControlConfig {
+            bind,
+            session_id: session,
+        })
+        .unwrap()
+        .with_suspend_observer(Arc::new(move || {
+            observed_notifications.fetch_add(1, Ordering::Relaxed);
+        }));
+        let state = server.state();
+        let task = tokio::spawn(server.serve_on(listener));
+
+        let mut client = TcpStream::connect(bind).await.unwrap();
+        Frame::new(MessageType::Hello, session, Vec::new())
+            .write_to(&mut client)
+            .await
+            .unwrap();
+        Frame::read_from(&mut client).await.unwrap();
+        Frame::new(MessageType::Started, session, Vec::new())
+            .write_to(&mut client)
+            .await
+            .unwrap();
+        Frame::new(MessageType::Suspend, session, Vec::new())
+            .write_to(&mut client)
+            .await
+            .unwrap();
+
+        let acknowledgement = Frame::read_from(&mut client).await.unwrap();
+        assert_eq!(acknowledgement.message_type, MessageType::Suspended);
+        assert!(acknowledgement.payload.is_empty());
+        let snapshot = state.lock().await.snapshot();
+        assert_eq!(snapshot.state, HostState::Degraded);
+        assert_eq!(
+            snapshot.reason.as_deref(),
+            Some(crate::state::HEADSET_SUSPENDED_REASON)
+        );
+        assert_eq!(notifications.load(Ordering::Relaxed), 1);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn malformed_suspend_does_not_notify_the_flow_gate() {
+        let session = SessionId([0x3b; 16]);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bind = listener.local_addr().unwrap();
+        let notifications = Arc::new(AtomicU64::new(0));
+        let observed_notifications = notifications.clone();
+        let server = ControlServer::new(ControlConfig {
+            bind,
+            session_id: session,
+        })
+        .unwrap()
+        .with_suspend_observer(Arc::new(move || {
+            observed_notifications.fetch_add(1, Ordering::Relaxed);
+        }));
+        let task = tokio::spawn(server.serve_on(listener));
+        let mut client = TcpStream::connect(bind).await.unwrap();
+        Frame::new(MessageType::Hello, session, Vec::new())
+            .write_to(&mut client)
+            .await
+            .unwrap();
+        Frame::read_from(&mut client).await.unwrap();
+        Frame::new(MessageType::Started, session, Vec::new())
+            .write_to(&mut client)
+            .await
+            .unwrap();
+        Frame::new(MessageType::Suspend, session, vec![1])
+            .write_to(&mut client)
+            .await
+            .unwrap();
+
+        let closed = time::timeout(Duration::from_secs(1), client.read_u8())
+            .await
+            .expect("malformed suspend left the control connection open");
+        assert!(closed.is_err());
+        assert_eq!(notifications.load(Ordering::Relaxed), 0);
         task.abort();
     }
 

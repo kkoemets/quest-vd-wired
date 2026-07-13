@@ -32,7 +32,7 @@ use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeServer, ServerOpti
 
 use crate::{
     adb::{AdbController, AndroidVpnStatus, CONTROL_PORT, SOCKS_PORT, UDP_STREAM_PORT},
-    control::{ControlConfig, ControlHandle, ControlServer, StateObserver},
+    control::{ControlConfig, ControlHandle, ControlServer, StateObserver, SuspendObserver},
     diagnostics::Diagnostics,
     protocol::SessionId,
     socks::{RelayGate, SocksCommandPolicy, SocksConfig, SocksServer},
@@ -538,7 +538,7 @@ impl HostRuntime {
         let observer_diagnostics = diagnostics.clone();
         let observer_relay_gate = relay_gate.clone();
         let observer: StateObserver = Arc::new(move |snapshot| {
-            observer_relay_gate.set_enabled(snapshot.state == HostState::Connected);
+            update_relay_gate(&observer_relay_gate, snapshot);
             if let Err(error) = observer_store.write(snapshot, Some(std::process::id())) {
                 let _ = observer_diagnostics.record(
                     "state_persistence_error",
@@ -546,13 +546,18 @@ impl HostRuntime {
                 );
             }
         });
+        let suspend_relay_gate = relay_gate.clone();
+        let suspend_observer: SuspendObserver = Arc::new(move || {
+            suspend_relay_gate.set_enabled(false);
+        });
 
         let control = ControlServer::new(ControlConfig {
             bind: self.config.control_bind,
             session_id: self.config.session_id,
         })?
         .with_diagnostics(diagnostics.clone())
-        .with_observer(observer);
+        .with_observer(observer)
+        .with_suspend_observer(suspend_observer);
         let control_handle = control.command_handle();
         let adb_monitor = AdbHealthMonitor::default();
         let shutdown = Arc::new(Notify::new());
@@ -647,6 +652,16 @@ impl HostRuntime {
         metrics.abort();
         let _ = fs::remove_file(&self.config.paths.daemon_pid);
         result
+    }
+}
+
+fn update_relay_gate(relay_gate: &RelayGate, snapshot: &StateSnapshot) {
+    match snapshot.state {
+        HostState::Connected => relay_gate.set_enabled(true),
+        HostState::Stopped | HostState::Stopping | HostState::Error => {
+            relay_gate.set_enabled(false);
+        }
+        HostState::Preparing | HostState::Degraded => {}
     }
 }
 
@@ -1961,6 +1976,34 @@ mod tests {
         assert_eq!(first, Duration::from_millis(500));
         assert_eq!(second, maximum);
         assert_eq!(third, maximum);
+    }
+
+    #[test]
+    fn transient_degradation_keeps_the_relay_generation_alive() {
+        let relay_gate = RelayGate::default();
+        let session = SessionId([0x79; 16]).to_string();
+        let snapshot = |state| StateSnapshot {
+            state,
+            session_id: Some(session.clone()),
+            missed_heartbeats: 0,
+            reason: None,
+        };
+
+        update_relay_gate(&relay_gate, &snapshot(HostState::Connected));
+        let connected_generation = relay_gate.generation();
+        assert!(relay_gate.is_enabled());
+
+        update_relay_gate(&relay_gate, &snapshot(HostState::Degraded));
+        assert!(relay_gate.is_enabled());
+        assert_eq!(relay_gate.generation(), connected_generation);
+
+        update_relay_gate(&relay_gate, &snapshot(HostState::Connected));
+        assert!(relay_gate.is_enabled());
+        assert_eq!(relay_gate.generation(), connected_generation);
+
+        update_relay_gate(&relay_gate, &snapshot(HostState::Stopping));
+        assert!(!relay_gate.is_enabled());
+        assert!(relay_gate.generation() > connected_generation);
     }
 
     #[tokio::test]

@@ -150,6 +150,16 @@ impl RelayGate {
         });
     }
 
+    #[cfg(test)]
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.sender.borrow().enabled
+    }
+
+    #[cfg(test)]
+    pub(crate) fn generation(&self) -> u64 {
+        self.sender.borrow().generation
+    }
+
     fn active_generation(&self) -> Option<u64> {
         let state = *self.sender.borrow();
         state.enabled.then_some(state.generation)
@@ -533,8 +543,10 @@ impl SocksError {
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;
+    use tokio::net::UdpSocket;
 
     use super::*;
+    use crate::udp::HevUdpFrame;
 
     #[test]
     fn rejects_non_loopback_listener() {
@@ -572,6 +584,35 @@ mod tests {
         client.read_exact(&mut reply).await.unwrap();
         assert_eq!(reply[1], 0);
         client
+    }
+
+    async fn connect_udp_through_socks(address: SocketAddr) -> TcpStream {
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client.write_all(&[5, 1, 0]).await.unwrap();
+        let mut auth = [0; 2];
+        client.read_exact(&mut auth).await.unwrap();
+        assert_eq!(auth, [5, 0]);
+        client
+            .write_all(&[5, CMD_FWD_UDP, 0, 1, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        let mut reply = [0; 10];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], 0);
+        client
+    }
+
+    async fn assert_udp_echo(client: &mut TcpStream, echo_address: SocketAddr, payload: &[u8]) {
+        HevUdpFrame {
+            endpoint: Endpoint::Socket(echo_address),
+            payload: payload.to_vec(),
+        }
+        .write_to(client)
+        .await
+        .unwrap();
+        let response = HevUdpFrame::read_from(client).await.unwrap();
+        assert_eq!(response.endpoint, Endpoint::Socket(echo_address));
+        assert_eq!(response.payload, payload);
     }
 
     #[tokio::test]
@@ -612,7 +653,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lifecycle_gate_closes_old_tcp_flows_and_reopens_the_same_listener() {
+    async fn explicit_suspend_closes_old_tcp_flows_and_reopens_the_same_listener() {
         let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let echo_address = echo.local_addr().unwrap();
         let echo_task = tokio::spawn(async move {
@@ -648,7 +689,7 @@ mod tests {
         gate.set_enabled(false);
         let closed = time::timeout(Duration::from_millis(500), first.read_u8())
             .await
-            .expect("old flow stayed open after lifecycle degradation");
+            .expect("old flow stayed open after explicit suspend");
         assert!(closed.is_err());
         time::timeout(Duration::from_millis(500), async {
             while stats.stats().active_connections != 0 {
@@ -673,6 +714,56 @@ mod tests {
         let mut echoed = [0; 10];
         second.read_exact(&mut echoed).await.unwrap();
         assert_eq!(&echoed, b"after-wake");
+
+        task.abort();
+        echo_task.abort();
+    }
+
+    #[tokio::test]
+    async fn explicit_suspend_closes_udp_flow_and_wake_accepts_a_fresh_one() {
+        let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_address = echo.local_addr().unwrap();
+        let echo_task = tokio::spawn(async move {
+            let mut buffer = [0; 2048];
+            loop {
+                let (length, peer) = echo.recv_from(&mut buffer).await.unwrap();
+                echo.send_to(&buffer[..length], peer).await.unwrap();
+            }
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let gate = RelayGate::default();
+        gate.set_enabled(true);
+        let server = SocksServer::new(SocksConfig {
+            bind: address,
+            command_policy: SocksCommandPolicy::FwdUdpOnly,
+            ..Default::default()
+        })
+        .unwrap()
+        .with_relay_gate(gate.clone());
+        let task = tokio::spawn(server.serve_on(listener));
+
+        let mut first = connect_udp_through_socks(address).await;
+        assert_udp_echo(&mut first, echo_address, b"before-sleep").await;
+
+        gate.set_enabled(false);
+        let closed = time::timeout(Duration::from_millis(500), first.read_u8())
+            .await
+            .expect("UDP flow stayed open after explicit suspend");
+        assert!(closed.is_err());
+
+        let mut rejected = TcpStream::connect(address).await.unwrap();
+        rejected.write_all(&[5, 1, 0]).await.unwrap();
+        let mut auth = [0; 2];
+        let rejected_read =
+            time::timeout(Duration::from_millis(500), rejected.read_exact(&mut auth))
+                .await
+                .expect("suspended UDP listener left a new connection pending");
+        assert!(rejected_read.is_err());
+
+        gate.set_enabled(true);
+        let mut second = connect_udp_through_socks(address).await;
+        assert_udp_echo(&mut second, echo_address, b"after-wake").await;
 
         task.abort();
         echo_task.abort();
