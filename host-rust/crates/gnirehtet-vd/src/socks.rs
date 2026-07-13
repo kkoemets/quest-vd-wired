@@ -1,20 +1,17 @@
 use std::{
-    io::ErrorKind,
     net::{Ipv4Addr, SocketAddr},
-    pin::Pin,
     sync::{
-        atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
-    task::{Context, Poll},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use thiserror::Error;
 use tokio::{
-    io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
+    io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::{watch, Semaphore},
     time,
@@ -33,7 +30,6 @@ pub const AUTH_NONE: u8 = 0x00;
 pub const AUTH_UNACCEPTABLE: u8 = 0xff;
 pub const CMD_CONNECT: u8 = 0x01;
 pub const CMD_FWD_UDP: u8 = 0x05;
-const TCP_COPY_BUFFER_SIZE: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SocksCommand {
@@ -374,306 +370,15 @@ impl SocksServer {
         upstream.set_nodelay(true)?;
         let bound = upstream.local_addr()?;
         write_reply(&mut client, 0, Endpoint::Socket(bound)).await?;
-        let mut report = TcpFlowReport::new(self.diagnostics.clone(), endpoint_kind(&destination));
-        let result = relay_tcp(
-            &mut client,
-            &mut upstream,
-            self.stats.clone(),
-            report.client_to_network_bytes.clone(),
-            report.network_to_client_bytes.clone(),
-            report.terminal_direction.clone(),
-        )
-        .await;
-        match &result {
-            Ok(()) => report.set_close_reason("clean_eof"),
-            Err(error) => report.set_close_reason(io_close_reason(error.kind())),
-        }
-        result.map_err(SocksError::from)
-    }
-}
-
-fn endpoint_kind(endpoint: &Endpoint) -> &'static str {
-    match endpoint {
-        Endpoint::Socket(SocketAddr::V4(_)) => "ipv4",
-        Endpoint::Socket(SocketAddr::V6(_)) => "ipv6",
-        Endpoint::Domain(_, _) => "domain",
-    }
-}
-
-fn io_close_reason(kind: ErrorKind) -> &'static str {
-    match kind {
-        ErrorKind::ConnectionReset => "connection_reset",
-        ErrorKind::ConnectionAborted => "connection_aborted",
-        ErrorKind::BrokenPipe => "broken_pipe",
-        ErrorKind::NotConnected => "not_connected",
-        ErrorKind::UnexpectedEof => "unexpected_eof",
-        ErrorKind::TimedOut => "timed_out",
-        _ => "io_error",
-    }
-}
-
-async fn relay_tcp<C, U>(
-    client: &mut C,
-    upstream: &mut U,
-    stats: SocksStats,
-    client_to_network_bytes: Arc<AtomicU64>,
-    network_to_client_bytes: Arc<AtomicU64>,
-    terminal_direction: Arc<AtomicU8>,
-) -> io::Result<()>
-where
-    C: AsyncRead + AsyncWrite + Unpin,
-    U: AsyncRead + AsyncWrite + Unpin,
-{
-    let mut client = MeteredIo::new(
-        client,
-        TrafficCounter::new(
-            stats.clone(),
-            TcpDirection::ClientToNetwork,
-            client_to_network_bytes,
-            terminal_direction.clone(),
-        ),
-    );
-    let mut upstream = MeteredIo::new(
-        upstream,
-        TrafficCounter::new(
-            stats,
-            TcpDirection::NetworkToClient,
-            network_to_client_bytes,
-            terminal_direction,
-        ),
-    );
-    io::copy_bidirectional_with_sizes(
-        &mut client,
-        &mut upstream,
-        TCP_COPY_BUFFER_SIZE,
-        TCP_COPY_BUFFER_SIZE,
-    )
-    .await
-    .map(|_| ())
-}
-
-#[derive(Clone, Copy)]
-#[repr(u8)]
-enum TcpDirection {
-    ClientToNetwork = 1,
-    NetworkToClient = 2,
-}
-
-impl TcpDirection {
-    fn opposite(self) -> Self {
-        match self {
-            Self::ClientToNetwork => Self::NetworkToClient,
-            Self::NetworkToClient => Self::ClientToNetwork,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::ClientToNetwork => "client_to_network",
-            Self::NetworkToClient => "network_to_client",
-        }
-    }
-}
-
-struct TrafficCounter {
-    stats: SocksStats,
-    direction: TcpDirection,
-    flow_bytes: Arc<AtomicU64>,
-    terminal_direction: Arc<AtomicU8>,
-}
-
-impl TrafficCounter {
-    fn new(
-        stats: SocksStats,
-        direction: TcpDirection,
-        flow_bytes: Arc<AtomicU64>,
-        terminal_direction: Arc<AtomicU8>,
-    ) -> Self {
-        Self {
-            stats,
-            direction,
-            flow_bytes,
-            terminal_direction,
-        }
-    }
-
-    fn record(&self, bytes: usize) {
-        let bytes = bytes as u64;
-        if bytes == 0 {
-            return;
-        }
-        match self.direction {
-            TcpDirection::ClientToNetwork => {
-                self.stats.tcp_tx_bytes.fetch_add(bytes, Ordering::Relaxed)
-            }
-            TcpDirection::NetworkToClient => {
-                self.stats.tcp_rx_bytes.fetch_add(bytes, Ordering::Relaxed)
-            }
-        };
-        self.flow_bytes.fetch_add(bytes, Ordering::Relaxed);
-    }
-
-    fn mark_read_terminal(&self) {
-        self.mark_terminal(self.direction);
-    }
-
-    fn mark_write_terminal(&self) {
-        self.mark_terminal(self.direction.opposite());
-    }
-
-    fn mark_terminal(&self, direction: TcpDirection) {
-        let _ = self.terminal_direction.compare_exchange(
-            0,
-            direction as u8,
-            Ordering::Release,
-            Ordering::Relaxed,
-        );
-    }
-}
-
-struct MeteredIo<T> {
-    inner: T,
-    counter: TrafficCounter,
-}
-
-impl<T> MeteredIo<T> {
-    fn new(inner: T, counter: TrafficCounter) -> Self {
-        Self { inner, counter }
-    }
-}
-
-impl<T> AsyncRead for MeteredIo<T>
-where
-    T: AsyncRead + Unpin,
-{
-    fn poll_read(
-        self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-        buffer: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        let before = buffer.filled().len();
-        match Pin::new(&mut this.inner).poll_read(context, buffer) {
-            Poll::Ready(Ok(())) => {
-                let bytes = buffer.filled().len() - before;
-                this.counter.record(bytes);
-                if bytes == 0 {
-                    this.counter.mark_read_terminal();
-                }
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(Err(error)) => {
-                this.counter.mark_read_terminal();
-                Poll::Ready(Err(error))
-            }
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl<T> AsyncWrite for MeteredIo<T>
-where
-    T: AsyncWrite + Unpin,
-{
-    fn poll_write(
-        self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-        buffer: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        let this = self.get_mut();
-        match Pin::new(&mut this.inner).poll_write(context, buffer) {
-            Poll::Ready(Ok(0)) if !buffer.is_empty() => {
-                this.counter.mark_write_terminal();
-                Poll::Ready(Ok(0))
-            }
-            Poll::Ready(Err(error)) => {
-                this.counter.mark_write_terminal();
-                Poll::Ready(Err(error))
-            }
-            result => result,
-        }
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        match Pin::new(&mut this.inner).poll_flush(context) {
-            Poll::Ready(Err(error)) => {
-                this.counter.mark_write_terminal();
-                Poll::Ready(Err(error))
-            }
-            result => result,
-        }
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        match Pin::new(&mut this.inner).poll_shutdown(context) {
-            Poll::Ready(Err(error)) => {
-                this.counter.mark_write_terminal();
-                Poll::Ready(Err(error))
-            }
-            result => result,
-        }
-    }
-}
-
-struct TcpFlowReport {
-    diagnostics: Option<Diagnostics>,
-    started_at: Instant,
-    target_kind: &'static str,
-    close_reason: &'static str,
-    client_to_network_bytes: Arc<AtomicU64>,
-    network_to_client_bytes: Arc<AtomicU64>,
-    terminal_direction: Arc<AtomicU8>,
-}
-
-impl TcpFlowReport {
-    fn new(diagnostics: Option<Diagnostics>, target_kind: &'static str) -> Self {
-        Self {
-            diagnostics,
-            started_at: Instant::now(),
-            target_kind,
-            close_reason: "cancelled",
-            client_to_network_bytes: Arc::new(AtomicU64::new(0)),
-            network_to_client_bytes: Arc::new(AtomicU64::new(0)),
-            terminal_direction: Arc::new(AtomicU8::new(0)),
-        }
-    }
-
-    fn set_close_reason(&mut self, close_reason: &'static str) {
-        self.close_reason = close_reason;
-    }
-
-    fn terminal_direction(&self) -> &'static str {
-        match self.terminal_direction.load(Ordering::Acquire) {
-            value if value == TcpDirection::ClientToNetwork as u8 => {
-                TcpDirection::ClientToNetwork.label()
-            }
-            value if value == TcpDirection::NetworkToClient as u8 => {
-                TcpDirection::NetworkToClient.label()
-            }
-            _ => "external",
-        }
-    }
-}
-
-impl Drop for TcpFlowReport {
-    fn drop(&mut self) {
-        let Some(diagnostics) = &self.diagnostics else {
-            return;
-        };
-        let duration_ms = self.started_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
-        let _ = diagnostics.record(
-            "tcp_flow_closed",
-            json!({
-                "duration_ms": duration_ms,
-                "target_kind": self.target_kind,
-                "client_to_network_bytes": self.client_to_network_bytes.load(Ordering::Relaxed),
-                "network_to_client_bytes": self.network_to_client_bytes.load(Ordering::Relaxed),
-                "close_reason": self.close_reason,
-                "terminal_direction": self.terminal_direction(),
-            }),
-        );
+        let (from_client, from_upstream) =
+            io::copy_bidirectional(&mut client, &mut upstream).await?;
+        self.stats
+            .tcp_tx_bytes
+            .fetch_add(from_client, Ordering::Relaxed);
+        self.stats
+            .tcp_rx_bytes
+            .fetch_add(from_upstream, Ordering::Relaxed);
+        Ok(())
     }
 }
 
@@ -911,7 +616,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connect_proxies_bidirectionally() {
+    async fn connect_preserves_a_large_bidirectional_stream() {
         let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let echo_address = echo.local_addr().unwrap();
         tokio::spawn(async move {
@@ -941,24 +646,30 @@ mod tests {
         let mut reply = [0; 10];
         client.read_exact(&mut reply).await.unwrap();
         assert_eq!(reply[1], 0);
-        client.write_all(b"ping").await.unwrap();
-        let mut echoed = [0; 4];
-        client.read_exact(&mut echoed).await.unwrap();
-        assert_eq!(&echoed, b"ping");
-        assert_eq!(stats.stats().tcp_tx_bytes, 4);
-        assert_eq!(stats.stats().tcp_rx_bytes, 4);
-        assert_eq!(stats.stats().active_connections, 1);
+        let payload: Vec<u8> = (0..(2 * 1024 * 1024 + 1))
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let expected = payload.clone();
+        let byte_count = payload.len() as u64;
+        let (mut reader, mut writer) = client.into_split();
+        let sender = tokio::spawn(async move {
+            writer.write_all(&payload).await.unwrap();
+            writer.shutdown().await.unwrap();
+        });
+        let mut echoed = vec![0; expected.len()];
+        reader.read_exact(&mut echoed).await.unwrap();
+        sender.await.unwrap();
+        assert_eq!(echoed, expected);
 
-        client.shutdown().await.unwrap();
-        time::timeout(Duration::from_millis(500), async {
+        time::timeout(Duration::from_secs(5), async {
             while stats.stats().active_connections != 0 {
                 time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
         .unwrap();
-        assert_eq!(stats.stats().tcp_tx_bytes, 4);
-        assert_eq!(stats.stats().tcp_rx_bytes, 4);
+        assert_eq!(stats.stats().tcp_tx_bytes, byte_count);
+        assert_eq!(stats.stats().tcp_rx_bytes, byte_count);
         task.abort();
     }
 
@@ -995,8 +706,6 @@ mod tests {
         first.read_exact(&mut echoed).await.unwrap();
         assert_eq!(&echoed, b"before-sleep");
         assert_eq!(stats.stats().active_connections, 1);
-        assert_eq!(stats.stats().tcp_tx_bytes, 12);
-        assert_eq!(stats.stats().tcp_rx_bytes, 12);
 
         gate.set_enabled(false);
         let closed = time::timeout(Duration::from_millis(500), first.read_u8())
@@ -1010,8 +719,6 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(stats.stats().tcp_tx_bytes, 12);
-        assert_eq!(stats.stats().tcp_rx_bytes, 12);
 
         let mut rejected = TcpStream::connect(address).await.unwrap();
         rejected.write_all(&[5, 1, 0]).await.unwrap();
@@ -1142,170 +849,6 @@ mod tests {
 
         drop(stalled);
         task.abort();
-    }
-
-    struct PartialThenError {
-        payload: Option<Vec<u8>>,
-    }
-
-    impl AsyncRead for PartialThenError {
-        fn poll_read(
-            self: Pin<&mut Self>,
-            _context: &mut Context<'_>,
-            buffer: &mut ReadBuf<'_>,
-        ) -> Poll<io::Result<()>> {
-            let this = self.get_mut();
-            if let Some(payload) = this.payload.take() {
-                buffer.put_slice(&payload);
-                return Poll::Ready(Ok(()));
-            }
-            Poll::Ready(Err(std::io::Error::new(
-                ErrorKind::ConnectionReset,
-                "test reset",
-            )))
-        }
-    }
-
-    impl AsyncWrite for PartialThenError {
-        fn poll_write(
-            self: Pin<&mut Self>,
-            _context: &mut Context<'_>,
-            buffer: &[u8],
-        ) -> Poll<io::Result<usize>> {
-            Poll::Ready(Ok(buffer.len()))
-        }
-
-        fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn poll_shutdown(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
-    }
-
-    #[tokio::test]
-    async fn partial_bytes_survive_io_error() {
-        let stats = SocksStats::default();
-        let client_to_network = Arc::new(AtomicU64::new(0));
-        let network_to_client = Arc::new(AtomicU64::new(0));
-        let terminal_direction = Arc::new(AtomicU8::new(0));
-        let mut client = PartialThenError {
-            payload: Some(b"partial".to_vec()),
-        };
-        let mut upstream = tokio::io::join(tokio::io::empty(), tokio::io::sink());
-
-        let error = relay_tcp(
-            &mut client,
-            &mut upstream,
-            stats.clone(),
-            client_to_network.clone(),
-            network_to_client.clone(),
-            terminal_direction.clone(),
-        )
-        .await
-        .unwrap_err();
-
-        assert_eq!(error.kind(), ErrorKind::ConnectionReset);
-        assert_eq!(stats.snapshot().tcp_tx_bytes, 7);
-        assert_eq!(stats.snapshot().tcp_rx_bytes, 0);
-        assert_eq!(client_to_network.load(Ordering::Relaxed), 7);
-        assert_eq!(network_to_client.load(Ordering::Relaxed), 0);
-        assert_eq!(
-            terminal_direction.load(Ordering::Acquire),
-            TcpDirection::ClientToNetwork as u8
-        );
-    }
-
-    #[test]
-    fn first_terminal_direction_is_stable_and_bounded() {
-        let stats = SocksStats::default();
-        let terminal_direction = Arc::new(AtomicU8::new(0));
-        let network_to_client = TrafficCounter::new(
-            stats.clone(),
-            TcpDirection::NetworkToClient,
-            Arc::new(AtomicU64::new(0)),
-            terminal_direction.clone(),
-        );
-        let client_to_network = TrafficCounter::new(
-            stats,
-            TcpDirection::ClientToNetwork,
-            Arc::new(AtomicU64::new(0)),
-            terminal_direction.clone(),
-        );
-
-        network_to_client.mark_read_terminal();
-        client_to_network.mark_read_terminal();
-
-        assert_eq!(
-            terminal_direction.load(Ordering::Acquire),
-            TcpDirection::NetworkToClient as u8
-        );
-        assert_eq!(TcpDirection::NetworkToClient.label(), "network_to_client");
-        assert_eq!(TcpDirection::ClientToNetwork.label(), "client_to_network");
-    }
-
-    #[tokio::test]
-    async fn partial_bytes_survive_relay_cancellation() {
-        let stats = SocksStats::default();
-        let task_stats = stats.clone();
-        let client_to_network = Arc::new(AtomicU64::new(0));
-        let network_to_client = Arc::new(AtomicU64::new(0));
-        let terminal_direction = Arc::new(AtomicU8::new(0));
-        let task_client_to_network = client_to_network.clone();
-        let task_network_to_client = network_to_client.clone();
-        let task_terminal_direction = terminal_direction.clone();
-        let (mut client_peer, mut client_relay) = tokio::io::duplex(1024);
-        let (mut upstream_relay, mut upstream_peer) = tokio::io::duplex(1024);
-        let task = tokio::spawn(async move {
-            relay_tcp(
-                &mut client_relay,
-                &mut upstream_relay,
-                task_stats,
-                task_client_to_network,
-                task_network_to_client,
-                task_terminal_direction,
-            )
-            .await
-        });
-
-        client_peer.write_all(b"before-stop").await.unwrap();
-        let mut received = [0; 11];
-        upstream_peer.read_exact(&mut received).await.unwrap();
-        assert_eq!(&received, b"before-stop");
-        assert_eq!(stats.snapshot().tcp_tx_bytes, 11);
-
-        task.abort();
-        let _ = task.await;
-        assert_eq!(stats.snapshot().tcp_tx_bytes, 11);
-        assert_eq!(client_to_network.load(Ordering::Relaxed), 11);
-        assert_eq!(network_to_client.load(Ordering::Relaxed), 0);
-        assert_eq!(terminal_direction.load(Ordering::Acquire), 0);
-    }
-
-    #[test]
-    fn flow_report_is_bounded_and_contains_no_endpoint() {
-        let directory = tempfile::tempdir().unwrap();
-        let diagnostics = Diagnostics::open(directory.path()).unwrap();
-        {
-            let mut report = TcpFlowReport::new(Some(diagnostics), "domain");
-            report.client_to_network_bytes.store(123, Ordering::Relaxed);
-            report.network_to_client_bytes.store(456, Ordering::Relaxed);
-            report.set_close_reason("clean_eof");
-        }
-
-        let encoded =
-            std::fs::read_to_string(directory.path().join("gnirehtet-vd.0.jsonl")).unwrap();
-        let event: serde_json::Value = serde_json::from_str(encoded.trim()).unwrap();
-        assert_eq!(event["kind"], "tcp_flow_closed");
-        assert_eq!(event["fields"]["target_kind"], "domain");
-        assert_eq!(event["fields"]["client_to_network_bytes"], 123);
-        assert_eq!(event["fields"]["network_to_client_bytes"], 456);
-        assert_eq!(event["fields"]["close_reason"], "clean_eof");
-        assert_eq!(event["fields"]["terminal_direction"], "external");
-        assert!(event["fields"]["duration_ms"].as_u64().is_some());
-        assert!(!encoded.contains("address"));
-        assert!(!encoded.contains("endpoint"));
     }
 
     proptest! {

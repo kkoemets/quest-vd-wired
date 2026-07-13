@@ -183,13 +183,12 @@ class NativeSbomTest(unittest.TestCase):
             with self.assertRaises(generate_v4_native_sbom.VerificationError):
                 generate_v4_native_sbom.verify_runtime_classpath_report(root)
 
-    def test_project_patch_set_covers_hev_root_and_lwip(self) -> None:
+    def test_project_patch_set_covers_the_pinned_hev_changes(self) -> None:
         self.assertEqual(
             {
                 "hev-lifecycle.patch": ".",
                 "hev-split-udp-port.patch": ".",
                 "hev-timeout-phases.patch": ".",
-                "hev-lwip-window.patch": "third-part/lwip",
             },
             generate_v4_native_sbom.PROJECT_PATCH_SCOPES,
         )
@@ -374,8 +373,8 @@ class CommandLineToolsTest(unittest.TestCase):
                 "#!/bin/sh\n"
                 "case \"$2\" in\n"
                 "application-id) echo com.genymobile.gnirehtet ;;\n"
-                "version-code) echo 45 ;;\n"
-                "version-name) echo 4.0.2 ;;\n"
+                "version-code) echo 46 ;;\n"
+                "version-name) echo 4.0.3 ;;\n"
                 "min-sdk) echo 29 ;;\n"
                 "target-sdk) echo 36 ;;\n"
                 "debuggable) echo false ;;\n"
@@ -488,20 +487,21 @@ class ReleasePolicyTest(unittest.TestCase):
         rust_v4 = (REPOSITORY / "host-rust/Cargo.toml").read_text(encoding="utf-8")
         ignore = (REPOSITORY / ".gitignore").read_text(encoding="utf-8")
 
-        self.assertIn("v4.0.2 — current release", readme)
+        self.assertIn("v4.0.3 — current release", readme)
         self.assertIn("v3.1.0 Legacy", readme)
         self.assertIn("gnirehtet-java-v3.1.0.zip", readme)
-        self.assertIn("gnirehtet-v4.0.2-windows-x64.zip", readme)
+        self.assertIn("gnirehtet-v4.0.3-windows-x64.zip", readme)
         self.assertNotIn("v4.0.1", readme)
+        self.assertNotIn("v4.0.2", readme)
         self.assertIn("gnirehtet-java-v3.0.0.zip", readme)
         self.assertNotIn("docs/", readme)
         self.assertIn("/docs/", ignore)
         self.assertTrue((REPOSITORY / "release").is_file())
         self.assertTrue((REPOSITORY / "scripts/build_v4_android_rc.sh").is_file())
         self.assertTrue((REPOSITORY / "scripts/build_v4_windows_rc.ps1").is_file())
-        self.assertIn('versionCode = 45', android_v4)
-        self.assertIn('versionName = "4.0.2"', android_v4)
-        self.assertIn('version = "4.0.2"', rust_v4)
+        self.assertIn('versionCode = 46', android_v4)
+        self.assertIn('versionName = "4.0.3"', android_v4)
+        self.assertIn('version = "4.0.3"', rust_v4)
 
     def test_android_release_dependency_compliance_is_fail_closed(self) -> None:
         gradle = (REPOSITORY / "android-v4/app/build.gradle.kts").read_text(encoding="utf-8")

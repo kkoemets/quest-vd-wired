@@ -26,7 +26,7 @@ class RustSbomSanitizerTest(unittest.TestCase):
             "members = [\"crates/gnirehtet-vd\"]\n"
             "\n"
             "[workspace.package]\n"
-            "version = \"4.0.2\"\n",
+            "version = \"4.0.3\"\n",
             encoding="utf-8",
         )
         member.write_text(
@@ -41,7 +41,7 @@ class RustSbomSanitizerTest(unittest.TestCase):
 
     @staticmethod
     def fixture() -> dict[str, object]:
-        root_ref = "path+file:///Users/builder/work/quest-vd-wired/host-rust/crates/gnirehtet-vd#4.0.2"
+        root_ref = "path+file:///Users/builder/work/quest-vd-wired/host-rust/crates/gnirehtet-vd#4.0.3"
         first_dependency = "registry+https://github.com/rust-lang/crates.io-index#alpha@1.0.0"
         second_dependency = "registry+https://github.com/rust-lang/crates.io-index#beta@2.0.0"
         return {
@@ -55,23 +55,23 @@ class RustSbomSanitizerTest(unittest.TestCase):
                     "type": "application",
                     "bom-ref": root_ref,
                     "name": "gnirehtet-vd",
-                    "version": "4.0.2",
+                    "version": "4.0.3",
                     "description": "Wired-link host",
-                    "purl": "pkg:cargo/gnirehtet-vd@4.0.2?download_url=file://.",
+                    "purl": "pkg:cargo/gnirehtet-vd@4.0.3?download_url=file://.",
                     "components": [
                         {
                             "type": "library",
                             "bom-ref": f"{root_ref} bin-target-0",
                             "name": "gnirehtet_vd",
-                            "version": "4.0.2",
-                            "purl": "pkg:cargo/gnirehtet-vd@4.0.2?download_url=file://.#src/lib.rs",
+                            "version": "4.0.3",
+                            "purl": "pkg:cargo/gnirehtet-vd@4.0.3?download_url=file://.#src/lib.rs",
                         },
                         {
                             "type": "application",
                             "bom-ref": f"{root_ref} bin-target-1",
                             "name": "gnirehtet-vd",
-                            "version": "4.0.2",
-                            "purl": "pkg:cargo/gnirehtet-vd@4.0.2?download_url=file://.#src/main.rs",
+                            "version": "4.0.3",
+                            "purl": "pkg:cargo/gnirehtet-vd@4.0.3?download_url=file://.#src/main.rs",
                         },
                     ],
                 },
@@ -118,15 +118,15 @@ class RustSbomSanitizerTest(unittest.TestCase):
         self.assertNotIn("serialNumber", output)
         self.assertNotIn("timestamp", output["metadata"])
         root = output["metadata"]["component"]
-        stable_root = "pkg:cargo/gnirehtet-vd@4.0.2"
+        stable_root = "pkg:cargo/gnirehtet-vd@4.0.3"
         self.assertEqual("gnirehtet-vd", root["name"])
-        self.assertEqual("4.0.2", root["version"])
+        self.assertEqual("4.0.3", root["version"])
         self.assertEqual(stable_root, root["bom-ref"])
         self.assertEqual(stable_root, root["purl"])
         self.assertEqual(
             [
-                "pkg:cargo/gnirehtet-vd@4.0.2?target=application%3Agnirehtet-vd",
-                "pkg:cargo/gnirehtet-vd@4.0.2?target=library%3Agnirehtet_vd",
+                "pkg:cargo/gnirehtet-vd@4.0.3?target=application%3Agnirehtet-vd",
+                "pkg:cargo/gnirehtet-vd@4.0.3?target=library%3Agnirehtet_vd",
             ],
             [component["bom-ref"] for component in root["components"]],
         )

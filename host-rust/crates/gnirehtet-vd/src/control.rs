@@ -283,7 +283,7 @@ impl ControlServer {
             self.config.session_id,
             serde_json::to_vec(&json!({
                 "protocol": VERSION,
-                "capabilities": ["heartbeat", "status", "explicit_stop", "explicit_suspend", "metrics_v1"]
+                "capabilities": ["heartbeat", "status", "explicit_stop", "explicit_suspend"]
             }))?,
         )
         .write_to(&mut writer)
@@ -775,7 +775,7 @@ mod tests {
             .await
             .unwrap();
         let acknowledgement = Frame::read_from(&mut client).await.unwrap();
-        assert!(String::from_utf8(acknowledgement.payload)
+        assert!(!String::from_utf8(acknowledgement.payload)
             .unwrap()
             .contains("metrics_v1"));
         Frame::new(MessageType::Started, session, Vec::new())

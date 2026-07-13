@@ -78,7 +78,6 @@ PROJECT_PATCH_SCOPES = {
     "hev-lifecycle.patch": ".",
     "hev-split-udp-port.patch": ".",
     "hev-timeout-phases.patch": ".",
-    "hev-lwip-window.patch": "third-part/lwip",
 }
 REQUIRED_PROJECT_PATCHES = frozenset(PROJECT_PATCH_SCOPES)
 
