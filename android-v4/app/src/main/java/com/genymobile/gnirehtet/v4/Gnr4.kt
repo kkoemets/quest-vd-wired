@@ -56,7 +56,7 @@ object Gnr4 {
     const val VERSION = 4
     const val MAX_PAYLOAD = 65_536
     const val METRICS_PAYLOAD_SIZE = 60
-    const val HELLO_CAPABILITIES = "android-v4;hev-udp-in-tcp;metrics_v1"
+    const val HELLO_CAPABILITIES = "android-v4;hev-udp-in-tcp"
     private const val METRICS_VERSION = 1
     private const val METRICS_FLAGS = 0
     private val MAGIC = byteArrayOf('G'.code.toByte(), 'N'.code.toByte(), 'R'.code.toByte(), '4'.code.toByte())

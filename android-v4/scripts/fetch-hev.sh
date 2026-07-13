@@ -7,11 +7,8 @@ target="$root/.deps/hev-socks5-tunnel"
 lifecycle_patch="$root/patches/hev-lifecycle.patch"
 split_udp_patch="$root/patches/hev-split-udp-port.patch"
 timeout_phases_patch="$root/patches/hev-timeout-phases.patch"
-lwip_window_patch="$root/patches/hev-lwip-window.patch"
 root_patches=("$lifecycle_patch" "$split_udp_patch" "$timeout_phases_patch")
-lwip_patches=("$lwip_window_patch")
 expected_patch_files=$'src/hev-config.c\nsrc/hev-config.h\nsrc/hev-jni.c\nsrc/hev-main.c\nsrc/hev-main.h\nsrc/hev-socks5-session.c\nsrc/hev-socks5-tunnel.c'
-expected_lwip_patch_files=$'src/ports/include/lwipopts.h'
 
 verify_exact_patch_content() (
     expected="$(mktemp -d)"
@@ -27,19 +24,6 @@ verify_exact_patch_content() (
         fi
     done <<< "$expected_patch_files"
 
-    lwip_expected="$(mktemp -d)"
-    git -C "$target/third-part/lwip" archive HEAD | tar -x -C "$lwip_expected"
-    for patch in "${lwip_patches[@]}"; do
-        git -C "$lwip_expected" apply "$patch"
-    done
-    while IFS= read -r file; do
-        if ! cmp -s "$target/third-part/lwip/$file" "$lwip_expected/$file"; then
-            echo "HEV lwIP checkout differs from the exact pinned patch content: $file" >&2
-            rm -rf "$lwip_expected"
-            exit 1
-        fi
-    done <<< "$expected_lwip_patch_files"
-    rm -rf "$lwip_expected"
 )
 
 verify_pinned_patch() {
@@ -51,6 +35,7 @@ verify_pinned_patch() {
     git -C "$target/third-part/yaml" diff --quiet
     git -C "$target/third-part/yaml" diff --cached --quiet
     git -C "$target" diff --ignore-submodules=all --check
+    git -C "$target/third-part/lwip" diff --quiet
     git -C "$target/third-part/lwip" diff --cached --quiet
     git -C "$target/third-part/lwip" diff --check
 
@@ -68,28 +53,9 @@ verify_pinned_patch() {
             exit 1
         fi
     done
-    for patch in "${lwip_patches[@]}"; do
-        if git -C "$target/third-part/lwip" apply --reverse --check "$patch"; then
-            continue
-        fi
-        if ! git -C "$target/third-part/lwip" apply --check "$patch"; then
-            echo "HEV lwIP checkout cannot apply project patch: $patch" >&2
-            exit 1
-        fi
-        git -C "$target/third-part/lwip" apply "$patch"
-        if ! git -C "$target/third-part/lwip" apply --reverse --check "$patch"; then
-            echo "HEV lwIP checkout does not contain project patch: $patch" >&2
-            exit 1
-        fi
-    done
     actual_patch_files="$(git -C "$target" diff --ignore-submodules=all --name-only | LC_ALL=C sort)"
     if [[ "$actual_patch_files" != "$expected_patch_files" ]]; then
         echo "HEV checkout contains changes outside the pinned project patches" >&2
-        exit 1
-    fi
-    actual_lwip_patch_files="$(git -C "$target/third-part/lwip" diff --name-only | LC_ALL=C sort)"
-    if [[ "$actual_lwip_patch_files" != "$expected_lwip_patch_files" ]]; then
-        echo "HEV lwIP checkout contains changes outside the pinned project patches" >&2
         exit 1
     fi
     verify_exact_patch_content
