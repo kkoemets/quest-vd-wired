@@ -7,6 +7,7 @@ import java.io.InputStream
 import java.util.UUID
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Test
 
 class Gnr4Test {
@@ -97,10 +98,40 @@ class Gnr4Test {
     }
 
     @Test
+    fun metricsV1UsesTheBoundedCrossLanguageLayout() {
+        val metrics = Gnr4Metrics(
+            txPackets = 1,
+            txBytes = 2,
+            rxPackets = 3,
+            rxBytes = 4,
+            controlRttSamples = 5,
+            controlRttP99Micros = 6,
+            controlRttMaxMicros = 7,
+        )
+
+        val payload = Gnr4.metricsPayload(metrics)
+
+        assertEquals(60, payload.size)
+        assertEquals(metrics, Gnr4.parseMetricsPayload(payload))
+    }
+
+    @Test
+    fun rejectsMalformedMetricsWithoutParsingCounters() {
+        val valid = Gnr4.metricsPayload(Gnr4Metrics(1, 2, 3, 4, 5, 6, 7))
+
+        assertNull(Gnr4.parseMetricsPayload(valid.copyOf(59)))
+        assertNull(Gnr4.parseMetricsPayload(valid.copyOf().apply { this[1] = 2 }))
+        assertNull(Gnr4.parseMetricsPayload(valid.copyOf().apply { this[3] = 1 }))
+        assertNull(Gnr4.parseMetricsPayload(valid.copyOf().apply { this[4] = 0xff.toByte() }))
+    }
+
+    @Test
     fun suspendMessageValuesMatchTheHost() {
         assertEquals(9, Gnr4MessageType.SUSPEND.wireValue)
         assertEquals(10, Gnr4MessageType.SUSPENDED.wireValue)
         assertEquals(Gnr4MessageType.SUSPEND, Gnr4MessageType.fromWire(9))
         assertEquals(Gnr4MessageType.SUSPENDED, Gnr4MessageType.fromWire(10))
+        assertEquals(11, Gnr4MessageType.METRICS.wireValue)
+        assertEquals(Gnr4MessageType.METRICS, Gnr4MessageType.fromWire(11))
     }
 }

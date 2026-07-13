@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import os
 import re
+import struct
 import subprocess
 import sys
 import tempfile
 import unittest
 import zipfile
-import struct
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPTS = Path(__file__).resolve().parents[1]
@@ -18,6 +19,7 @@ sys.path.insert(0, str(SCRIPTS))
 import generate_rust_notices  # noqa: E402
 import generate_v4_native_sbom  # noqa: E402
 import normalize_windows_pe  # noqa: E402
+import verify_windows_release  # noqa: E402
 
 
 class WindowsPeNormalizationTest(unittest.TestCase):
@@ -66,6 +68,82 @@ class WindowsPeNormalizationTest(unittest.TestCase):
             self.assertEqual(normalized, first.read_bytes())
 
 
+class WindowsReleaseVerificationTest(unittest.TestCase):
+    def test_local_build_paths_are_rejected_in_ascii_and_utf16(self) -> None:
+        examples = (
+            b"MZpayload/Users/example/project/src/main.rs\0",
+            b"MZpayloadC:\\Users\\example\\project\\src\\main.rs\0",
+            b"MZpayload/private/var/folders/example/build\0",
+            b"MZ" + "C:\\Users\\example\\project\\src\\main.rs".encode("utf-16-le"),
+        )
+        for payload in examples:
+            with self.subTest(payload=payload[:32]):
+                with tempfile.TemporaryDirectory() as directory:
+                    executable = Path(directory) / "release.exe"
+                    executable.write_bytes(payload)
+                    with self.assertRaises(verify_windows_release.VerificationError):
+                        verify_windows_release.verify_no_local_paths(executable)
+
+    def test_explicit_nonstandard_local_root_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / "release.exe"
+            executable.write_bytes(b"MZpayloadD:\\build-agent\\private\\source\\main.rs\0")
+            with self.assertRaises(verify_windows_release.VerificationError):
+                verify_windows_release.verify_no_local_paths(
+                    executable,
+                    [r"D:\build-agent\private"],
+                )
+
+    def test_safe_binary_and_system_imports_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executable = root / "release.exe"
+            executable.write_bytes(b"MZpayload/source/quest-vd-wired/src/main.rs\0")
+            verify_windows_release.verify_no_local_paths(executable)
+            completed = subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout="Import {\n  Name: KERNEL32.dll\n}\n",
+                stderr="",
+            )
+            with mock.patch.object(
+                verify_windows_release.subprocess,
+                "run",
+                return_value=completed,
+            ):
+                self.assertEqual(
+                    ["KERNEL32.dll"],
+                    verify_windows_release.verify_static_runtime_imports(
+                        executable,
+                        Path("llvm-readobj"),
+                    ),
+                )
+
+    def test_dynamic_vc_runtime_import_is_rejected(self) -> None:
+        for runtime in ("VCRUNTIME140.dll", "ucrtbase.dll", "api-ms-win-crt-runtime-l1-1-0.dll"):
+            with self.subTest(runtime=runtime):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    executable = root / "release.exe"
+                    executable.write_bytes(b"MZpayload")
+                    completed = subprocess.CompletedProcess(
+                        args=[],
+                        returncode=0,
+                        stdout=f"Import {{\n  Name: {runtime}\n}}\n",
+                        stderr="",
+                    )
+                    with mock.patch.object(
+                        verify_windows_release.subprocess,
+                        "run",
+                        return_value=completed,
+                    ):
+                        with self.assertRaises(verify_windows_release.VerificationError):
+                            verify_windows_release.verify_static_runtime_imports(
+                                executable,
+                                Path("llvm-readobj"),
+                            )
+
+
 class NativeSbomTest(unittest.TestCase):
     def test_bom_is_deterministic_and_has_closed_graph(self) -> None:
         first = generate_v4_native_sbom.build_bom("4.0.0-beta.1", 1_700_000_000, "a" * 64, "b" * 64)
@@ -73,12 +151,86 @@ class NativeSbomTest(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual("CycloneDX", first["bomFormat"])
         self.assertEqual("1.6", first["specVersion"])
-        self.assertEqual(5, len(first["components"]))
+        self.assertEqual(7, len(first["components"]))
         root = first["metadata"]["component"]
         self.assertEqual("com.genymobile", root["group"])
         self.assertEqual("a" * 64, root["hashes"][0]["content"])
-        dependency_refs = {entry["ref"] for entry in first["dependencies"]}
+        dependencies = {entry["ref"]: entry["dependsOn"] for entry in first["dependencies"]}
+        dependency_refs = set(dependencies)
         self.assertIn(root["bom-ref"], dependency_refs)
+        kotlin_ref = "pkg:maven/org.jetbrains.kotlin/kotlin-stdlib@2.2.10"
+        annotations_ref = "pkg:maven/org.jetbrains/annotations@13.0"
+        components = {entry["bom-ref"]: entry for entry in first["components"]}
+        self.assertEqual("Apache-2.0", components[kotlin_ref]["licenses"][0]["license"]["id"])
+        self.assertEqual("Apache-2.0", components[annotations_ref]["licenses"][0]["license"]["id"])
+        self.assertIn(kotlin_ref, dependencies[root["bom-ref"]])
+        self.assertEqual([annotations_ref], dependencies[kotlin_ref])
+        self.assertEqual([], dependencies[annotations_ref])
+
+    def test_runtime_classpath_report_requires_exact_sorted_graph(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report = root / generate_v4_native_sbom.RUNTIME_CLASSPATH_REPORT
+            report.parent.mkdir(parents=True)
+            expected = sorted(generate_v4_native_sbom.EXPECTED_JVM_COMPONENTS)
+            report.write_text("\n".join(expected) + "\n", encoding="utf-8")
+            self.assertEqual(expected, generate_v4_native_sbom.verify_runtime_classpath_report(root))
+
+            report.write_text(
+                "\n".join(expected + ["invalid.example:unexpected-runtime:1"]) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(generate_v4_native_sbom.VerificationError):
+                generate_v4_native_sbom.verify_runtime_classpath_report(root)
+
+    def test_project_patch_set_covers_hev_root_and_lwip(self) -> None:
+        self.assertEqual(
+            {
+                "hev-lifecycle.patch": ".",
+                "hev-split-udp-port.patch": ".",
+                "hev-timeout-phases.patch": ".",
+                "hev-lwip-window.patch": "third-part/lwip",
+            },
+            generate_v4_native_sbom.PROJECT_PATCH_SCOPES,
+        )
+
+    def test_patch_scope_verifier_rejects_extra_changes_in_a_patched_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            checkout = Path(directory) / "checkout"
+            checkout.mkdir()
+            subprocess.run(["git", "init", "--quiet", str(checkout)], check=True)
+            subprocess.run(
+                ["git", "-C", str(checkout), "config", "user.email", "test@example.invalid"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(checkout), "config", "user.name", "Test"],
+                check=True,
+            )
+            source = checkout / "src/value.c"
+            source.parent.mkdir(parents=True)
+            source.write_text("old\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(checkout), "add", "src/value.c"], check=True)
+            subprocess.run(
+                ["git", "-C", str(checkout), "commit", "--quiet", "-m", "fixture"],
+                check=True,
+            )
+            patch = Path(directory) / "change.patch"
+            patch.write_text(
+                "diff --git a/src/value.c b/src/value.c\n"
+                "--- a/src/value.c\n"
+                "+++ b/src/value.c\n"
+                "@@ -1 +1 @@\n"
+                "-old\n"
+                "+new\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "-C", str(checkout), "apply", str(patch)], check=True)
+            generate_v4_native_sbom.verify_patch_scope(checkout, [patch], "fixture")
+
+            source.write_text("new\nextra\n", encoding="utf-8")
+            with self.assertRaises(generate_v4_native_sbom.VerificationError):
+                generate_v4_native_sbom.verify_patch_scope(checkout, [patch], "fixture")
 
 
 class RustNoticeTest(unittest.TestCase):
@@ -222,8 +374,8 @@ class CommandLineToolsTest(unittest.TestCase):
                 "#!/bin/sh\n"
                 "case \"$2\" in\n"
                 "application-id) echo com.genymobile.gnirehtet ;;\n"
-                "version-code) echo 44 ;;\n"
-                "version-name) echo 4.0.1 ;;\n"
+                "version-code) echo 45 ;;\n"
+                "version-name) echo 4.0.2 ;;\n"
                 "min-sdk) echo 29 ;;\n"
                 "target-sdk) echo 36 ;;\n"
                 "debuggable) echo false ;;\n"
@@ -336,19 +488,56 @@ class ReleasePolicyTest(unittest.TestCase):
         rust_v4 = (REPOSITORY / "host-rust/Cargo.toml").read_text(encoding="utf-8")
         ignore = (REPOSITORY / ".gitignore").read_text(encoding="utf-8")
 
-        self.assertIn("v4.0.1 — current release", readme)
+        self.assertIn("v4.0.2 — current release", readme)
         self.assertIn("v3.1.0 Legacy", readme)
         self.assertIn("gnirehtet-java-v3.1.0.zip", readme)
-        self.assertIn("gnirehtet-v4.0.1-windows-x64.zip", readme)
+        self.assertIn("gnirehtet-v4.0.2-windows-x64.zip", readme)
+        self.assertNotIn("v4.0.1", readme)
         self.assertIn("gnirehtet-java-v3.0.0.zip", readme)
         self.assertNotIn("docs/", readme)
         self.assertIn("/docs/", ignore)
         self.assertTrue((REPOSITORY / "release").is_file())
         self.assertTrue((REPOSITORY / "scripts/build_v4_android_rc.sh").is_file())
         self.assertTrue((REPOSITORY / "scripts/build_v4_windows_rc.ps1").is_file())
-        self.assertIn('versionCode = 44', android_v4)
-        self.assertIn('versionName = "4.0.1"', android_v4)
-        self.assertIn('version = "4.0.1"', rust_v4)
+        self.assertIn('versionCode = 45', android_v4)
+        self.assertIn('versionName = "4.0.2"', android_v4)
+        self.assertIn('version = "4.0.2"', rust_v4)
+
+    def test_android_release_dependency_compliance_is_fail_closed(self) -> None:
+        gradle = (REPOSITORY / "android-v4/app/build.gradle.kts").read_text(encoding="utf-8")
+        builder = (REPOSITORY / "scripts/build_v4_android_rc.sh").read_text(encoding="utf-8")
+        verifier = (REPOSITORY / "scripts/verify_v4_apk.sh").read_text(encoding="utf-8")
+        notices = (
+            REPOSITORY / "android-v4/app/src/main/assets/THIRD_PARTY_NOTICES.md"
+        ).read_text(encoding="utf-8")
+
+        for coordinate in (
+            "org.jetbrains.kotlin:kotlin-stdlib:2.2.10",
+            "org.jetbrains:annotations:13.0",
+        ):
+            self.assertIn(coordinate, gradle)
+            self.assertIn(coordinate, verifier)
+            self.assertIn(coordinate, notices)
+        self.assertIn("outputs.upToDateWhen { false }", gradle)
+        self.assertIn("testReleaseRuntimeClasspathGuard", builder)
+        self.assertIn("verifyReleaseRuntimeClasspath", builder)
+        self.assertIn("gnirehtet-v4-android.cdx.json", builder)
+        self.assertIn("ANDROID_THIRD_PARTY_NOTICES.md", builder)
+        self.assertNotIn("gnirehtet-v4-android-native.cdx.json", builder)
+        self.assertNotIn("ANDROID_NATIVE_NOTICES.md", builder)
+
+    def test_windows_release_remaps_and_rejects_local_build_paths(self) -> None:
+        builder = (REPOSITORY / "scripts/build_v4_windows_rc.ps1").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("CARGO_ENCODED_RUSTFLAGS", builder)
+        self.assertIn("[char]0x1f", builder)
+        self.assertIn("--remap-path-prefix", builder)
+        self.assertIn("target-feature=+crt-static", builder)
+        self.assertIn("link-arg=/Brepro", builder)
+        self.assertIn("verify_windows_release.py", builder)
+        self.assertIn("llvm-readobj", builder)
+        self.assertIn('Get-Command "llvm-readobj" -ErrorAction Stop', builder)
 
 
 if __name__ == "__main__":

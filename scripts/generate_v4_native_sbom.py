@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Generate the deterministic Android/native CycloneDX SBOM for v4.
+"""Generate the deterministic Android CycloneDX SBOM for v4.
 
-The dependency graph is intentionally closed over the pinned HEV checkout.
-Any revision, submodule, notice, or project-patch drift is a hard failure.
+The dependency graph is intentionally closed over the pinned HEV checkout and
+the exact Gradle release runtime. Any dependency, revision, notice, or
+project-patch drift is a hard failure.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import json
 import re
 import subprocess
 import sys
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -51,7 +53,34 @@ EXPECTED_COMPONENTS = {
         "url": "https://github.com/heiher/yaml",
     },
 }
-REQUIRED_PROJECT_PATCHES = {"hev-lifecycle.patch", "hev-split-udp-port.patch"}
+EXPECTED_JVM_COMPONENTS = {
+    "org.jetbrains.kotlin:kotlin-stdlib:2.2.10": {
+        "group": "org.jetbrains.kotlin",
+        "name": "kotlin-stdlib",
+        "version": "2.2.10",
+        "license": "Apache-2.0",
+        "url": "https://github.com/JetBrains/kotlin",
+        "depends_on": ["org.jetbrains:annotations:13.0"],
+    },
+    "org.jetbrains:annotations:13.0": {
+        "group": "org.jetbrains",
+        "name": "annotations",
+        "version": "13.0",
+        "license": "Apache-2.0",
+        "url": "https://github.com/JetBrains/java-annotations",
+        "depends_on": [],
+    },
+}
+RUNTIME_CLASSPATH_REPORT = Path(
+    "android-v4/app/build/reports/release-runtime-classpath.txt"
+)
+PROJECT_PATCH_SCOPES = {
+    "hev-lifecycle.patch": ".",
+    "hev-split-udp-port.patch": ".",
+    "hev-timeout-phases.patch": ".",
+    "hev-lwip-window.patch": "third-part/lwip",
+}
+REQUIRED_PROJECT_PATCHES = frozenset(PROJECT_PATCH_SCOPES)
 
 
 class VerificationError(RuntimeError):
@@ -70,6 +99,80 @@ def git(checkout: Path, *args: str) -> str:
         detail = process.stderr.strip() or process.stdout.strip() or "git command failed"
         raise VerificationError(detail)
     return process.stdout.rstrip("\r\n")
+
+
+def git_bytes(checkout: Path, *args: str) -> bytes:
+    process = subprocess.run(
+        ["git", "-C", str(checkout), *args],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if process.returncode != 0:
+        detail = process.stderr.decode(errors="replace").strip() or "git command failed"
+        raise VerificationError(detail)
+    return process.stdout
+
+
+def patched_files(patches: list[Path]) -> set[str]:
+    files: set[str] = set()
+    for patch in patches:
+        for line in patch.read_text(encoding="utf-8").splitlines():
+            if line.startswith("+++ b/"):
+                files.add(line.removeprefix("+++ b/"))
+    return files
+
+
+def verify_patch_scope(checkout: Path, patches: list[Path], label: str) -> None:
+    expected_files = patched_files(patches)
+    if not expected_files:
+        raise VerificationError(f"project patches for {label} contain no file changes")
+    changed = set(
+        git(checkout, "diff", "--ignore-submodules=all", "--name-only").splitlines()
+    )
+    staged = git(checkout, "diff", "--cached", "--name-only")
+    untracked = git(checkout, "ls-files", "--others", "--exclude-standard")
+    if changed != expected_files or staged or untracked:
+        raise VerificationError(f"{label} contains changes outside its checked-in project patches")
+
+    for patch in reversed(patches):
+        reverse_check = subprocess.run(
+            ["git", "-C", str(checkout), "apply", "--reverse", "--check", str(patch)],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if reverse_check.returncode != 0:
+            raise VerificationError(f"project patch content drift detected: {patch.name}")
+
+    with tempfile.TemporaryDirectory() as directory:
+        expected = Path(directory)
+        subprocess.run(
+            ["git", "init", "--quiet", str(expected)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        for relative in expected_files:
+            destination = expected / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(git_bytes(checkout, "show", f"HEAD:{relative}"))
+        for patch in patches:
+            applied = subprocess.run(
+                ["git", "-C", str(expected), "apply", str(patch)],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            if applied.returncode != 0:
+                raise VerificationError(
+                    f"cannot reconstruct checked-in project patch {patch.name}: "
+                    f"{applied.stderr.strip()}"
+                )
+        for relative in expected_files:
+            if (expected / relative).read_bytes() != (checkout / relative).read_bytes():
+                raise VerificationError(f"project patch content drift detected in {label}: {relative}")
 
 
 def verify_checkout(repo_root: Path) -> dict[str, str]:
@@ -99,38 +202,47 @@ def verify_checkout(repo_root: Path) -> dict[str, str]:
 
     if set(revisions) != set(EXPECTED_COMPONENTS):
         raise VerificationError("HEV dependency graph changed")
+    patched_scopes = set(PROJECT_PATCH_SCOPES.values())
     for path, component in EXPECTED_COMPONENTS.items():
         if revisions[path] != component["revision"]:
             raise VerificationError(f"HEV dependency revision drift at {path}")
-        if path != "." and git(checkout / path, "status", "--porcelain"):
+        if path != "." and path not in patched_scopes and git(checkout / path, "status", "--porcelain"):
             raise VerificationError(f"HEV dependency contains local changes at {path}")
 
-    expected_patched_files: set[str] = set()
-    for patch in patches:
-        for line in patch.read_text(encoding="utf-8").splitlines():
-            if line.startswith("+++ b/"):
-                expected_patched_files.add(line.removeprefix("+++ b/"))
-    if not expected_patched_files:
-        raise VerificationError("project HEV patches contain no file changes")
-    changed = set(git(checkout, "diff", "--name-only").splitlines())
-    staged = git(checkout, "diff", "--cached", "--name-only")
-    if changed != expected_patched_files or staged:
-        raise VerificationError("HEV root contains changes outside the checked-in project patches")
-    for patch in reversed(patches):
-        reverse_check = subprocess.run(
-            ["git", "-C", str(checkout), "apply", "--reverse", "--check", str(patch)],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        if reverse_check.returncode != 0:
-            raise VerificationError(f"HEV project patch content drift detected: {patch.name}")
+    patch_by_name = {patch.name: patch for patch in patches}
+    for scope in sorted(patched_scopes):
+        scoped = [
+            patch_by_name[name]
+            for name, patch_scope in PROJECT_PATCH_SCOPES.items()
+            if patch_scope == scope
+        ]
+        verify_patch_scope(checkout if scope == "." else checkout / scope, scoped, scope)
 
     notice_text = notices.read_text(encoding="utf-8")
     for component in EXPECTED_COMPONENTS.values():
         if component["revision"] not in notice_text:
             raise VerificationError(f"notices omit pinned revision for {component['name']}")
+    for coordinate in EXPECTED_JVM_COMPONENTS:
+        if coordinate not in notice_text:
+            raise VerificationError(f"notices omit Gradle runtime dependency {coordinate}")
+    if "TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION" not in notice_text:
+        raise VerificationError("notices omit the Apache-2.0 license terms")
     return revisions
+
+
+def verify_runtime_classpath_report(repo_root: Path) -> list[str]:
+    report = repo_root / RUNTIME_CLASSPATH_REPORT
+    if not report.is_file():
+        raise VerificationError(
+            "verified Gradle releaseRuntimeClasspath report is missing"
+        )
+    lines = report.read_text(encoding="utf-8").splitlines()
+    expected = sorted(EXPECTED_JVM_COMPONENTS)
+    if lines != expected:
+        raise VerificationError(
+            "Gradle releaseRuntimeClasspath differs from the closed Android SBOM graph"
+        )
+    return lines
 
 
 def read_app_version(repo_root: Path) -> str:
@@ -147,6 +259,13 @@ def iso_timestamp(source_date_epoch: int) -> str:
 
 def component_ref(name: str, revision: str) -> str:
     return f"pkg:github/heiher/{name}@{revision}"
+
+
+def maven_component_ref(component: dict[str, object]) -> str:
+    return (
+        f"pkg:maven/{component['group']}/{component['name']}"
+        f"@{component['version']}"
+    )
 
 
 def build_bom(
@@ -180,6 +299,32 @@ def build_bom(
             }
         )
 
+    for coordinate in sorted(EXPECTED_JVM_COMPONENTS):
+        definition = EXPECTED_JVM_COMPONENTS[coordinate]
+        reference = maven_component_ref(definition)
+        components.append(
+            {
+                "type": "library",
+                "bom-ref": reference,
+                "group": definition["group"],
+                "name": definition["name"],
+                "version": definition["version"],
+                "purl": reference,
+                "licenses": [{"license": {"id": definition["license"]}}],
+                "externalReferences": [
+                    {"type": "vcs", "url": definition["url"]}
+                ],
+                "properties": [
+                    {
+                        "name": "gnirehtet:gradle-configuration",
+                        "value": "releaseRuntimeClasspath",
+                    },
+                    {"name": "gnirehtet:gradle-coordinate", "value": coordinate},
+                    {"name": "gnirehtet:compiled-into-apk", "value": "true"},
+                ],
+            }
+        )
+
     app_component = {
         "type": "application",
         "bom-ref": app_ref,
@@ -203,6 +348,7 @@ def build_bom(
     graph_fingerprint = "|".join(
         [app_version, str(source_date_epoch), patch_sha256]
         + [definition["revision"] for definition in EXPECTED_COMPONENTS.values()]
+        + sorted(EXPECTED_JVM_COMPONENTS)
         + ([apk_sha256] if apk_sha256 else [])
     )
     child_refs = [
@@ -210,10 +356,24 @@ def build_bom(
         for path, definition in EXPECTED_COMPONENTS.items()
         if path != "."
     ]
+    kotlin_ref = maven_component_ref(
+        EXPECTED_JVM_COMPONENTS["org.jetbrains.kotlin:kotlin-stdlib:2.2.10"]
+    )
     dependencies = [
-        {"ref": app_ref, "dependsOn": [hev_ref]},
+        {"ref": app_ref, "dependsOn": [hev_ref, kotlin_ref]},
         {"ref": hev_ref, "dependsOn": child_refs},
     ] + [{"ref": child, "dependsOn": []} for child in child_refs]
+    for coordinate in sorted(EXPECTED_JVM_COMPONENTS):
+        definition = EXPECTED_JVM_COMPONENTS[coordinate]
+        dependencies.append(
+            {
+                "ref": maven_component_ref(definition),
+                "dependsOn": [
+                    maven_component_ref(EXPECTED_JVM_COMPONENTS[dependency])
+                    for dependency in definition["depends_on"]
+                ],
+            }
+        )
 
     return {
         "bomFormat": "CycloneDX",
@@ -269,6 +429,7 @@ def main() -> int:
     args = parse_args()
     repo_root = args.repo_root.resolve()
     verify_checkout(repo_root)
+    verify_runtime_classpath_report(repo_root)
     apk_digest = None
     if args.apk:
         apk = args.apk.resolve()

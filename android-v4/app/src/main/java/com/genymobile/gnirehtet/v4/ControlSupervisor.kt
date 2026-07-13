@@ -27,6 +27,7 @@ class ControlSupervisor(
     private val sessionId: UUID,
     private val port: Int,
     private val listener: Listener,
+    private val metricsProvider: () -> Gnr4Metrics? = { null },
 ) : Closeable {
     interface Listener {
         fun shouldReportStarted(): Boolean
@@ -113,13 +114,14 @@ class ControlSupervisor(
                     connected.soTimeout = 1_000
                     synchronized(pauseLock) {
                         if (!isActiveSocket(connected)) return@use
-                        val hello = "android-v4;hev-udp-in-tcp".toByteArray(StandardCharsets.UTF_8)
+                        val hello = Gnr4.HELLO_CAPABILITIES.toByteArray(StandardCharsets.UTF_8)
                         write(connected, Gnr4Frame(Gnr4MessageType.HELLO, sessionId, hello))
                     }
                     val acknowledgement = Gnr4.read(connected.getInputStream(), sessionId)
                     if (acknowledgement.type != Gnr4MessageType.HELLO_ACK) {
                         throw IllegalStateException("Expected HELLO_ACK, got ${acknowledgement.type}")
                     }
+                    val metricsEnabled = Gnr4.helloAckSupportsMetrics(acknowledgement.payload)
                     synchronized(pauseLock) {
                         if (!isActiveSocket(connected) || !listener.shouldReportStarted()) return@use
                         write(connected, Gnr4Frame(Gnr4MessageType.STARTED, sessionId))
@@ -129,6 +131,7 @@ class ControlSupervisor(
                     delayMs = 250L
                     var missed = 0
                     val outstandingHeartbeats = linkedMapOf<Long, Long>()
+                    var lastMetricsAt = System.nanoTime()
                     while (
                         running.get() &&
                         (!paused.get() || suspendAcknowledgement.get() != null) &&
@@ -195,6 +198,9 @@ class ControlSupervisor(
                             )
                             missed += 1
                             if (missed >= 3) throw SocketTimeoutException("Three host heartbeats missed")
+                        }
+                        if (metricsEnabled) {
+                            lastMetricsAt = writeMetricsIfDue(connected, lastMetricsAt)
                         }
                     }
                 }
@@ -264,12 +270,24 @@ class ControlSupervisor(
         }
     }
 
+    private fun writeMetricsIfDue(connected: Socket, lastMetricsAt: Long): Long {
+        val now = System.nanoTime()
+        if (now - lastMetricsAt < METRICS_INTERVAL_NANOS) return lastMetricsAt
+        val metrics = runCatching(metricsProvider).getOrNull() ?: return now
+        write(
+            connected,
+            Gnr4Frame(Gnr4MessageType.METRICS, sessionId, Gnr4.metricsPayload(metrics)),
+        )
+        return now
+    }
+
     companion object {
         private const val TAG = "Gnr4Control"
         private const val CONNECT_TIMEOUT_MS = 1_000
         private const val STOP_ACK_TIMEOUT_MS = 5_000L
         private const val SUSPEND_ACK_TIMEOUT_MS = 500L
         private const val MAX_OUTSTANDING_HEARTBEATS = 8
+        private const val METRICS_INTERVAL_NANOS = 1_000_000_000L
         private val IPV4_LOOPBACK = java.net.InetAddress.getByAddress(byteArrayOf(127, 0, 0, 1))
     }
 }

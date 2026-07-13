@@ -130,15 +130,6 @@ impl Diagnostics {
             .write_record(&encoded)
     }
 
-    pub fn capture_process_sample(&self) -> io::Result<ProcessSample> {
-        let sample = process_sample();
-        self.record(
-            "process_sample",
-            serde_json::to_value(&sample).map_err(io::Error::other)?,
-        )?;
-        Ok(sample)
-    }
-
     /// Creates a local JSONL support bundle. No network operation is performed.
     pub fn export(&self, destination: impl AsRef<Path>) -> io::Result<PathBuf> {
         let mut destination = destination.as_ref().to_path_buf();
@@ -360,7 +351,7 @@ pub struct ProcessSample {
 }
 
 #[cfg(target_os = "linux")]
-fn process_sample() -> ProcessSample {
+pub fn process_sample() -> ProcessSample {
     let rss_bytes = fs::read_to_string("/proc/self/statm")
         .ok()
         .and_then(|line| line.split_whitespace().nth(1)?.parse::<u64>().ok())
@@ -372,7 +363,7 @@ fn process_sample() -> ProcessSample {
 }
 
 #[cfg(target_os = "windows")]
-fn process_sample() -> ProcessSample {
+pub fn process_sample() -> ProcessSample {
     use windows_sys::Win32::{
         Foundation::FILETIME,
         System::{
@@ -413,7 +404,7 @@ fn filetime_ticks(value: windows_sys::Win32::Foundation::FILETIME) -> u64 {
 }
 
 #[cfg(target_os = "macos")]
-fn process_sample() -> ProcessSample {
+pub fn process_sample() -> ProcessSample {
     let output = Command::new("ps")
         .args(["-o", "rss=", "-p", &std::process::id().to_string()])
         .output()
@@ -429,7 +420,7 @@ fn process_sample() -> ProcessSample {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-fn process_sample() -> ProcessSample {
+pub fn process_sample() -> ProcessSample {
     ProcessSample::default()
 }
 

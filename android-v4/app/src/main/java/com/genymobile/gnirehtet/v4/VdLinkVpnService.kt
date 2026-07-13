@@ -257,6 +257,9 @@ class VdLinkVpnService : VpnService() {
                         requestStop(resources.generation, sendStopped)
                     }
                 },
+                metricsProvider = {
+                    if (isCurrent(resources, supervisor)) collectMetrics(resources.tunnel) else null
+                },
             )
             val accepted = synchronized(lifecycleLock) {
                 if (generationGate.isCurrent(resources.generation) && active === resources) {
@@ -282,6 +285,24 @@ class VdLinkVpnService : VpnService() {
                 active === resources &&
                 (supervisor == null || resources.control === supervisor)
         }
+
+    private fun collectMetrics(tunnel: NativeTunnel): Gnr4Metrics? {
+        val stats = runCatching(tunnel::stats).getOrNull() ?: return null
+        if (
+            stats.size < 4 || stats[0] < 0 || stats[1] < 0 ||
+            stats[2] < 0 || stats[3] < 0
+        ) return null
+        val rtt = controlRtt.snapshot()
+        return Gnr4Metrics(
+            txPackets = stats[0],
+            txBytes = stats[1],
+            rxPackets = stats[2],
+            rxBytes = stats[3],
+            controlRttSamples = rtt.samples,
+            controlRttP99Micros = rtt.p99Micros,
+            controlRttMaxMicros = rtt.maxMicros,
+        )
+    }
 
     private fun setScreenSuspended(suspended: Boolean) {
         if (!screenSuspended.compareAndSet(!suspended, suspended)) return

@@ -71,7 +71,13 @@ rm -f "$output"/*
     cd "$repo_root/android-v4"
     bash scripts/fetch-hev.sh "$hev_revision"
     test "$(git -C .deps/hev-socks5-tunnel rev-parse HEAD)" = "$hev_revision"
-    ./gradlew --no-daemon clean testDebugUnitTest lintRelease assembleRelease
+    ./gradlew --no-daemon \
+        clean \
+        testReleaseRuntimeClasspathGuard \
+        verifyReleaseRuntimeClasspath \
+        testDebugUnitTest \
+        lintRelease \
+        assembleRelease
 )
 
 first_apk="$repo_root/android-v4/app/build/outputs/apk/release/app-release.apk"
@@ -88,9 +94,9 @@ python3 "$repo_root/scripts/generate_v4_native_sbom.py" \
     --repo-root "$repo_root" \
     --apk "$output/gnirehtet-v4.apk" \
     --source-date-epoch "$source_date_epoch" \
-    --output "$output/gnirehtet-v4-android-native.cdx.json"
+    --output "$output/gnirehtet-v4-android.cdx.json"
 cp "$repo_root/android-v4/app/src/main/assets/THIRD_PARTY_NOTICES.md" \
-    "$output/ANDROID_NATIVE_NOTICES.md"
+    "$output/ANDROID_THIRD_PARTY_NOTICES.md"
 cp "$repo_root/LICENSE" "$output/PROJECT_LICENSE.txt"
 
 (

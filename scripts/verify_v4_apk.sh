@@ -56,8 +56,8 @@ version_name="$("$apkanalyzer" manifest version-name "$apk")"
 min_sdk="$("$apkanalyzer" manifest min-sdk "$apk")"
 target_sdk="$("$apkanalyzer" manifest target-sdk "$apk")"
 debuggable="$("$apkanalyzer" manifest debuggable "$apk" | tr '[:upper:]' '[:lower:]')"
-if [[ "$version_code" != "44" || "$version_name" != "4.0.1" ]]; then
-    echo "APK version is not the exact v4.0.1 release identity" >&2
+if [[ "$version_code" != "45" || "$version_name" != "4.0.2" ]]; then
+    echo "APK version is not the exact v4.0.2 release identity" >&2
     exit 1
 fi
 if [[ "$debuggable" != "false" ]]; then
@@ -92,3 +92,12 @@ if ! cmp -s "$packaged_notices" "$repo_root/android-v4/app/src/main/assets/THIRD
     echo "packaged third-party notices differ from the reviewed source" >&2
     exit 1
 fi
+for required_notice in \
+    'org.jetbrains.kotlin:kotlin-stdlib:2.2.10' \
+    'org.jetbrains:annotations:13.0' \
+    'TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION'; do
+    if ! grep -Fq "$required_notice" "$packaged_notices"; then
+        echo "packaged third-party notices omit required Android runtime license data" >&2
+        exit 1
+    fi
+done

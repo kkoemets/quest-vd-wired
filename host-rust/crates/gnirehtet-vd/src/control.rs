@@ -21,7 +21,7 @@ const CONTROL_FRAME_TIMEOUT: Duration = Duration::from_secs(4);
 
 use crate::{
     diagnostics::{Diagnostics, LatencyHistogram, LatencyHistogramSnapshot},
-    protocol::{Frame, MessageType, ProtocolError, SessionId, VERSION},
+    protocol::{AndroidMetricsV1, Frame, MessageType, ProtocolError, SessionId, VERSION},
     state::{HostState, StateMachine, StateSnapshot, TransitionError, HEARTBEAT_INTERVAL},
 };
 
@@ -49,7 +49,9 @@ struct ControlMetricsInner {
     connection_generation: AtomicU64,
     heartbeats_echoed: AtomicU64,
     invalid_heartbeats: AtomicU64,
+    invalid_metrics: AtomicU64,
     heartbeat_echo_service: LatencyHistogram,
+    android: RwLock<Option<AndroidMetricsV1>>,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -58,6 +60,8 @@ pub struct ControlMetricsSnapshot {
     pub reconnects: u64,
     pub heartbeats_echoed: u64,
     pub invalid_heartbeats: u64,
+    #[serde(default)]
+    pub invalid_metrics: u64,
     pub heartbeat_echo_service_us: LatencyHistogramSnapshot,
 }
 
@@ -69,8 +73,17 @@ impl ControlMetrics {
             reconnects: connection_generation.saturating_sub(1),
             heartbeats_echoed: self.0.heartbeats_echoed.load(Ordering::Relaxed),
             invalid_heartbeats: self.0.invalid_heartbeats.load(Ordering::Relaxed),
+            invalid_metrics: self.0.invalid_metrics.load(Ordering::Relaxed),
             heartbeat_echo_service_us: self.0.heartbeat_echo_service.snapshot(),
         }
+    }
+
+    fn android_snapshot(&self) -> Option<AndroidMetricsV1> {
+        self.0
+            .android
+            .read()
+            .ok()
+            .and_then(|metrics| metrics.clone())
     }
 }
 
@@ -210,6 +223,10 @@ impl ControlServer {
         self.metrics.snapshot()
     }
 
+    pub fn android_metrics(&self) -> Option<AndroidMetricsV1> {
+        self.metrics.android_snapshot()
+    }
+
     pub async fn serve(self) -> Result<(), ControlError> {
         let listener = TcpListener::bind(self.config.bind).await?;
         self.serve_on(listener).await
@@ -254,6 +271,9 @@ impl ControlServer {
         if first.message_type != MessageType::Hello {
             return Err(ControlError::ExpectedHello);
         }
+        if let Ok(mut latest) = self.metrics.0.android.write() {
+            *latest = None;
+        }
         self.metrics
             .0
             .connection_generation
@@ -263,7 +283,7 @@ impl ControlServer {
             self.config.session_id,
             serde_json::to_vec(&json!({
                 "protocol": VERSION,
-                "capabilities": ["heartbeat", "status", "explicit_stop", "explicit_suspend"]
+                "capabilities": ["heartbeat", "status", "explicit_stop", "explicit_suspend", "metrics_v1"]
             }))?,
         )
         .write_to(&mut writer)
@@ -369,6 +389,24 @@ impl ControlServer {
                                 serde_json::to_vec(&snapshot)?,
                             ).write_to(&mut writer).await?;
                         }
+                        MessageType::Metrics => {
+                            match AndroidMetricsV1::decode(&frame.payload) {
+                                Ok(metrics) => {
+                                    if let Ok(mut latest) = self.metrics.0.android.write() {
+                                        *latest = Some(metrics);
+                                    }
+                                }
+                                Err(error) => {
+                                    self.metrics.0.invalid_metrics.fetch_add(1, Ordering::Relaxed);
+                                    if let Some(diagnostics) = &self.diagnostics {
+                                        let _ = diagnostics.record(
+                                            "android_metrics_malformed",
+                                            json!({"category": metrics_error_category(&error)}),
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         MessageType::Suspend => {
                             if !frame.payload.is_empty() {
                                 break Err(ControlError::InvalidSuspendPayload(frame.payload.len()));
@@ -431,6 +469,9 @@ impl ControlServer {
         };
         reader_task.abort();
         let _ = writer.shutdown().await;
+        if let Ok(mut latest) = self.metrics.0.android.write() {
+            *latest = None;
+        }
         {
             let mut state = self.state.lock().await;
             if pending_stop.is_pending() {
@@ -472,6 +513,14 @@ impl ControlServer {
                 let _ = diagnostics.record("lifecycle_state", fields);
             }
         }
+    }
+}
+
+fn metrics_error_category(error: &crate::protocol::MetricsError) -> &'static str {
+    match error {
+        crate::protocol::MetricsError::InvalidLength(_) => "invalid_length",
+        crate::protocol::MetricsError::UnsupportedVersion(_) => "unsupported_version",
+        crate::protocol::MetricsError::UnsupportedFlags(_) => "unsupported_flags",
     }
 }
 
@@ -704,6 +753,79 @@ mod tests {
         assert_eq!(echo.message_type, MessageType::Heartbeat);
         assert_eq!(echo.payload, heartbeat_payload);
         assert_eq!(state.lock().await.state(), HostState::Connected);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn metrics_are_stored_and_malformed_metrics_do_not_close_control() {
+        let session = SessionId([0x4d; 16]);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bind = listener.local_addr().unwrap();
+        let server = ControlServer::new(ControlConfig {
+            bind,
+            session_id: session,
+        })
+        .unwrap();
+        let observed = server.clone();
+        let task = tokio::spawn(server.serve_on(listener));
+
+        let mut client = TcpStream::connect(bind).await.unwrap();
+        Frame::new(MessageType::Hello, session, Vec::new())
+            .write_to(&mut client)
+            .await
+            .unwrap();
+        let acknowledgement = Frame::read_from(&mut client).await.unwrap();
+        assert!(String::from_utf8(acknowledgement.payload)
+            .unwrap()
+            .contains("metrics_v1"));
+        Frame::new(MessageType::Started, session, Vec::new())
+            .write_to(&mut client)
+            .await
+            .unwrap();
+
+        Frame::new(MessageType::Metrics, session, vec![0; 3])
+            .write_to(&mut client)
+            .await
+            .unwrap();
+        let metrics = AndroidMetricsV1 {
+            tx_packets: 11,
+            tx_bytes: 12,
+            rx_packets: 13,
+            rx_bytes: 14,
+            control_rtt_samples: 15,
+            control_rtt_p99_us: 16,
+            control_rtt_max_us: 17,
+        };
+        Frame::new(MessageType::Metrics, session, metrics.encode().to_vec())
+            .write_to(&mut client)
+            .await
+            .unwrap();
+        let heartbeat_payload = vec![0x4d; 16];
+        Frame::new(MessageType::Heartbeat, session, heartbeat_payload.clone())
+            .write_to(&mut client)
+            .await
+            .unwrap();
+        let echo = Frame::read_from(&mut client).await.unwrap();
+        assert_eq!(echo.message_type, MessageType::Heartbeat);
+        assert_eq!(echo.payload, heartbeat_payload);
+
+        time::timeout(Duration::from_secs(1), async {
+            while observed.android_metrics().is_none() {
+                time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(observed.android_metrics(), Some(metrics));
+        assert_eq!(observed.metrics().invalid_metrics, 1);
+        drop(client);
+        time::timeout(Duration::from_secs(1), async {
+            while observed.android_metrics().is_some() {
+                time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
         task.abort();
     }
 

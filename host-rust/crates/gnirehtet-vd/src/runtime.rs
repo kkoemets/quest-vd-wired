@@ -2,7 +2,7 @@ use std::{
     env, fs, io,
     net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex as StdMutex,
@@ -11,15 +11,17 @@ use std::{
 };
 
 #[cfg(target_os = "windows")]
-use wait_timeout::ChildExt;
+use std::io::Read;
 #[cfg(target_os = "windows")]
-use {std::io::Read, std::process::Stdio};
+use wait_timeout::ChildExt;
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    net::TcpListener,
+    process::{Child as TokioChild, Command as TokioCommand},
     sync::{Mutex, Notify, Semaphore},
     task, time,
 };
@@ -34,7 +36,7 @@ use crate::{
     adb::{AdbController, AndroidVpnStatus, CONTROL_PORT, SOCKS_PORT, UDP_STREAM_PORT},
     control::{ControlConfig, ControlHandle, ControlServer, StateObserver, SuspendObserver},
     diagnostics::Diagnostics,
-    protocol::SessionId,
+    protocol::{AndroidMetricsV1, SessionId},
     socks::{RelayGate, SocksCommandPolicy, SocksConfig, SocksServer},
     state::{HostState, StateSnapshot},
 };
@@ -112,11 +114,17 @@ impl StateStore {
             .lock
             .lock()
             .map_err(|_| io::Error::other("state store lock poisoned"))?;
-        let telemetry = fs::read(&self.path)
+        let existing = fs::read(&self.path)
             .ok()
-            .and_then(|bytes| serde_json::from_slice::<PersistedStatus>(&bytes).ok())
-            .and_then(|status| status.telemetry);
-        self.write_document(snapshot, daemon_pid, telemetry)
+            .and_then(|bytes| serde_json::from_slice::<PersistedStatus>(&bytes).ok());
+        let telemetry = existing
+            .as_ref()
+            .and_then(|status| status.telemetry.clone());
+        let runtime_ready = daemon_pid.is_some()
+            && existing
+                .as_ref()
+                .is_some_and(|status| status.daemon_pid == daemon_pid && status.runtime_ready);
+        self.write_document(snapshot, daemon_pid, runtime_ready, telemetry)
     }
 
     pub fn write_with_telemetry(
@@ -129,13 +137,43 @@ impl StateStore {
             .lock
             .lock()
             .map_err(|_| io::Error::other("state store lock poisoned"))?;
-        self.write_document(snapshot, daemon_pid, Some(telemetry))
+        let runtime_ready = daemon_pid.is_some()
+            && fs::read(&self.path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<PersistedStatus>(&bytes).ok())
+                .is_some_and(|status| status.daemon_pid == daemon_pid && status.runtime_ready);
+        self.write_document(snapshot, daemon_pid, runtime_ready, Some(telemetry))
+    }
+
+    pub fn write_runtime_not_ready(
+        &self,
+        snapshot: &StateSnapshot,
+        daemon_pid: u32,
+    ) -> io::Result<()> {
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| io::Error::other("state store lock poisoned"))?;
+        self.write_document(snapshot, Some(daemon_pid), false, None)
+    }
+
+    pub fn write_runtime_ready(&self, snapshot: &StateSnapshot, daemon_pid: u32) -> io::Result<()> {
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| io::Error::other("state store lock poisoned"))?;
+        let telemetry = fs::read(&self.path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<PersistedStatus>(&bytes).ok())
+            .and_then(|status| status.telemetry);
+        self.write_document(snapshot, Some(daemon_pid), true, telemetry)
     }
 
     fn write_document(
         &self,
         snapshot: &StateSnapshot,
         daemon_pid: Option<u32>,
+        runtime_ready: bool,
         telemetry: Option<RuntimeTelemetry>,
     ) -> io::Result<()> {
         let document = PersistedStatus {
@@ -145,6 +183,7 @@ impl StateStore {
             // would launch a Windows liveness subprocess on every heartbeat
             // and telemetry tick; external reads perform the bounded probe.
             daemon_running: daemon_pid.is_some(),
+            runtime_ready: daemon_pid.is_some() && runtime_ready,
             updated_unix_ms: unix_millis(),
             telemetry,
         };
@@ -205,6 +244,8 @@ pub struct PersistedStatus {
     pub lifecycle: StateSnapshot,
     pub daemon_pid: Option<u32>,
     pub daemon_running: bool,
+    #[serde(default)]
+    pub runtime_ready: bool,
     pub updated_unix_ms: u128,
     #[serde(default)]
     pub telemetry: Option<RuntimeTelemetry>,
@@ -221,6 +262,7 @@ impl PersistedStatus {
             },
             daemon_pid: None,
             daemon_running: false,
+            runtime_ready: false,
             updated_unix_ms: unix_millis(),
             telemetry: None,
         }
@@ -230,13 +272,15 @@ impl PersistedStatus {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RuntimeTelemetry {
     pub control: crate::control::ControlMetricsSnapshot,
+    #[serde(default)]
+    pub android: Option<AndroidMetricsV1>,
     pub relay: crate::socks::SocksStatsSnapshot,
     #[serde(default)]
     pub adb: AdbMonitorSnapshot,
     pub process: crate::diagnostics::ProcessSample,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AdbMonitorSnapshot {
     pub active: bool,
     pub repair_suppressed: bool,
@@ -252,6 +296,7 @@ pub struct AdbHealthMonitor {
     reconnect_generation: Arc<AtomicU64>,
     status: Arc<StdMutex<AdbMonitorSnapshot>>,
     operation: Arc<Mutex<()>>,
+    changed: Arc<Notify>,
 }
 
 impl AdbHealthMonitor {
@@ -266,103 +311,226 @@ impl AdbHealthMonitor {
         snapshot
     }
 
-    /// Prevents any new repair and waits for an in-flight bounded ADB command
-    /// to finish before the explicit STOP transaction is sent to Android.
+    /// Convenience shutdown path that suppresses and drains repair work.
     pub async fn suppress_repairs(&self) {
+        self.begin_suppress_repairs();
+        self.drain_repairs().await;
+    }
+
+    /// Nonblocking first phase of explicit Stop. New repair work observes the
+    /// flag immediately, allowing the authenticated STOP frame to reach
+    /// Android without waiting behind an existing mapping command.
+    pub fn begin_suppress_repairs(&self) {
         self.stopping.store(true, Ordering::Release);
-        let _operation = self.operation.lock().await;
+        self.changed.notify_waiters();
         if let Ok(mut status) = self.status.lock() {
             status.active = false;
             status.repair_suppressed = true;
         }
     }
 
+    /// Drains the at-most-one bounded mapping command that was already in
+    /// flight when Stop began.
+    pub async fn drain_repairs(&self) {
+        let _operation = self.operation.lock().await;
+    }
+
+    pub fn notify_state_change(&self) {
+        self.changed.notify_one();
+    }
+
     async fn run(
         self,
         adb: AdbController,
+        adb_program: PathBuf,
         control: ControlHandle,
         store: StateStore,
         diagnostics: Diagnostics,
     ) {
-        const HEALTHY_INTERVAL: Duration = Duration::from_secs(1);
+        const HEALTHY_INTERVAL: Duration = Duration::from_secs(2);
+        const MONITOR_ADB_TIMEOUT: Duration = Duration::from_millis(500);
         const INITIAL_BACKOFF: Duration = Duration::from_millis(250);
-        // A one-second cap leaves room for bounded ADB commands and mapping
-        // recreation inside the three-second reconnect acceptance window.
-        const MAX_BACKOFF: Duration = Duration::from_secs(1);
+        const MAX_BACKOFF: Duration = Duration::from_secs(5);
 
+        let adb = adb.with_mapping_timeout(MONITOR_ADB_TIMEOUT);
         let mut backoff = INITIAL_BACKOFF;
         loop {
             if self.stopping.load(Ordering::Acquire) {
                 return;
             }
-            let lifecycle = control.snapshot().await;
-            if !matches!(lifecycle.state, HostState::Connected | HostState::Degraded) {
-                self.update_status(false, false, false, None);
-                time::sleep(HEALTHY_INTERVAL).await;
+            let mut child = match spawn_track_devices(&adb_program) {
+                Ok(child) => child,
+                Err(_) => {
+                    self.track_failed(&control, &store, &diagnostics, "track_spawn_failed")
+                        .await;
+                    if sleep_or_stop(&self, backoff).await {
+                        return;
+                    }
+                    backoff = next_backoff(backoff, MAX_BACKOFF);
+                    continue;
+                }
+            };
+            let Some(stdout) = child.stdout.take() else {
+                let _ = child.kill().await;
+                self.track_failed(&control, &store, &diagnostics, "track_stdout_unavailable")
+                    .await;
+                if sleep_or_stop(&self, backoff).await {
+                    return;
+                }
+                backoff = next_backoff(backoff, MAX_BACKOFF);
                 continue;
+            };
+            self.update_status(true, false, false, None);
+            let mut stdout = stdout;
+            let mut read_buffer = [0u8; 4096];
+            let mut decoder = TrackDevicesDecoder::default();
+            let mut device_available = false;
+            let mut healthy =
+                time::interval_at(time::Instant::now() + HEALTHY_INTERVAL, HEALTHY_INTERVAL);
+            healthy.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+            let mut tracker_failed = None;
+            loop {
+                tokio::select! {
+                    read = stdout.read(&mut read_buffer) => {
+                        match read {
+                            Ok(0) => {
+                                tracker_failed = Some("track_exited");
+                                break;
+                            }
+                            Ok(length) => {
+                                let updates = match decoder.push(&read_buffer[..length]) {
+                                    Ok(updates) => updates,
+                                    Err(_) => {
+                                        tracker_failed = Some("track_decode_failed");
+                                        break;
+                                    }
+                                };
+                                for available in updates {
+                                    device_available = available;
+                                    self.reconcile(
+                                        &adb,
+                                        &control,
+                                        &store,
+                                        &diagnostics,
+                                        device_available,
+                                    ).await;
+                                }
+                            }
+                            Err(_) => {
+                                tracker_failed = Some("track_read_failed");
+                                break;
+                            }
+                        }
+                    }
+                    _ = healthy.tick() => {
+                        // A track process that remains alive for a complete
+                        // health interval is stable enough to reset restart
+                        // backoff. Fast crash loops continue toward the cap.
+                        backoff = INITIAL_BACKOFF;
+                        self.reconcile(
+                            &adb,
+                            &control,
+                            &store,
+                            &diagnostics,
+                            device_available,
+                        ).await;
+                    }
+                    _ = self.changed.notified() => {
+                        if self.stopping.load(Ordering::Acquire) {
+                            break;
+                        }
+                        self.reconcile(
+                            &adb,
+                            &control,
+                            &store,
+                            &diagnostics,
+                            device_available,
+                        ).await;
+                    }
+                }
+                if self.stopping.load(Ordering::Acquire) {
+                    break;
+                }
             }
-
-            let _operation = self.operation.lock().await;
+            let _ = child.kill().await;
+            let _ = child.wait().await;
             if self.stopping.load(Ordering::Acquire) {
                 return;
             }
-            let probe_adb = adb.clone();
-            let probe = task::spawn_blocking(move || probe_adb_health(&probe_adb)).await;
-            let probe = match probe {
-                Ok(probe) => probe,
-                Err(_) => AdbHealthProbe::DeviceUnavailable,
-            };
-            match probe {
-                AdbHealthProbe::Healthy => {
-                    self.update_status(true, true, true, None);
-                    backoff = INITIAL_BACKOFF;
-                    drop(_operation);
-                    time::sleep(HEALTHY_INTERVAL).await;
-                }
-                AdbHealthProbe::DeviceUnavailable => {
-                    self.record_loss(&control, &store, &diagnostics, false, "device_unavailable")
-                        .await;
-                    drop(_operation);
-                    time::sleep(backoff).await;
-                    backoff = next_backoff(backoff, MAX_BACKOFF);
-                }
-                AdbHealthProbe::MappingsMissing(missing) => {
-                    self.record_loss(
-                        &control,
-                        &store,
-                        &diagnostics,
-                        true,
-                        "reverse_mapping_unhealthy",
-                    )
+            if let Some(category) = tracker_failed {
+                self.track_failed(&control, &store, &diagnostics, category)
                     .await;
+                if sleep_or_stop(&self, backoff).await {
+                    return;
+                }
+                backoff = next_backoff(backoff, MAX_BACKOFF);
+            }
+        }
+    }
+
+    async fn reconcile(
+        &self,
+        adb: &AdbController,
+        control: &ControlHandle,
+        store: &StateStore,
+        diagnostics: &Diagnostics,
+        device_available: bool,
+    ) {
+        if self.stopping.load(Ordering::Acquire) {
+            return;
+        }
+        let lifecycle = control.snapshot().await;
+        let lifecycle_active =
+            matches!(lifecycle.state, HostState::Connected | HostState::Degraded);
+        if !device_available {
+            if lifecycle_active {
+                self.record_loss(control, store, diagnostics, false, "device_unavailable")
+                    .await;
+            } else {
+                self.update_status(true, false, false, Some("device_unavailable".into()));
+            }
+            return;
+        }
+        if !lifecycle_active {
+            self.update_status(true, true, false, None);
+            return;
+        }
+
+        let _operation = self.operation.lock().await;
+        if self.stopping.load(Ordering::Acquire) {
+            return;
+        }
+        let probe_adb = adb.clone();
+        let health = task::spawn_blocking(move || probe_adb.mapping_health()).await;
+        match health {
+            Ok(Ok(health)) if health.is_healthy() => {
+                self.update_status(true, true, true, None);
+            }
+            Ok(Ok(health)) => {
+                self.record_loss(
+                    control,
+                    store,
+                    diagnostics,
+                    true,
+                    "reverse_mapping_unhealthy",
+                )
+                .await;
+                let missing = health.missing;
+                let mut repair_failed = false;
+                for mapping in missing {
+                    // Explicit Stop sets this flag before waiting on the
+                    // operation mutex. Check between bounded mapping commands
+                    // so Stop waits for at most one ADB timeout, not the whole
+                    // three-lane repair transaction.
                     if self.stopping.load(Ordering::Acquire) {
                         return;
                     }
                     let repair_adb = adb.clone();
-                    let repaired =
-                        task::spawn_blocking(move || repair_adb.repair_missing_mappings(&missing))
-                            .await;
-                    match repaired {
-                        Ok(Ok(())) => {
-                            let generation = self
-                                .reconnect_generation
-                                .fetch_add(1, Ordering::Relaxed)
-                                .saturating_add(1);
-                            self.update_status(true, true, true, None);
-                            let _ = diagnostics.record(
-                                "adb_mapping_repaired",
-                                json!({"reconnect_generation": generation}),
-                            );
-                            backoff = INITIAL_BACKOFF;
-                        }
+                    match task::spawn_blocking(move || repair_adb.add_mapping(mapping)).await {
+                        Ok(Ok(())) => {}
                         Ok(Err(_)) => {
-                            self.update_status(
-                                true,
-                                true,
-                                false,
-                                Some("mapping_repair_failed".into()),
-                            );
-                            backoff = next_backoff(backoff, MAX_BACKOFF);
+                            repair_failed = true;
+                            break;
                         }
                         Err(_) => {
                             self.update_status(
@@ -371,14 +539,71 @@ impl AdbHealthMonitor {
                                 false,
                                 Some("mapping_repair_worker_failed".into()),
                             );
-                            backoff = next_backoff(backoff, MAX_BACKOFF);
+                            return;
                         }
                     }
-                    drop(_operation);
-                    time::sleep(backoff).await;
+                }
+                if self.stopping.load(Ordering::Acquire) {
+                    return;
+                }
+                if !repair_failed {
+                    let verify_adb = adb.clone();
+                    repair_failed = !matches!(
+                        task::spawn_blocking(move || verify_adb.mapping_health()).await,
+                        Ok(Ok(health)) if health.is_healthy()
+                    );
+                }
+                if repair_failed {
+                    self.update_status(true, true, false, Some("mapping_repair_failed".into()));
+                } else {
+                    let generation = self
+                        .reconnect_generation
+                        .fetch_add(1, Ordering::Relaxed)
+                        .saturating_add(1);
+                    self.update_status(true, true, true, None);
+                    let _ = diagnostics.record(
+                        "adb_mapping_repaired",
+                        json!({"reconnect_generation": generation}),
+                    );
                 }
             }
+            Ok(Err(_)) => {
+                self.record_loss(control, store, diagnostics, false, "mapping_probe_failed")
+                    .await;
+            }
+            Err(_) => {
+                self.record_loss(
+                    control,
+                    store,
+                    diagnostics,
+                    false,
+                    "mapping_probe_worker_failed",
+                )
+                .await;
+            }
         }
+    }
+
+    async fn track_failed(
+        &self,
+        control: &ControlHandle,
+        store: &StateStore,
+        diagnostics: &Diagnostics,
+        category: &'static str,
+    ) {
+        self.update_status(false, false, false, Some(category.into()));
+        if matches!(
+            control.snapshot().await.state,
+            HostState::Connected | HostState::Degraded
+        ) {
+            self.record_loss(control, store, diagnostics, false, category)
+                .await;
+        }
+        // `record_loss` describes a live monitor observing carrier loss. A
+        // failed track process is different: clear that active bit throughout
+        // restart backoff so status never presents stale monitor health.
+        self.update_status(false, false, false, Some(category.into()));
+        let _ = diagnostics.record("adb_monitor_failure", json!({"category": category}));
     }
 
     fn update_status(
@@ -387,9 +612,9 @@ impl AdbHealthMonitor {
         device_available: bool,
         mappings_healthy: bool,
         last_error: Option<String>,
-    ) {
+    ) -> bool {
         if let Ok(mut status) = self.status.lock() {
-            *status = AdbMonitorSnapshot {
+            let next = AdbMonitorSnapshot {
                 active,
                 repair_suppressed: self.stopping.load(Ordering::Acquire),
                 device_available,
@@ -397,6 +622,11 @@ impl AdbHealthMonitor {
                 reconnect_generation: self.reconnect_generation.load(Ordering::Relaxed),
                 last_error,
             };
+            let changed = *status != next;
+            *status = next;
+            changed
+        } else {
+            false
         }
     }
 
@@ -408,7 +638,9 @@ impl AdbHealthMonitor {
         device_available: bool,
         category: &'static str,
     ) {
-        self.update_status(true, device_available, false, Some(category.into()));
+        if !self.update_status(true, device_available, false, Some(category.into())) {
+            return;
+        }
         let snapshot = control
             .transport_lost(format!("ADB carrier unavailable ({category})"))
             .await;
@@ -424,21 +656,176 @@ impl AdbHealthMonitor {
     }
 }
 
-enum AdbHealthProbe {
-    Healthy,
-    DeviceUnavailable,
-    MappingsMissing(Vec<crate::adb::ReverseMapping>),
+const MAX_TRACK_DEVICES_PAYLOAD: usize = 16 * 1024;
+
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+enum TrackDevicesMode {
+    #[default]
+    Unknown,
+    Framed,
+    Text,
 }
 
-fn probe_adb_health(adb: &AdbController) -> AdbHealthProbe {
-    match adb.device_state() {
-        Ok(state) if state == "device" => {}
-        Ok(_) | Err(_) => return AdbHealthProbe::DeviceUnavailable,
+#[derive(Default)]
+struct TrackDevicesDecoder {
+    mode: TrackDevicesMode,
+    buffer: Vec<u8>,
+    text: TrackDevicesTextParser,
+    last_update: Option<bool>,
+}
+
+impl TrackDevicesDecoder {
+    fn push(&mut self, bytes: &[u8]) -> Result<Vec<bool>, TrackDevicesDecodeError> {
+        self.buffer.extend_from_slice(bytes);
+        let mut updates = Vec::new();
+        loop {
+            if self.mode == TrackDevicesMode::Unknown {
+                if self.buffer.len() < 4 {
+                    return Ok(updates);
+                }
+                self.mode = if self.buffer[..4].iter().all(u8::is_ascii_hexdigit) {
+                    let length = parse_track_length(&self.buffer[..4])?;
+                    if length > MAX_TRACK_DEVICES_PAYLOAD {
+                        return Err(TrackDevicesDecodeError::Oversized(length));
+                    }
+                    TrackDevicesMode::Framed
+                } else {
+                    TrackDevicesMode::Text
+                };
+            }
+
+            match self.mode {
+                TrackDevicesMode::Unknown => unreachable!(),
+                TrackDevicesMode::Framed => {
+                    if self.buffer.len() < 4 {
+                        return Ok(updates);
+                    }
+                    let length = parse_track_length(&self.buffer[..4])?;
+                    if length > MAX_TRACK_DEVICES_PAYLOAD {
+                        return Err(TrackDevicesDecodeError::Oversized(length));
+                    }
+                    if self.buffer.len() < 4 + length {
+                        return Ok(updates);
+                    }
+                    let available = parse_track_snapshot(&self.buffer[4..4 + length])?;
+                    self.buffer.drain(..4 + length);
+                    if self.last_update != Some(available) {
+                        self.last_update = Some(available);
+                        updates.push(available);
+                    }
+                }
+                TrackDevicesMode::Text => {
+                    while let Some(newline) = self.buffer.iter().position(|byte| *byte == b'\n') {
+                        let mut line = self.buffer.drain(..=newline).collect::<Vec<_>>();
+                        line.pop();
+                        if line.last() == Some(&b'\r') {
+                            line.pop();
+                        }
+                        let line = std::str::from_utf8(&line)
+                            .map_err(|_| TrackDevicesDecodeError::InvalidUtf8)?;
+                        if let Some(available) = self.text.push_line(line) {
+                            if self.last_update != Some(available) {
+                                self.last_update = Some(available);
+                                updates.push(available);
+                            }
+                        }
+                    }
+                    if self.buffer.len() > MAX_TRACK_DEVICES_PAYLOAD {
+                        return Err(TrackDevicesDecodeError::Oversized(self.buffer.len()));
+                    }
+                    return Ok(updates);
+                }
+            }
+        }
     }
-    match adb.mapping_health() {
-        Ok(health) if health.is_healthy() => AdbHealthProbe::Healthy,
-        Ok(health) => AdbHealthProbe::MappingsMissing(health.missing),
-        Err(_) => AdbHealthProbe::DeviceUnavailable,
+}
+
+fn parse_track_length(bytes: &[u8]) -> Result<usize, TrackDevicesDecodeError> {
+    if bytes.len() != 4 || !bytes.iter().all(u8::is_ascii_hexdigit) {
+        return Err(TrackDevicesDecodeError::InvalidLength);
+    }
+    let text = std::str::from_utf8(bytes).map_err(|_| TrackDevicesDecodeError::InvalidLength)?;
+    usize::from_str_radix(text, 16).map_err(|_| TrackDevicesDecodeError::InvalidLength)
+}
+
+fn parse_track_snapshot(payload: &[u8]) -> Result<bool, TrackDevicesDecodeError> {
+    let text = std::str::from_utf8(payload).map_err(|_| TrackDevicesDecodeError::InvalidUtf8)?;
+    Ok(text.lines().any(|line| {
+        line.split_once('\t')
+            .is_some_and(|(_, state)| state.split_whitespace().next() == Some("device"))
+    }))
+}
+
+#[derive(Debug, Error, Eq, PartialEq)]
+enum TrackDevicesDecodeError {
+    #[error("ADB track-devices frame has an invalid length")]
+    InvalidLength,
+    #[error("ADB track-devices frame is {0} bytes, exceeding the bound")]
+    Oversized(usize),
+    #[error("ADB track-devices output is not UTF-8")]
+    InvalidUtf8,
+}
+
+#[derive(Default)]
+struct TrackDevicesTextParser {
+    in_snapshot: bool,
+    device_available: bool,
+}
+
+impl TrackDevicesTextParser {
+    fn push_line(&mut self, line: &str) -> Option<bool> {
+        let line = line.trim_end_matches('\r');
+        if line == "List of devices attached" {
+            let completed = self.in_snapshot.then_some(self.device_available);
+            self.in_snapshot = true;
+            self.device_available = false;
+            return completed;
+        }
+        if line.is_empty() {
+            let available = self.in_snapshot && self.device_available;
+            self.in_snapshot = false;
+            self.device_available = false;
+            return Some(available);
+        }
+        // Current ADB builds normally print the human-readable header, while
+        // some platform-tools versions stream only the tab-separated snapshot.
+        // Treat the first valid device-state line as an implicit snapshot start.
+        if !self.in_snapshot && line.contains('\t') {
+            self.in_snapshot = true;
+            self.device_available = false;
+        }
+        if !self.in_snapshot {
+            return None;
+        }
+        let available = line
+            .split_once('\t')
+            .is_some_and(|(_, state)| state.split_whitespace().next() == Some("device"));
+        self.device_available |= available;
+        available.then_some(true)
+    }
+}
+
+fn spawn_track_devices(adb_program: &Path) -> io::Result<TokioChild> {
+    let mut command = TokioCommand::new(adb_program);
+    command
+        .arg("track-devices")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.as_std_mut().creation_flags(CREATE_NO_WINDOW);
+    }
+    command.spawn()
+}
+
+async fn sleep_or_stop(monitor: &AdbHealthMonitor, duration: Duration) -> bool {
+    tokio::select! {
+        _ = time::sleep(duration) => monitor.stopping.load(Ordering::Acquire),
+        _ = monitor.changed.notified() => monitor.stopping.load(Ordering::Acquire),
     }
 }
 
@@ -494,10 +881,16 @@ pub struct RuntimeConfig {
     pub session_id: SessionId,
     pub paths: AppPaths,
     pub adb: AdbController,
+    pub adb_program: PathBuf,
 }
 
 impl RuntimeConfig {
-    pub fn new(session_id: SessionId, paths: AppPaths, adb: AdbController) -> Self {
+    pub fn new(
+        session_id: SessionId,
+        paths: AppPaths,
+        adb: AdbController,
+        adb_program: PathBuf,
+    ) -> Self {
         Self {
             control_bind: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), CONTROL_PORT),
             socks_bind: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), SOCKS_PORT),
@@ -505,6 +898,7 @@ impl RuntimeConfig {
             session_id,
             paths,
             adb,
+            adb_program,
         }
     }
 }
@@ -533,12 +927,24 @@ impl HostRuntime {
         let diagnostics = Diagnostics::open(&self.config.paths.logs)?;
         let store = StateStore::new(&self.config.paths.status);
         write_daemon_identity(&self.config.paths.daemon_pid, self.config.session_id)?;
+        store.write_runtime_not_ready(
+            &StateSnapshot {
+                state: HostState::Preparing,
+                session_id: Some(self.config.session_id.to_string()),
+                missed_heartbeats: 0,
+                reason: None,
+            },
+            std::process::id(),
+        )?;
         let relay_gate = RelayGate::default();
+        let adb_monitor = AdbHealthMonitor::default();
         let observer_store = store.clone();
         let observer_diagnostics = diagnostics.clone();
         let observer_relay_gate = relay_gate.clone();
+        let observer_adb_monitor = adb_monitor.clone();
         let observer: StateObserver = Arc::new(move |snapshot| {
             update_relay_gate(&observer_relay_gate, snapshot);
+            observer_adb_monitor.notify_state_change();
             if let Err(error) = observer_store.write(snapshot, Some(std::process::id())) {
                 let _ = observer_diagnostics.record(
                     "state_persistence_error",
@@ -559,7 +965,6 @@ impl HostRuntime {
         .with_observer(observer)
         .with_suspend_observer(suspend_observer);
         let control_handle = control.command_handle();
-        let adb_monitor = AdbHealthMonitor::default();
         let shutdown = Arc::new(Notify::new());
         let admin = AdminServer::new(
             self.config.paths.clone(),
@@ -582,6 +987,9 @@ impl HostRuntime {
         })?
         .with_diagnostics(diagnostics.clone())
         .with_relay_gate(relay_gate);
+        let control_listener = TcpListener::bind(self.config.control_bind).await?;
+        let tcp_listener = TcpListener::bind(self.config.socks_bind).await?;
+        let udp_listener = TcpListener::bind(self.config.udp_bind).await?;
         let metrics_tcp_socks = tcp_socks.clone();
         let metrics_udp_socks = udp_socks.clone();
         let metrics_control = control.clone();
@@ -589,14 +997,17 @@ impl HostRuntime {
         let metrics_adb = adb_monitor.clone();
         let metrics_store = store.clone();
         let metrics_diagnostics = diagnostics.clone();
+        let runtime_ready = Arc::new(AtomicBool::new(false));
+        let metrics_runtime_ready = runtime_ready.clone();
+        let process_generation = unix_millis()
+            .saturating_mul(1_000)
+            .saturating_add(u128::from(std::process::id()));
         let metrics = tokio::spawn(async move {
             let mut interval = time::interval(Duration::from_secs(1));
             interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
-                let process = metrics_diagnostics
-                    .capture_process_sample()
-                    .unwrap_or_default();
+                let process = crate::diagnostics::process_sample();
                 let mut relay = metrics_udp_socks.stats();
                 let tcp = metrics_tcp_socks.stats();
                 relay.accepted_connections = relay
@@ -611,19 +1022,27 @@ impl HostRuntime {
                 relay.tcp_tx_bytes = relay.tcp_tx_bytes.saturating_add(tcp.tcp_tx_bytes);
                 relay.tcp_rx_bytes = relay.tcp_rx_bytes.saturating_add(tcp.tcp_rx_bytes);
                 let control = metrics_control.metrics();
-                if let Ok(fields) = serde_json::to_value(&relay) {
-                    let _ = metrics_diagnostics.record("relay_counters", fields);
-                }
-                if let Ok(fields) = serde_json::to_value(&control) {
-                    let _ = metrics_diagnostics.record("control_counters", fields);
-                }
                 let telemetry = RuntimeTelemetry {
                     control,
+                    android: metrics_control.android_metrics(),
                     relay,
                     adb: metrics_adb.snapshot(),
                     process,
                 };
                 let snapshot = metrics_control_handle.snapshot().await;
+                let _ = metrics_diagnostics.record(
+                    "runtime_sample",
+                    json!({
+                        "process": {
+                            "pid": std::process::id(),
+                            "role": "daemon",
+                            "generation": process_generation,
+                        },
+                        "runtime_ready": metrics_runtime_ready.load(Ordering::Acquire),
+                        "lifecycle": &snapshot,
+                        "telemetry": &telemetry,
+                    }),
+                );
                 let _ = metrics_store.write_with_telemetry(
                     &snapshot,
                     Some(std::process::id()),
@@ -634,25 +1053,78 @@ impl HostRuntime {
 
         let monitor = tokio::spawn(adb_monitor.clone().run(
             self.config.adb.clone(),
+            self.config.adb_program.clone(),
             control_handle.clone(),
             store.clone(),
             diagnostics.clone(),
         ));
 
+        let mut control_task = tokio::spawn(async move {
+            control
+                .serve_on(control_listener)
+                .await
+                .map_err(RuntimeError::from)
+        });
+        let mut tcp_task = tokio::spawn(async move {
+            tcp_socks
+                .serve_on(tcp_listener)
+                .await
+                .map_err(RuntimeError::from)
+        });
+        let mut udp_task = tokio::spawn(async move {
+            udp_socks
+                .serve_on(udp_listener)
+                .await
+                .map_err(RuntimeError::from)
+        });
+        let mut admin_task = tokio::spawn(admin.serve());
+        wait_for_admin_ready(&self.config.paths).await?;
+        store.write_runtime_ready(&control_handle.snapshot().await, std::process::id())?;
+        runtime_ready.store(true, Ordering::Release);
+
         let result = tokio::select! {
-            result = control.serve() => result.map_err(RuntimeError::from),
-            result = tcp_socks.serve() => result.map_err(RuntimeError::from),
-            result = udp_socks.serve() => result.map_err(RuntimeError::from),
-            result = admin.serve() => result,
+            result = &mut control_task => flatten_runtime_task(result),
+            result = &mut tcp_task => flatten_runtime_task(result),
+            result = &mut udp_task => flatten_runtime_task(result),
+            result = &mut admin_task => flatten_runtime_task(result),
             _ = shutdown.notified() => Ok(()),
             result = tokio::signal::ctrl_c() => result.map_err(RuntimeError::Io),
         };
         adb_monitor.suppress_repairs().await;
         monitor.abort();
         metrics.abort();
+        control_task.abort();
+        tcp_task.abort();
+        udp_task.abort();
+        admin_task.abort();
         let _ = fs::remove_file(&self.config.paths.daemon_pid);
         result
     }
+}
+
+async fn wait_for_admin_ready(paths: &AppPaths) -> Result<(), RuntimeError> {
+    let deadline = time::Instant::now() + Duration::from_secs(3);
+    loop {
+        if admin_command(paths, "status", Duration::from_millis(150))
+            .await
+            .is_ok_and(|response| response.ok)
+        {
+            return Ok(());
+        }
+        if time::Instant::now() >= deadline {
+            return Err(RuntimeError::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "per-user admin endpoint did not become ready within 3 seconds",
+            )));
+        }
+        time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+fn flatten_runtime_task(
+    result: Result<Result<(), RuntimeError>, tokio::task::JoinError>,
+) -> Result<(), RuntimeError> {
+    result.map_err(|error| RuntimeError::Io(io::Error::other(error)))?
 }
 
 fn update_relay_gate(relay_gate: &RelayGate, snapshot: &StateSnapshot) {
@@ -827,8 +1299,14 @@ impl AdminServer {
         }
         let response = match request.command.as_str() {
             "stop" => {
-                self.adb_monitor.suppress_repairs().await;
-                match self.control.request_stop(Duration::from_secs(6)).await {
+                // Stop new mapping work first, then send STOP immediately so
+                // Android can close the VPN descriptor without waiting behind
+                // an already-running health command. Drain that one bounded
+                // command before acknowledging serialized cleanup to the host.
+                self.adb_monitor.begin_suppress_repairs();
+                let stop_result = self.control.request_stop(Duration::from_secs(6)).await;
+                self.adb_monitor.drain_repairs().await;
+                match stop_result {
                     Ok(()) => AdminResponse {
                         ok: true,
                         repairs_suppressed: true,
@@ -1204,6 +1682,8 @@ pub enum StreamerProbe {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct DoctorReport {
+    pub host_runtime_ready: bool,
+    pub control_connected: bool,
     pub adb_state: Result<String, String>,
     pub reverse_mappings_healthy: bool,
     pub reverse_mapping_error: Option<String>,
@@ -1212,7 +1692,20 @@ pub struct DoctorReport {
     pub tunnel_available: bool,
 }
 
-pub fn doctor(adb: &AdbController) -> DoctorReport {
+pub fn doctor(paths: &AppPaths, adb: &AdbController) -> DoctorReport {
+    let live_daemon = read_daemon_pid(&paths.daemon_pid).filter(|pid| process_is_running(*pid));
+    let persisted = StateStore::new(&paths.status).read().ok();
+    let host_runtime_ready = persisted.as_ref().is_some_and(|status| {
+        live_daemon.is_some()
+            && status.daemon_pid == live_daemon
+            && status.daemon_running
+            && status.runtime_ready
+    });
+    let control_connected = persisted.as_ref().is_some_and(|status| {
+        host_runtime_ready
+            && status.lifecycle.state == HostState::Connected
+            && status.lifecycle.missed_heartbeats == 0
+    });
     let adb_state = adb.device_state().map_err(|error| error.to_string());
     let mapping = adb.mapping_health();
     let (reverse_mappings_healthy, reverse_mapping_error) = match mapping {
@@ -1220,23 +1713,39 @@ pub fn doctor(adb: &AdbController) -> DoctorReport {
         Err(error) => (false, Some(error.to_string())),
     };
     let virtual_desktop_streamer = probe_virtual_desktop_streamer();
-    let streamer_ready = matches!(virtual_desktop_streamer, StreamerProbe::Listening { .. });
     let android_vpn = adb.android_status().map_err(|error| error.to_string());
     let android_ready = android_vpn.as_ref().is_ok_and(|status| {
         status.vpn_fd_open == Some(true)
             && matches!(status.state.as_deref(), Some("connected" | "degraded"))
     });
     DoctorReport {
-        tunnel_available: adb_state.as_deref() == Ok("device")
-            && reverse_mappings_healthy
-            && streamer_ready
-            && android_ready,
+        tunnel_available: tunnel_layers_available(
+            host_runtime_ready,
+            control_connected,
+            adb_state.as_deref() == Ok("device"),
+            reverse_mappings_healthy,
+            android_ready,
+            &virtual_desktop_streamer,
+        ),
+        host_runtime_ready,
+        control_connected,
         adb_state,
         reverse_mappings_healthy,
         reverse_mapping_error,
         virtual_desktop_streamer,
         android_vpn,
     }
+}
+
+fn tunnel_layers_available(
+    host_runtime_ready: bool,
+    control_connected: bool,
+    adb_ready: bool,
+    mappings_ready: bool,
+    android_ready: bool,
+    _streamer: &StreamerProbe,
+) -> bool {
+    host_runtime_ready && control_connected && adb_ready && mappings_ready && android_ready
 }
 
 #[cfg(target_os = "windows")]
@@ -1640,6 +2149,8 @@ pub fn terminate_daemon(identity_path: &Path, timeout: Duration) -> io::Result<(
 #[cfg(test)]
 mod tests {
     use crate::adb::{AdbError, AdbExecutor, AdbOutput, REVERSE_MAPPINGS};
+    #[cfg(unix)]
+    use crate::protocol::{Frame, MessageType};
 
     use super::*;
 
@@ -1647,6 +2158,7 @@ mod tests {
     struct MonitorMockAdb {
         calls: StdMutex<Vec<Vec<String>>>,
         mapping_adds: AtomicU64,
+        mapping_delay_ms: AtomicU64,
     }
 
     impl AdbExecutor for MonitorMockAdb {
@@ -1671,6 +2183,9 @@ mod tests {
                 && !args.iter().any(|argument| argument == "--remove")
             {
                 self.mapping_adds.fetch_add(1, Ordering::Relaxed);
+                std::thread::sleep(Duration::from_millis(
+                    self.mapping_delay_ms.load(Ordering::Relaxed),
+                ));
             }
             Ok(AdbOutput::success(""))
         }
@@ -1688,6 +2203,43 @@ mod tests {
         };
         store.write(&snapshot, None).unwrap();
         assert_eq!(store.read().unwrap().lifecycle.state, HostState::Degraded);
+    }
+
+    #[test]
+    fn new_daemon_cannot_inherit_stale_runtime_readiness() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::new(directory.path().join("status.json"));
+        let snapshot = StateSnapshot {
+            state: HostState::Preparing,
+            session_id: Some("new-session".into()),
+            missed_heartbeats: 0,
+            reason: None,
+        };
+        store.write_runtime_ready(&snapshot, 41).unwrap();
+        assert!(store.read().unwrap().runtime_ready);
+
+        store.write_runtime_not_ready(&snapshot, 42).unwrap();
+        let status = store.read().unwrap();
+        assert_eq!(status.daemon_pid, Some(42));
+        assert!(!status.runtime_ready);
+        store.write(&snapshot, Some(42)).unwrap();
+        assert!(!store.read().unwrap().runtime_ready);
+        store.write_runtime_ready(&snapshot, 42).unwrap();
+        assert!(store.read().unwrap().runtime_ready);
+    }
+
+    #[test]
+    fn tunnel_health_ignores_streamer_listener_but_requires_host_control() {
+        let streamer = StreamerProbe::RunningNotListening;
+        assert!(tunnel_layers_available(
+            true, true, true, true, true, &streamer
+        ));
+        assert!(!tunnel_layers_available(
+            false, true, true, true, true, &streamer
+        ));
+        assert!(!tunnel_layers_available(
+            true, false, true, true, true, &streamer
+        ));
     }
 
     #[test]
@@ -1837,6 +2389,77 @@ mod tests {
         task.abort();
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn admin_stop_reaches_android_before_delayed_repair_drain() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = AppPaths::discover(Some(directory.path().to_owned())).unwrap();
+        let token = SessionId([0x6c; 16]).to_string();
+        fs::write(&paths.admin_token, &token).unwrap();
+        let session = SessionId([0x6d; 16]);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bind = listener.local_addr().unwrap();
+        let control = ControlServer::new(ControlConfig {
+            bind,
+            session_id: session,
+        })
+        .unwrap();
+        let state = control.state();
+        let control_task = tokio::spawn(control.clone().serve_on(listener));
+        let mut android = tokio::net::TcpStream::connect(bind).await.unwrap();
+        Frame::new(MessageType::Hello, session, Vec::new())
+            .write_to(&mut android)
+            .await
+            .unwrap();
+        Frame::read_from(&mut android).await.unwrap();
+        Frame::new(MessageType::Started, session, Vec::new())
+            .write_to(&mut android)
+            .await
+            .unwrap();
+        time::timeout(Duration::from_secs(1), async {
+            while state.lock().await.state() != HostState::Connected {
+                time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let monitor = AdbHealthMonitor::default();
+        let delayed_repair = monitor.operation.clone().lock_owned().await;
+        let admin = AdminServer::new(
+            paths.clone(),
+            token,
+            control.command_handle(),
+            monitor,
+            Arc::new(Notify::new()),
+        );
+        let admin_task = tokio::spawn(admin.serve());
+        wait_for_unix_socket(&paths.admin_socket).await;
+        let request_paths = paths.clone();
+        let stop_request = tokio::spawn(async move {
+            admin_command(&request_paths, "stop", Duration::from_secs(2)).await
+        });
+
+        let stop = time::timeout(Duration::from_millis(250), Frame::read_from(&mut android))
+            .await
+            .expect("STOP must not wait behind mapping repair")
+            .unwrap();
+        assert_eq!(stop.message_type, MessageType::Stop);
+        Frame::new(MessageType::Stopped, session, Vec::new())
+            .write_to(&mut android)
+            .await
+            .unwrap();
+        time::sleep(Duration::from_millis(25)).await;
+        assert!(!stop_request.is_finished());
+        drop(delayed_repair);
+        let response = stop_request.await.unwrap().unwrap();
+        assert!(response.ok);
+        assert!(response.repairs_suppressed);
+
+        admin_task.abort();
+        control_task.abort();
+    }
+
     #[cfg(target_os = "windows")]
     #[tokio::test]
     async fn windows_named_pipe_survives_concurrent_capacity() {
@@ -1968,14 +2591,18 @@ mod tests {
     }
 
     #[test]
-    fn adb_health_backoff_caps_at_one_second() {
-        let maximum = Duration::from_secs(1);
+    fn adb_health_backoff_caps_at_five_seconds() {
+        let maximum = Duration::from_secs(5);
         let first = next_backoff(Duration::from_millis(250), maximum);
         let second = next_backoff(first, maximum);
         let third = next_backoff(second, maximum);
+        let fourth = next_backoff(third, maximum);
+        let fifth = next_backoff(fourth, maximum);
         assert_eq!(first, Duration::from_millis(500));
-        assert_eq!(second, maximum);
-        assert_eq!(third, maximum);
+        assert_eq!(second, Duration::from_secs(1));
+        assert_eq!(third, Duration::from_secs(2));
+        assert_eq!(fourth, Duration::from_secs(4));
+        assert_eq!(fifth, maximum);
     }
 
     #[test]
@@ -2032,22 +2659,9 @@ mod tests {
             Duration::ZERO,
         );
         let monitor = AdbHealthMonitor::default();
-        let task = tokio::spawn(monitor.clone().run(
-            adb,
-            control.command_handle(),
-            store,
-            diagnostics,
-        ));
-
-        time::timeout(Duration::from_secs(1), async {
-            while monitor.snapshot().reconnect_generation == 0 {
-                time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .unwrap();
-        monitor.suppress_repairs().await;
-        task.await.unwrap();
+        monitor
+            .reconcile(&adb, &control.command_handle(), &store, &diagnostics, true)
+            .await;
 
         assert_eq!(monitor.snapshot().reconnect_generation, 1);
         assert!(monitor.snapshot().mappings_healthy);
@@ -2059,6 +2673,9 @@ mod tests {
                     && !args.iter().any(|argument| argument == "--remove")
             }));
         }
+        assert!(!calls
+            .iter()
+            .any(|args| args.iter().any(|argument| argument == "get-state")));
     }
 
     #[tokio::test]
@@ -2084,11 +2701,160 @@ mod tests {
         let monitor = AdbHealthMonitor::default();
         monitor.suppress_repairs().await;
         monitor
-            .clone()
-            .run(adb, control.command_handle(), store, diagnostics)
+            .reconcile(&adb, &control.command_handle(), &store, &diagnostics, true)
             .await;
 
         assert!(executor.calls.lock().unwrap().is_empty());
         assert!(monitor.snapshot().repair_suppressed);
+    }
+
+    #[tokio::test]
+    async fn explicit_stop_preempts_multi_mapping_repair_between_commands() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = AppPaths::discover(Some(directory.path().to_owned())).unwrap();
+        let diagnostics = Diagnostics::open(&paths.logs).unwrap();
+        let store = StateStore::new(&paths.status);
+        let session = SessionId([0x7b; 16]);
+        let control = ControlServer::new(ControlConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            session_id: session,
+        })
+        .unwrap();
+        control
+            .state()
+            .lock()
+            .await
+            .peer_started(session, std::time::Instant::now())
+            .unwrap();
+        let executor = Arc::new(MonitorMockAdb::default());
+        executor.mapping_delay_ms.store(75, Ordering::Relaxed);
+        let adb = AdbController::with_timing(
+            executor.clone(),
+            Duration::from_millis(200),
+            Duration::from_millis(200),
+            Duration::ZERO,
+        );
+        let monitor = AdbHealthMonitor::default();
+        let reconcile_monitor = monitor.clone();
+        let reconcile_control = control.command_handle();
+        let reconcile_store = store.clone();
+        let reconcile_diagnostics = diagnostics.clone();
+        let reconcile_adb = adb.clone();
+        let repair = tokio::spawn(async move {
+            reconcile_monitor
+                .reconcile(
+                    &reconcile_adb,
+                    &reconcile_control,
+                    &reconcile_store,
+                    &reconcile_diagnostics,
+                    true,
+                )
+                .await;
+        });
+        time::timeout(Duration::from_secs(1), async {
+            while executor.mapping_adds.load(Ordering::Relaxed) == 0 {
+                time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        monitor.suppress_repairs().await;
+        repair.await.unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(executor.mapping_adds.load(Ordering::Relaxed), 1);
+        assert!(monitor.snapshot().repair_suppressed);
+    }
+
+    #[test]
+    fn track_devices_decoder_handles_every_frame_split_and_empty_snapshot() {
+        let connected = b"0016private-serial\tdevice\n";
+        let stream = [connected.as_slice(), b"0000"].concat();
+        for split in 0..=stream.len() {
+            let mut decoder = TrackDevicesDecoder::default();
+            let mut updates = decoder.push(&stream[..split]).unwrap();
+            updates.extend(decoder.push(&stream[split..]).unwrap());
+            assert_eq!(updates, vec![true, false], "split at {split}");
+        }
+        let mut decoder = TrackDevicesDecoder::default();
+        assert_eq!(decoder.push(&stream).unwrap(), vec![true, false]);
+        let mut decoder = TrackDevicesDecoder::default();
+        let mut updates = Vec::new();
+        for byte in &stream {
+            updates.extend(decoder.push(std::slice::from_ref(byte)).unwrap());
+        }
+        assert_eq!(updates, vec![true, false]);
+    }
+
+    #[test]
+    fn track_devices_decoder_supports_headered_and_headerless_text_fallback() {
+        let mut decoder = TrackDevicesDecoder::default();
+        let first = b"List of devices attached\r\nprivate-serial\tdevice product:quest\r\n\r\n";
+        let mut updates = decoder.push(&first[..7]).unwrap();
+        updates.extend(decoder.push(&first[7..]).unwrap());
+        assert_eq!(updates, vec![true]);
+
+        let mut decoder = TrackDevicesDecoder::default();
+        assert_eq!(
+            decoder
+                .push(b"private-serial\tunauthorized\n\nprivate-serial\tdevice\n\n")
+                .unwrap(),
+            vec![false, true]
+        );
+    }
+
+    #[test]
+    fn malformed_or_oversized_framed_track_output_fails_closed() {
+        let mut malformed = TrackDevicesDecoder::default();
+        assert_eq!(malformed.push(b"0000").unwrap(), vec![false]);
+        assert_eq!(
+            malformed.push(b"00g1"),
+            Err(TrackDevicesDecodeError::InvalidLength)
+        );
+        let mut oversized = TrackDevicesDecoder::default();
+        assert_eq!(
+            oversized.push(b"ffff"),
+            Err(TrackDevicesDecodeError::Oversized(65_535))
+        );
+        let mut invalid_utf8 = TrackDevicesDecoder::default();
+        assert_eq!(
+            invalid_utf8.push(b"0001\xff"),
+            Err(TrackDevicesDecodeError::InvalidUtf8)
+        );
+    }
+
+    #[tokio::test]
+    async fn tracker_failure_clears_active_and_device_state_during_backoff() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = AppPaths::discover(Some(directory.path().to_owned())).unwrap();
+        let diagnostics = Diagnostics::open(&paths.logs).unwrap();
+        let store = StateStore::new(&paths.status);
+        let session = SessionId([0x7a; 16]);
+        let control = ControlServer::new(ControlConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            session_id: session,
+        })
+        .unwrap();
+        control
+            .state()
+            .lock()
+            .await
+            .peer_started(session, std::time::Instant::now())
+            .unwrap();
+        let monitor = AdbHealthMonitor::default();
+        monitor.update_status(true, true, true, None);
+        monitor
+            .track_failed(
+                &control.command_handle(),
+                &store,
+                &diagnostics,
+                "track_decode_failed",
+            )
+            .await;
+        let snapshot = monitor.snapshot();
+        assert!(!snapshot.active);
+        assert!(!snapshot.device_available);
+        assert!(!snapshot.mappings_healthy);
     }
 }

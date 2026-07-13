@@ -26,8 +26,8 @@ pub const ANDROID_VPN_SERVICE: &str = "com.genymobile.gnirehtet/.v4.VdLinkVpnSer
 pub const ACTION_START_V4: &str = "com.genymobile.gnirehtet.v4.START";
 pub const ACTION_STOP_V4: &str = "com.genymobile.gnirehtet.v4.STOP";
 pub const VIRTUAL_DESKTOP_PACKAGE: &str = "VirtualDesktop.Android";
-pub const ANDROID_VERSION_CODE: &str = "44";
-pub const ANDROID_VERSION_NAME: &str = "4.0.1";
+pub const ANDROID_VERSION_CODE: &str = "45";
+pub const ANDROID_VERSION_NAME: &str = "4.0.2";
 pub const PLATFORM_TOOLS_VERSION: &str = "37.0.0";
 pub const PLATFORM_TOOLS_WINDOWS_URL: &str =
     "https://dl.google.com/android/repository/platform-tools_r37.0.0-win.zip";
@@ -596,6 +596,14 @@ impl AdbController {
         }
     }
 
+    /// Returns a clone with a tighter deadline for routine background mapping
+    /// health. Public start/stop/install commands retain their longer bounds.
+    pub fn with_mapping_timeout(&self, timeout: Duration) -> Self {
+        let mut controller = self.clone();
+        controller.mapping_timeout = controller.mapping_timeout.min(timeout);
+        controller
+    }
+
     pub fn install_matching_apk(&self, apk: &Path) -> Result<(), TransactionError> {
         self.require_device()
             .map_err(|failure| TransactionError::single("device_check", failure))?;
@@ -878,7 +886,7 @@ impl AdbController {
         }
     }
 
-    fn add_mapping(&self, mapping: ReverseMapping) -> Result<(), AdbError> {
+    pub(crate) fn add_mapping(&self, mapping: ReverseMapping) -> Result<(), AdbError> {
         self.run_checked_with(
             &[
                 "-d".into(),
@@ -1559,7 +1567,7 @@ mod tests {
             Ok(AdbOutput::success("Package not found")),
             Ok(AdbOutput::success("Success")),
             Ok(AdbOutput::success(
-                "versionCode=44 minSdk=29 targetSdk=36\nversionName=4.0.1\n",
+                "versionCode=45 minSdk=29 targetSdk=36\nversionName=4.0.2\n",
             )),
         ]));
         AdbController::new(mock.clone())
@@ -1599,7 +1607,7 @@ mod tests {
             Ok(AdbOutput::success("Package not found")),
             Ok(AdbOutput::success("Success")),
             Ok(AdbOutput::success(
-                "versionCode=44 minSdk=29 targetSdk=36\nversionName=4.0.1\n",
+                "versionCode=45 minSdk=29 targetSdk=36\nversionName=4.0.2\n",
             )),
         ]));
         AdbController::new(mock.clone())
@@ -1622,7 +1630,7 @@ mod tests {
         let mock = Arc::new(MockAdb::with_results(vec![
             Ok(AdbOutput::success("device")),
             Ok(AdbOutput::success(
-                "versionCode=44 minSdk=29 targetSdk=36\nversionName=4.0.1\n",
+                "versionCode=45 minSdk=29 targetSdk=36\nversionName=4.0.2\n",
             )),
         ]));
         AdbController::new(mock.clone())
@@ -1673,6 +1681,24 @@ mod tests {
             "UsbFfs tcp:31416 tcp:31416\nUsbFfs tcp:31417 tcp:31417\nUsbFfs tcp:31418 tcp:31418\n";
         let mock = Arc::new(MockAdb::with_results(vec![Ok(AdbOutput::success(stdout))]));
         assert!(controller(mock).mapping_health().unwrap().is_healthy());
+    }
+
+    #[test]
+    fn background_mapping_timeout_is_tightened_without_changing_public_deadlines() {
+        let stdout =
+            "UsbFfs tcp:31416 tcp:31416\nUsbFfs tcp:31417 tcp:31417\nUsbFfs tcp:31418 tcp:31418\n";
+        let mock = Arc::new(MockAdb::with_results(vec![Ok(AdbOutput::success(stdout))]));
+        AdbController::new(mock.clone())
+            .with_mapping_timeout(Duration::from_millis(500))
+            .mapping_health()
+            .unwrap();
+        assert_eq!(
+            mock.timeouts.lock().unwrap().as_slice(),
+            &[(
+                strings(&["-d", "reverse", "--list"]),
+                Duration::from_millis(500)
+            )]
+        );
     }
 
     #[test]

@@ -9,6 +9,7 @@ pub const MAGIC: [u8; 4] = *b"GNR4";
 pub const VERSION: u16 = 4;
 pub const HEADER_LEN: usize = 28;
 pub const MAX_PAYLOAD_LEN: usize = 64 * 1024;
+pub const METRICS_V1_PAYLOAD_LEN: usize = 60;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct SessionId(pub [u8; 16]);
@@ -100,6 +101,7 @@ pub enum MessageType {
     Error = 8,
     Suspend = 9,
     Suspended = 10,
+    Metrics = 11,
 }
 
 impl TryFrom<u16> for MessageType {
@@ -117,9 +119,93 @@ impl TryFrom<u16> for MessageType {
             8 => Ok(Self::Error),
             9 => Ok(Self::Suspend),
             10 => Ok(Self::Suspended),
+            11 => Ok(Self::Metrics),
             other => Err(ProtocolError::UnknownMessageType(other)),
         }
     }
+}
+
+/// Payload-free traffic and latency counters reported by the Android peer.
+///
+/// The fixed-width, big-endian layout is intentionally small and append-only:
+/// `u16 version`, `u16 flags`, followed by the seven `u64` fields below.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AndroidMetricsV1 {
+    pub tx_packets: u64,
+    pub tx_bytes: u64,
+    pub rx_packets: u64,
+    pub rx_bytes: u64,
+    pub control_rtt_samples: u64,
+    pub control_rtt_p99_us: u64,
+    pub control_rtt_max_us: u64,
+}
+
+impl AndroidMetricsV1 {
+    pub const VERSION: u16 = 1;
+    pub const FLAGS: u16 = 0;
+
+    pub fn encode(&self) -> [u8; METRICS_V1_PAYLOAD_LEN] {
+        let mut output = [0; METRICS_V1_PAYLOAD_LEN];
+        output[0..2].copy_from_slice(&Self::VERSION.to_be_bytes());
+        output[2..4].copy_from_slice(&Self::FLAGS.to_be_bytes());
+        for (index, value) in [
+            self.tx_packets,
+            self.tx_bytes,
+            self.rx_packets,
+            self.rx_bytes,
+            self.control_rtt_samples,
+            self.control_rtt_p99_us,
+            self.control_rtt_max_us,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let offset = 4 + index * 8;
+            output[offset..offset + 8].copy_from_slice(&value.to_be_bytes());
+        }
+        output
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self, MetricsError> {
+        if payload.len() != METRICS_V1_PAYLOAD_LEN {
+            return Err(MetricsError::InvalidLength(payload.len()));
+        }
+        let version = u16::from_be_bytes([payload[0], payload[1]]);
+        if version != Self::VERSION {
+            return Err(MetricsError::UnsupportedVersion(version));
+        }
+        let flags = u16::from_be_bytes([payload[2], payload[3]]);
+        if flags != Self::FLAGS {
+            return Err(MetricsError::UnsupportedFlags(flags));
+        }
+        let value = |index: usize| {
+            let offset = 4 + index * 8;
+            u64::from_be_bytes(
+                payload[offset..offset + 8]
+                    .try_into()
+                    .expect("fixed metrics field"),
+            )
+        };
+        Ok(Self {
+            tx_packets: value(0),
+            tx_bytes: value(1),
+            rx_packets: value(2),
+            rx_bytes: value(3),
+            control_rtt_samples: value(4),
+            control_rtt_p99_us: value(5),
+            control_rtt_max_us: value(6),
+        })
+    }
+}
+
+#[derive(Debug, Error, Eq, PartialEq)]
+pub enum MetricsError {
+    #[error("METRICS payload must be {METRICS_V1_PAYLOAD_LEN} bytes, got {0}")]
+    InvalidLength(usize),
+    #[error("unsupported METRICS payload version {0}")]
+    UnsupportedVersion(u16),
+    #[error("unsupported METRICS flags 0x{0:04x}")]
+    UnsupportedFlags(u16),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -269,6 +355,50 @@ mod tests {
             let frame = Frame::new(message_type, SessionId([0x6a; 16]), Vec::new());
             assert_eq!(Frame::decode(&frame.encode().unwrap()).unwrap(), frame);
         }
+    }
+
+    #[test]
+    fn metrics_v1_is_fixed_width_big_endian_and_round_trips() {
+        let metrics = AndroidMetricsV1 {
+            tx_packets: 1,
+            tx_bytes: 2,
+            rx_packets: 3,
+            rx_bytes: 4,
+            control_rtt_samples: 5,
+            control_rtt_p99_us: 6,
+            control_rtt_max_us: 7,
+        };
+        let payload = metrics.encode();
+        assert_eq!(payload.len(), METRICS_V1_PAYLOAD_LEN);
+        assert_eq!(&payload[0..4], &[0, 1, 0, 0]);
+        assert_eq!(&payload[4..12], &1u64.to_be_bytes());
+        assert_eq!(AndroidMetricsV1::decode(&payload).unwrap(), metrics);
+        let frame = Frame::new(
+            MessageType::Metrics,
+            SessionId([0x6b; 16]),
+            payload.to_vec(),
+        );
+        assert_eq!(Frame::decode(&frame.encode().unwrap()).unwrap(), frame);
+    }
+
+    #[test]
+    fn metrics_v1_rejects_malformed_payloads_without_allocating() {
+        assert_eq!(
+            AndroidMetricsV1::decode(&[0; 59]),
+            Err(MetricsError::InvalidLength(59))
+        );
+        let mut payload = AndroidMetricsV1::default().encode();
+        payload[1] = 2;
+        assert_eq!(
+            AndroidMetricsV1::decode(&payload),
+            Err(MetricsError::UnsupportedVersion(2))
+        );
+        let mut payload = AndroidMetricsV1::default().encode();
+        payload[3] = 1;
+        assert_eq!(
+            AndroidMetricsV1::decode(&payload),
+            Err(MetricsError::UnsupportedFlags(1))
+        );
     }
 
     #[test]

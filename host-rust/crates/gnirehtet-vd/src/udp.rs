@@ -265,7 +265,9 @@ impl Default for FwdUdpConfig {
         Self {
             queue_capacity: 64,
             max_queue_age: Duration::from_millis(10),
-            idle_timeout: Duration::from_secs(60),
+            // Android owns idle expiry at 120 seconds. Keep the host side
+            // slightly longer so an association is never torn down first.
+            idle_timeout: Duration::from_secs(130),
             association_byte_budget: DEFAULT_ASSOCIATION_BYTE_BUDGET,
         }
     }
@@ -696,6 +698,14 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+
+    #[test]
+    fn host_udp_association_outlives_android_idle_expiry() {
+        assert_eq!(
+            FwdUdpConfig::default().idle_timeout,
+            Duration::from_secs(130)
+        );
+    }
 
     #[test]
     fn matches_pinned_hev_ipv4_wire_shape() {

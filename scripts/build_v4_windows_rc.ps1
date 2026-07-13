@@ -24,7 +24,7 @@ function Invoke-Checked {
     }
 }
 
-foreach ($command in @("cargo", "python")) {
+foreach ($command in @("cargo", "llvm-readobj", "python")) {
     if (-not (Get-Command $command -ErrorAction SilentlyContinue)) {
         throw "required command is unavailable: $command"
     }
@@ -40,10 +40,59 @@ New-Item -ItemType Directory -Path $output | Out-Null
 
 $env:GNIREHTET_VD_APK = $apk
 $env:CARGO_INCREMENTAL = "0"
-$env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS = "-C target-feature=+crt-static -C link-arg=/Brepro"
+$rustFlags = [System.Collections.Generic.List[string]]::new()
+foreach ($flag in @("-C", "target-feature=+crt-static", "-C", "link-arg=/Brepro")) {
+    $rustFlags.Add($flag)
+}
+$remapCandidates = @(
+    [PSCustomObject]@{ Source = $repoRoot; Target = "/source/quest-vd-wired" }
+    [PSCustomObject]@{ Source = $env:USERPROFILE; Target = "/source/user" }
+    [PSCustomObject]@{ Source = $env:HOME; Target = "/source/user" }
+    [PSCustomObject]@{ Source = $env:CARGO_HOME; Target = "/source/cargo" }
+    [PSCustomObject]@{ Source = $env:RUSTUP_HOME; Target = "/source/rustup" }
+    [PSCustomObject]@{ Source = $env:TEMP; Target = "/source/temp" }
+    [PSCustomObject]@{ Source = $env:TMP; Target = "/source/temp" }
+)
+$seenRemapRoots = @{}
+foreach ($candidate in $remapCandidates) {
+    $source = $candidate.Source
+    if ([string]::IsNullOrWhiteSpace($source)) { continue }
+    $source = [System.IO.Path]::GetFullPath($source).TrimEnd([char[]]@('\', '/'))
+    if ($source.Length -lt 4) { continue }
+    $key = $source.ToLowerInvariant()
+    if ($seenRemapRoots.ContainsKey($key)) { continue }
+    $seenRemapRoots[$key] = $true
+    $rustFlags.Add("--remap-path-prefix")
+    $rustFlags.Add("${source}=$($candidate.Target)")
+}
+$env:CARGO_ENCODED_RUSTFLAGS = [string]::Join([char]0x1f, $rustFlags)
+Remove-Item Env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS -ErrorAction SilentlyContinue
 if (-not $env:SOURCE_DATE_EPOCH) {
     $env:SOURCE_DATE_EPOCH = (& git -C $repoRoot show -s --format=%ct HEAD).Trim()
     if ($LASTEXITCODE -ne 0) { throw "could not determine SOURCE_DATE_EPOCH" }
+}
+
+$localRoots = @(
+    $repoRoot,
+    $env:USERPROFILE,
+    $env:HOME,
+    $env:CARGO_HOME,
+    $env:RUSTUP_HOME,
+    $env:TEMP,
+    $env:TMP
+) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique
+$llvmReadObj = Get-Command "llvm-readobj" -ErrorAction Stop
+function Test-ReleaseExecutable {
+    param([string]$Executable)
+    $arguments = @(
+        (Join-Path $repoRoot "scripts\verify_windows_release.py"),
+        $Executable
+    )
+    foreach ($localRoot in $localRoots) {
+        $arguments += @("--local-root", $localRoot)
+    }
+    $arguments += @("--llvm-readobj", $llvmReadObj.Source)
+    Invoke-Checked "python" $arguments
 }
 
 Invoke-Checked "cargo" @("fmt", "--manifest-path", $manifest, "--all", "--", "--check")
@@ -56,6 +105,7 @@ Invoke-Checked "python" @((Join-Path $repoRoot "scripts\normalize_windows_pe.py"
 if (-not (Test-Path -LiteralPath $builtExe -PathType Leaf)) {
     throw "Windows x64 host executable was not produced"
 }
+Test-ReleaseExecutable $builtExe
 $firstExe = Join-Path $output "gnirehtet-vd.exe"
 Copy-Item -LiteralPath $builtExe -Destination $firstExe
 Invoke-Checked "python" @((Join-Path $repoRoot "scripts\verify_embedded_apk.py"), $firstExe, $apk)
@@ -63,6 +113,7 @@ Invoke-Checked "python" @((Join-Path $repoRoot "scripts\verify_embedded_apk.py")
 Invoke-Checked "cargo" @("clean", "--manifest-path", $manifest, "--target", $target)
 Invoke-Checked "cargo" @("build", "--manifest-path", $manifest, "--locked", "--target", $target, "--release")
 Invoke-Checked "python" @((Join-Path $repoRoot "scripts\normalize_windows_pe.py"), $builtExe)
+Test-ReleaseExecutable $builtExe
 $firstHash = (Get-FileHash -LiteralPath $firstExe -Algorithm SHA256).Hash.ToLowerInvariant()
 $secondHash = (Get-FileHash -LiteralPath $builtExe -Algorithm SHA256).Hash.ToLowerInvariant()
 @(
@@ -76,6 +127,10 @@ if ($firstHash -ne $secondHash) {
 }
 Invoke-Checked "python" @((Join-Path $repoRoot "scripts\verify_embedded_apk.py"), $builtExe, $apk)
 
+$rawSbom = Join-Path $repoRoot "host-rust\crates\gnirehtet-vd\gnirehtet-vd.cdx.json"
+if (Test-Path -LiteralPath $rawSbom) {
+    Remove-Item -LiteralPath $rawSbom -Force
+}
 Invoke-Checked "cargo" @(
     "cyclonedx",
     "--manifest-path", $manifest,
@@ -85,11 +140,17 @@ Invoke-Checked "cargo" @(
     "--spec-version", "1.5",
     "--override-filename", "gnirehtet-vd.cdx"
 )
-$sboms = @(Get-ChildItem -LiteralPath (Join-Path $repoRoot "host-rust") -Recurse -Filter "gnirehtet-vd*.cdx.json")
-if ($sboms.Count -ne 1) {
-    throw "expected exactly one Rust CycloneDX SBOM, found $($sboms.Count)"
+if (-not (Test-Path -LiteralPath $rawSbom -PathType Leaf)) {
+    throw "Rust CycloneDX SBOM was not produced at the expected path"
 }
-Copy-Item -LiteralPath $sboms[0].FullName -Destination (Join-Path $output "gnirehtet-vd-rust.cdx.json")
+Invoke-Checked "python" @(
+    (Join-Path $repoRoot "scripts\sanitize_rust_sbom.py"),
+    $rawSbom,
+    (Join-Path $output "gnirehtet-vd-rust.cdx.json"),
+    "--manifest", $manifest,
+    "--repository-root", $repoRoot
+)
+Remove-Item -LiteralPath $rawSbom -Force
 Invoke-Checked "python" @(
     (Join-Path $repoRoot "scripts\generate_rust_notices.py"),
     "--manifest", $manifest,
