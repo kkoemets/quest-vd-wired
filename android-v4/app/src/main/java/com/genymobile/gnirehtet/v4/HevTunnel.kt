@@ -120,13 +120,13 @@ internal fun renderHevConfig(mtu: Int, socksPort: Int, udpPort: Int): String {
           udp: 'tcp'
         misc:
           task-stack-size: 65536
-          tcp-buffer-size: 65536
+          tcp-buffer-size: 262112
           udp-recv-buffer-size: 524288
           udp-copy-buffer-nums: 32
-          max-session-count: 256
+          max-session-count: 64
           connect-timeout: 5000
-          tcp-read-write-timeout: 300000
-          udp-read-write-timeout: 15000
+          tcp-read-write-timeout: 0
+          udp-read-write-timeout: 120000
           log-level: warn
         """.trimIndent()
 }

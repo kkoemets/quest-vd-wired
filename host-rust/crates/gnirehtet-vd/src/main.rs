@@ -1,5 +1,4 @@
 use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream as StdTcpStream},
     path::PathBuf,
     process::{Child, Command as ProcessCommand, Stdio},
     sync::Arc,
@@ -22,8 +21,7 @@ use clap::{Args, Parser, Subcommand};
 use gnirehtet_vd::{
     adb::{
         repair_adb_if_missing, resolve_adb_program, AdbController, SystemAdb,
-        ADB_MAPPING_COMMAND_TIMEOUT, CONTROL_PORT, SOCKS_PORT, UDP_STREAM_PORT,
-        VIRTUAL_DESKTOP_PACKAGE,
+        ADB_MAPPING_COMMAND_TIMEOUT, VIRTUAL_DESKTOP_PACKAGE,
     },
     diagnostics::Diagnostics,
     embedded,
@@ -128,10 +126,16 @@ async fn main() -> Result<()> {
 
     match cli.command {
         None => no_argument_entry(paths, adb_program, adb).await,
-        Some(Command::Daemon(args)) => run_foreground(args.session, paths, adb).await,
+        Some(Command::Daemon(args)) => run_foreground(args.session, paths, adb, adb_program).await,
         Some(command) => {
             #[cfg(target_os = "windows")]
             {
+                if command_runs_client_side(&command) {
+                    let output =
+                        execute_public_command(&adb_program, &paths, &adb, command).await?;
+                    println!("{output}");
+                    return Ok(());
+                }
                 let command = BrokerCommand::try_from(command)?;
                 let response = send_broker_command(&paths, &adb_program, command).await?;
                 emit_broker_response(response)
@@ -144,6 +148,16 @@ async fn main() -> Result<()> {
             }
         }
     }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn command_runs_client_side(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Diagnostics(DiagnosticsArgs {
+            command: DiagnosticsCommand::Capture { .. }
+        })
+    )
 }
 
 async fn execute_public_command(
@@ -161,7 +175,7 @@ async fn execute_public_command(
             let repaired_adb = AdbController::new(Arc::new(SystemAdb::new(repaired_program)));
             repair(paths, &repaired_adb)
         }
-        Command::Doctor => Ok(serde_json::to_string_pretty(&doctor(adb))?),
+        Command::Doctor => Ok(serde_json::to_string_pretty(&doctor(paths, adb))?),
         Command::Diagnostics(args) => diagnostics(paths, adb, args).await,
         Command::Version => Ok(format!("gnirehtet-vd {} (GNR4)", env!("CARGO_PKG_VERSION"))),
         Command::Daemon(_) => bail!("internal daemon commands cannot enter the public broker"),
@@ -527,19 +541,29 @@ impl BrokerContext {
 
     async fn capture_diagnostics(&self, duration: u64) -> Result<String> {
         let diagnostics = Diagnostics::open(&self.paths.logs)?;
-        let deadline = Instant::now() + Duration::from_secs(duration);
-        while Instant::now() < deadline {
-            {
-                let _adb_lane = self.adb_lane.lock().await;
-                let environment = self.environment()?;
-                diagnostics.capture_process_sample()?;
-                diagnostics.record(
-                    "doctor_snapshot",
-                    serde_json::to_value(doctor(&environment.adb))?,
-                )?;
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
+        let capture_id = SessionId::random().to_string();
+        diagnostics.record(
+            "capture_start",
+            json!({"capture_id": &capture_id, "duration_seconds": duration}),
+        )?;
+        {
+            let _adb_lane = self.adb_lane.lock().await;
+            let environment = self.environment()?;
+            diagnostics.record(
+                "doctor_snapshot",
+                json!({"capture_id": &capture_id, "boundary": "start", "report": doctor(&self.paths, &environment.adb)}),
+            )?;
         }
+        tokio::time::sleep(Duration::from_secs(duration)).await;
+        {
+            let _adb_lane = self.adb_lane.lock().await;
+            let environment = self.environment()?;
+            diagnostics.record(
+                "doctor_snapshot",
+                json!({"capture_id": &capture_id, "boundary": "end", "report": doctor(&self.paths, &environment.adb)}),
+            )?;
+        }
+        diagnostics.record("capture_end", json!({"capture_id": &capture_id}))?;
         Ok(format!("captured {duration}s of local diagnostics"))
     }
 
@@ -564,7 +588,7 @@ impl BrokerContext {
             )
             .await
         } else {
-            let report = doctor(&environment.adb);
+            let report = doctor(&self.paths, &environment.adb);
             if let Err(error) = report.adb_state {
                 bail!("Quest connection check failed: {error}");
             }
@@ -766,8 +790,13 @@ fn emit_broker_response(response: BrokerResponse) -> Result<()> {
     Ok(())
 }
 
-async fn run_foreground(session_id: SessionId, paths: AppPaths, adb: AdbController) -> Result<()> {
-    HostRuntime::new(RuntimeConfig::new(session_id, paths, adb))?
+async fn run_foreground(
+    session_id: SessionId,
+    paths: AppPaths,
+    adb: AdbController,
+    adb_program: PathBuf,
+) -> Result<()> {
+    HostRuntime::new(RuntimeConfig::new(session_id, paths, adb, adb_program))?
         .run()
         .await?;
     Ok(())
@@ -793,7 +822,7 @@ async fn start(
     let session = SessionId::random();
     let mut daemon = spawn_daemon(daemon_adb, paths, session)?;
     let daemon_pid = daemon.id();
-    if let Err(error) = wait_for_listeners(paths, daemon_pid).await {
+    if let Err(error) = wait_for_runtime_ready(paths, daemon_pid).await {
         let _ = terminate_spawned_daemon(&mut daemon);
         return Err(error);
     }
@@ -841,6 +870,9 @@ async fn start(
 async fn stop(paths: &AppPaths, adb: &AdbController) -> Result<String> {
     let _operation = OperationGuard::acquire(&paths.operation_lock)
         .context("another start/stop/repair operation is active")?;
+    // The health monitor uses sub-second mapping commands and checks the Stop
+    // flag between them. This envelope still covers one in-flight monitor
+    // command plus the six-second peer acknowledgement deadline.
     let control_stop = admin_command(paths, "stop", Duration::from_secs(8)).await;
     let stop_result = match control_stop {
         Ok(response) if admin_stop_acknowledges_suppression(&response) => {
@@ -950,6 +982,7 @@ async fn status(paths: &AppPaths, adb: &AdbController, args: StatusArgs) -> Resu
             }
         }
     } else {
+        status.runtime_ready = false;
         reflect_missing_runtime(&mut status.lifecycle);
     }
     let android = adb.android_status();
@@ -1048,12 +1081,21 @@ async fn diagnostics(
     let diagnostics = Diagnostics::open(&paths.logs)?;
     match args.command {
         DiagnosticsCommand::Capture { duration } => {
-            let deadline = Instant::now() + Duration::from_secs(duration);
-            while Instant::now() < deadline {
-                diagnostics.capture_process_sample()?;
-                diagnostics.record("doctor_snapshot", serde_json::to_value(doctor(adb))?)?;
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
+            let capture_id = SessionId::random().to_string();
+            diagnostics.record(
+                "capture_start",
+                json!({"capture_id": &capture_id, "duration_seconds": duration}),
+            )?;
+            diagnostics.record(
+                "doctor_snapshot",
+                json!({"capture_id": &capture_id, "boundary": "start", "report": doctor(paths, adb)}),
+            )?;
+            tokio::time::sleep(Duration::from_secs(duration)).await;
+            diagnostics.record(
+                "doctor_snapshot",
+                json!({"capture_id": &capture_id, "boundary": "end", "report": doctor(paths, adb)}),
+            )?;
+            diagnostics.record("capture_end", json!({"capture_id": &capture_id}))?;
             Ok(format!("captured {duration}s of local diagnostics"))
         }
         DiagnosticsCommand::Export { path } => {
@@ -1099,29 +1141,21 @@ fn terminate_spawned_daemon(child: &mut Child) -> std::io::Result<()> {
     Ok(())
 }
 
-async fn wait_for_listeners(paths: &AppPaths, pid: u32) -> Result<()> {
+async fn wait_for_runtime_ready(paths: &AppPaths, pid: u32) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(3);
-    let addresses = [
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), CONTROL_PORT),
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), SOCKS_PORT),
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), UDP_STREAM_PORT),
-    ];
     while Instant::now() < deadline {
         if !process_is_running(pid) {
             bail!("host daemon exited before binding listeners");
         }
-        let data_ready = addresses.iter().all(|address| {
-            StdTcpStream::connect_timeout(address, Duration::from_millis(100)).is_ok()
+        let persisted_ready = StateStore::new(&paths.status).read().is_ok_and(|status| {
+            status.daemon_pid == Some(pid) && status.daemon_running && status.runtime_ready
         });
-        let admin_ready = admin_command(paths, "status", Duration::from_millis(150))
-            .await
-            .is_ok_and(|response| response.ok);
-        if data_ready && admin_ready {
+        if persisted_ready {
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    bail!("host daemon did not bind its loopback listeners within 3 seconds")
+    bail!("host daemon did not become ready within 3 seconds")
 }
 
 fn runtime_may_be_active(paths: &AppPaths) -> bool {
@@ -1130,15 +1164,6 @@ fn runtime_may_be_active(paths: &AppPaths) -> bool {
         .and_then(|value| value.trim().parse::<u32>().ok())
         .is_some_and(process_is_running);
     lock_owner_running
-        || [CONTROL_PORT, SOCKS_PORT, UDP_STREAM_PORT]
-            .iter()
-            .any(|port| {
-                StdTcpStream::connect_timeout(
-                    &SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), *port),
-                    Duration::from_millis(50),
-                )
-                .is_ok()
-            })
 }
 
 async fn wait_for_daemon_exit(paths: &AppPaths, timeout: Duration) -> Result<()> {
@@ -2690,6 +2715,21 @@ mod tests {
         assert!(command_requires_lifecycle_serialization(&Command::Stop));
         assert!(command_requires_lifecycle_serialization(&Command::Repair));
         assert!(!command_requires_lifecycle_serialization(&Command::Version));
+    }
+
+    #[test]
+    fn diagnostics_capture_waits_in_client_without_occupying_broker_gate() {
+        let capture = Command::Diagnostics(DiagnosticsArgs {
+            command: DiagnosticsCommand::Capture { duration: 600 },
+        });
+        let export = Command::Diagnostics(DiagnosticsArgs {
+            command: DiagnosticsCommand::Export {
+                path: PathBuf::from("bundle.jsonl"),
+            },
+        });
+        assert!(command_runs_client_side(&capture));
+        assert!(!command_runs_client_side(&export));
+        assert!(BrokerGate::default().begin_command().is_some());
     }
 
     #[test]

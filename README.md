@@ -10,24 +10,24 @@ headset.
 
 ## Choose your download
 
-### v4.0.1 — current release
+### v4.0.2 — current release
 
 This is the latest version and the recommended download. It starts from a
 simple icon near the Windows clock and reconnects automatically.
 
-[Download v4.0.1](https://github.com/kkoemets/quest-vd-wired/releases/download/v4.0.1/gnirehtet-v4.0.1-windows-x64.zip)
+[Download v4.0.2](https://github.com/kkoemets/quest-vd-wired/releases/download/v4.0.2/gnirehtet-v4.0.2-windows-x64.zip)
 
 ### v3.1.0 Legacy — older Java version
 
 This is the previous Java version, kept available for users who need to roll
-back. New users should choose v4.0.1.
+back. New users should choose v4.0.2.
 
 [Download v3.1.0 Legacy](https://github.com/kkoemets/quest-vd-wired/releases/download/v3.1.0/gnirehtet-java-v3.1.0.zip)
 
 ### v3.0.0 Legacy — older fallback
 
 This older release remains available as an additional fallback. New users
-should choose v4.0.1 instead.
+should choose v4.0.2 instead.
 
 [Download v3.0.0 Legacy](https://github.com/kkoemets/quest-vd-wired/releases/download/v3.0.0/gnirehtet-java-v3.0.0.zip)
 
@@ -48,9 +48,9 @@ You need:
 The first time you connect the headset, put it on and accept the USB debugging
 prompt. Select **Always allow from this computer** if that choice is shown.
 
-## Use v4.0.1
+## Use v4.0.2
 
-1. Download and extract the v4.0.1 zip.
+1. Download and extract the v4.0.2 zip.
 2. Connect the Quest 3 and accept the USB debugging prompt.
 3. Double-click `gnirehtet-vd.exe`.
 4. Accept the VPN prompt inside the headset if it appears.
@@ -118,13 +118,13 @@ if you want to return the Quest to its normal network setup.
 
 ### An older install will not update
 
-Official v3.1.0 and v4.0.1 releases use the same project signing identity and
+Official v3.1.0 and v4.0.2 releases use the same project signing identity and
 should update in place. Very old builds from another source may need to be
 removed once before installing this project.
 
 ## Current or legacy?
 
-Use **v4.0.1** for the current experience. Use **v3.1.0 Legacy** only if you
+Use **v4.0.2** for the current experience. Use **v3.1.0 Legacy** only if you
 need the older Java version. Both remain available from the Releases page.
 
 ## Privacy

@@ -1,0 +1,95 @@
+diff --git a/src/hev-config.c b/src/hev-config.c
+index 3cd2b71..2b529c8 100644
+--- a/src/hev-config.c
++++ b/src/hev-config.c
+@@ -335,6 +335,9 @@ hev_config_parse_misc (yaml_document_t *doc, yaml_node_t *base)
+     int tcp_rw_timeout = -1;
+     int udp_rw_timeout = -1;
+     int rw_timeout = -1;
++    int tcp_rw_timeout_set = 0;
++    int udp_rw_timeout_set = 0;
++    int rw_timeout_set = 0;
+ 
+     if (!base || YAML_MAPPING_NODE != base->type)
+         return -1;
+@@ -372,12 +375,16 @@ hev_config_parse_misc (yaml_document_t *doc, yaml_node_t *base)
+             max_session_count = strtoul (value, NULL, 10);
+         else if (0 == strcmp (key, "connect-timeout"))
+             connect_timeout = strtoul (value, NULL, 10);
+-        else if (0 == strcmp (key, "read-write-timeout"))
+-            rw_timeout = strtoul (value, NULL, 10);
+-        else if (0 == strcmp (key, "tcp-read-write-timeout"))
+-            tcp_rw_timeout = strtoul (value, NULL, 10);
+-        else if (0 == strcmp (key, "udp-read-write-timeout"))
+-            udp_rw_timeout = strtoul (value, NULL, 10);
++        else if (0 == strcmp (key, "read-write-timeout")) {
++            rw_timeout = strtol (value, NULL, 10);
++            rw_timeout_set = 1;
++        } else if (0 == strcmp (key, "tcp-read-write-timeout")) {
++            tcp_rw_timeout = strtol (value, NULL, 10);
++            tcp_rw_timeout_set = 1;
++        } else if (0 == strcmp (key, "udp-read-write-timeout")) {
++            udp_rw_timeout = strtol (value, NULL, 10);
++            udp_rw_timeout_set = 1;
++        }
+         else if (0 == strcmp (key, "pid-file"))
+             strncpy (pid_file, value, 1024 - 1);
+         else if (0 == strcmp (key, "log-file"))
+@@ -388,14 +395,22 @@ hev_config_parse_misc (yaml_document_t *doc, yaml_node_t *base)
+             limit_nofile = strtol (value, NULL, 10);
+     }
+ 
+-    if (tcp_rw_timeout <= 0)
++    if (!tcp_rw_timeout_set && rw_timeout_set) {
+         tcp_rw_timeout = rw_timeout;
+-    if (udp_rw_timeout <= 0)
++        tcp_rw_timeout_set = 1;
++    }
++    if (!udp_rw_timeout_set && rw_timeout_set) {
+         udp_rw_timeout = rw_timeout;
++        udp_rw_timeout_set = 1;
++    }
+ 
+-    if (tcp_rw_timeout > 0)
+-        tcp_read_write_timeout = tcp_rw_timeout;
+-    if (udp_rw_timeout > 0)
++    if (tcp_rw_timeout_set) {
++        if (tcp_rw_timeout == 0)
++            tcp_read_write_timeout = -1;
++        else if (tcp_rw_timeout > 0)
++            tcp_read_write_timeout = tcp_rw_timeout;
++    }
++    if (udp_rw_timeout_set && udp_rw_timeout > 0)
+         udp_read_write_timeout = udp_rw_timeout;
+ 
+     return 0;
+diff --git a/src/hev-main.c b/src/hev-main.c
+index c6ee57e..d23dca5 100644
+--- a/src/hev-main.c
++++ b/src/hev-main.c
+@@ -42,7 +42,8 @@ hev_socks5_tunnel_main_inner (int tun_fd,
+ 
+     res = hev_config_get_misc_connect_timeout ();
+     hev_socks5_set_connect_timeout (res);
+-    res = hev_config_get_misc_tcp_read_write_timeout ();
++    /* Keep SOCKS negotiation bounded. The per-session TCP data timeout is
++     * installed only after a successful handshake. */
+     hev_socks5_set_tcp_timeout (res);
+     res = hev_config_get_misc_udp_read_write_timeout ();
+     hev_socks5_set_udp_timeout (res);
+diff --git a/src/hev-socks5-session.c b/src/hev-socks5-session.c
+index 5f520e4..8b3f04b 100644
+--- a/src/hev-socks5-session.c
++++ b/src/hev-socks5-session.c
+@@ -51,6 +51,11 @@ hev_socks5_session_run (HevSocks5Session *self)
+         return;
+     }
+ 
++    if (HEV_SOCKS5 (self)->type == HEV_SOCKS5_TYPE_TCP) {
++        res = hev_config_get_misc_tcp_read_write_timeout ();
++        hev_socks5_set_timeout (HEV_SOCKS5 (self), res);
++    }
++
+     iface = HEV_OBJECT_GET_IFACE (self, HEV_SOCKS5_SESSION_TYPE);
+     iface->splicer (self);
+ }

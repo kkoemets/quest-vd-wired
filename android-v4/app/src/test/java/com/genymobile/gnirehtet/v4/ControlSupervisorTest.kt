@@ -3,6 +3,8 @@ package com.genymobile.gnirehtet.v4
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
+import java.net.SocketTimeoutException
+import java.nio.charset.StandardCharsets
 import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
@@ -32,7 +34,9 @@ class ControlSupervisorTest {
             server.use {
                 it.accept().use { connection ->
                     assertEquals("127.0.0.1", connection.inetAddress.hostAddress)
-                    assertEquals(Gnr4MessageType.HELLO, Gnr4.read(connection.getInputStream(), session).type)
+                    val hello = Gnr4.read(connection.getInputStream(), session)
+                    assertEquals(Gnr4MessageType.HELLO, hello.type)
+                    assertEquals(Gnr4.HELLO_CAPABILITIES, String(hello.payload, StandardCharsets.UTF_8))
                     Gnr4.write(
                         connection.getOutputStream(),
                         Gnr4Frame(Gnr4MessageType.HELLO_ACK, session),
@@ -65,6 +69,125 @@ class ControlSupervisorTest {
         supervisor.start()
         assertTrue(connected.await(2, TimeUnit.SECONDS))
         exchange.get(2, TimeUnit.SECONDS)
+        supervisor.close()
+        executor.shutdownNow()
+    }
+
+    @Test
+    fun legacyAndMalformedHelloAcknowledgementsDisableMetricsWithoutDisconnecting() {
+        listOf(
+            ByteArray(0),
+            """{"capabilities":["heartbeat","status","explicit_stop","explicit_suspend"],"protocol":4}"""
+                .toByteArray(StandardCharsets.UTF_8),
+            """{"capabilities":["metrics_v1"]""".toByteArray(StandardCharsets.UTF_8),
+        ).forEachIndexed { index, acknowledgementPayload ->
+            val session = UUID(0x5061728394a5b6c7L, 0x8899aabbccddeeffUL.toLong() + index)
+            val expected = Gnr4Metrics(11, 12, 13, 14, 15, 16, 17)
+            val server = ServerSocket().apply {
+                bind(InetSocketAddress(InetAddress.getByName("127.0.0.1"), 0))
+            }
+            val executor = Executors.newSingleThreadExecutor()
+            val exchange = executor.submit {
+                server.use {
+                    it.accept().use { connection ->
+                        connection.soTimeout = 2_500
+                        assertEquals(Gnr4MessageType.HELLO, Gnr4.read(connection.getInputStream(), session).type)
+                        Gnr4.write(
+                            connection.getOutputStream(),
+                            Gnr4Frame(Gnr4MessageType.HELLO_ACK, session, acknowledgementPayload),
+                        )
+                        assertEquals(Gnr4MessageType.STARTED, Gnr4.read(connection.getInputStream(), session).type)
+                        val heartbeat = Gnr4.read(connection.getInputStream(), session)
+                        assertEquals(Gnr4MessageType.HEARTBEAT, heartbeat.type)
+                        Gnr4.write(connection.getOutputStream(), heartbeat)
+                        connection.soTimeout = 400
+                        try {
+                            val unexpected = Gnr4.read(connection.getInputStream(), session)
+                            throw AssertionError("legacy HELLO_ACK enabled ${unexpected.type}")
+                        } catch (_: SocketTimeoutException) {
+                            Unit
+                        }
+                        connection.soTimeout = 2_000
+                        Gnr4.write(connection.getOutputStream(), Gnr4Frame(Gnr4MessageType.STOP, session))
+                        assertEquals(Gnr4MessageType.STOPPED, Gnr4.read(connection.getInputStream(), session).type)
+                    }
+                }
+            }
+            val connected = CountDownLatch(1)
+            val supervisor = ControlSupervisor(
+                session,
+                server.localPort,
+                object : ControlSupervisor.Listener {
+                    override fun shouldReportStarted(): Boolean = true
+                    override fun onControlConnected() = connected.countDown()
+                    override fun onControlDegraded(error: Exception?) = Unit
+                    override fun onControlRttSample(rttNanos: Long) = Unit
+                    override fun onControlStopRequested(sendStopped: () -> Unit) = sendStopped()
+                },
+                metricsProvider = { expected },
+            )
+
+            supervisor.start()
+            try {
+                assertTrue(connected.await(2, TimeUnit.SECONDS))
+                exchange.get(5, TimeUnit.SECONDS)
+            } finally {
+                supervisor.close()
+                executor.shutdownNow()
+            }
+        }
+    }
+
+    @Test
+    fun sendsBoundedMetricsOnceTheControlLaneIsActive() {
+        val session = UUID.fromString("40516273-8495-a6b7-c8d9-eafb0c1d2e3f")
+        val expected = Gnr4Metrics(11, 12, 13, 14, 15, 16, 17)
+        val server = ServerSocket().apply {
+            bind(InetSocketAddress(InetAddress.getByName("127.0.0.1"), 0))
+        }
+        val executor = Executors.newSingleThreadExecutor()
+        val exchange = executor.submit {
+            server.use {
+                it.accept().use { connection ->
+                    connection.soTimeout = 3_500
+                    assertEquals(Gnr4MessageType.HELLO, Gnr4.read(connection.getInputStream(), session).type)
+                    Gnr4.write(
+                        connection.getOutputStream(),
+                        Gnr4Frame(
+                            Gnr4MessageType.HELLO_ACK,
+                            session,
+                            """{"protocol":4,"capabilities":["heartbeat","metrics_v1"]}"""
+                                .toByteArray(StandardCharsets.UTF_8),
+                        ),
+                    )
+                    assertEquals(Gnr4MessageType.STARTED, Gnr4.read(connection.getInputStream(), session).type)
+                    var frame: Gnr4Frame
+                    do {
+                        frame = Gnr4.read(connection.getInputStream(), session)
+                    } while (frame.type != Gnr4MessageType.METRICS)
+                    assertEquals(expected, Gnr4.parseMetricsPayload(frame.payload))
+                    Gnr4.write(connection.getOutputStream(), Gnr4Frame(Gnr4MessageType.STOP, session))
+                    assertEquals(Gnr4MessageType.STOPPED, Gnr4.read(connection.getInputStream(), session).type)
+                }
+            }
+        }
+        val connected = CountDownLatch(1)
+        val supervisor = ControlSupervisor(
+            session,
+            server.localPort,
+            object : ControlSupervisor.Listener {
+                override fun shouldReportStarted(): Boolean = true
+                override fun onControlConnected() = connected.countDown()
+                override fun onControlDegraded(error: Exception?) = Unit
+                override fun onControlRttSample(rttNanos: Long) = Unit
+                override fun onControlStopRequested(sendStopped: () -> Unit) = sendStopped()
+            },
+            metricsProvider = { expected },
+        )
+
+        supervisor.start()
+        assertTrue(connected.await(2, TimeUnit.SECONDS))
+        exchange.get(4, TimeUnit.SECONDS)
         supervisor.close()
         executor.shutdownNow()
     }

@@ -504,10 +504,71 @@ index 49896b9..b72ca2c 100644
   * hev_socks5_tunnel_main:
   * @config_path: config file path
 diff --git a/src/hev-socks5-tunnel.c b/src/hev-socks5-tunnel.c
-index 50cf41a..ec3c1a4 100644
+index 50cf41a..767de8f 100644
 --- a/src/hev-socks5-tunnel.c
 +++ b/src/hev-socks5-tunnel.c
-@@ -695,16 +695,13 @@ hev_socks5_tunnel_stop (void)
+@@ -10,6 +10,7 @@
+ #include <errno.h>
+ #include <assert.h>
+ #include <signal.h>
++#include <stdatomic.h>
+ #include <string.h>
+ #include <sys/ioctl.h>
+
+@@ -45,10 +46,10 @@ static int tun_fd_local;
+ static int session_count;
+ static int event_fds[2] = { -1, -1 };
+
+-static size_t stat_tx_packets;
+-static size_t stat_rx_packets;
+-static size_t stat_tx_bytes;
+-static size_t stat_rx_bytes;
++static atomic_size_t stat_tx_packets;
++static atomic_size_t stat_rx_packets;
++static atomic_size_t stat_tx_bytes;
++static atomic_size_t stat_rx_bytes;
+
+ static struct netif netif;
+ static struct tcp_pcb *tcp;
+@@ -81,8 +82,8 @@ netif_output_handler (struct netif *netif, struct pbuf *p)
+         return ERR_IF;
+     }
+
+-    stat_rx_packets++;
+-    stat_rx_bytes += s;
++    atomic_fetch_add_explicit (&stat_rx_packets, 1, memory_order_relaxed);
++    atomic_fetch_add_explicit (&stat_rx_bytes, s, memory_order_relaxed);
+
+     return ERR_OK;
+ }
+@@ -310,8 +311,9 @@ lwip_io_task_entry (void *data)
+         if (!buf)
+             continue;
+
+-        stat_tx_packets++;
+-        stat_tx_bytes += buf->tot_len;
++        atomic_fetch_add_explicit (&stat_tx_packets, 1, memory_order_relaxed);
++        atomic_fetch_add_explicit (&stat_tx_bytes, buf->tot_len,
++                                   memory_order_relaxed);
+
+         hev_task_mutex_lock (&mutex);
+         if (netif.input (buf, &netif) != ERR_OK)
+@@ -661,10 +663,10 @@ hev_socks5_tunnel_fini (void)
+     gateway_fini ();
+     tunnel_fini ();
+
+-    stat_tx_packets = 0;
+-    stat_rx_packets = 0;
+-    stat_tx_bytes = 0;
+-    stat_rx_bytes = 0;
++    atomic_store_explicit (&stat_tx_packets, 0, memory_order_relaxed);
++    atomic_store_explicit (&stat_rx_packets, 0, memory_order_relaxed);
++    atomic_store_explicit (&stat_tx_bytes, 0, memory_order_relaxed);
++    atomic_store_explicit (&stat_rx_bytes, 0, memory_order_relaxed);
+ }
+
+ int
+@@ -695,16 +697,13 @@ hev_socks5_tunnel_stop (void)
 
      LOG_D ("socks5 tunnel stop");
 
@@ -529,3 +590,26 @@ index 50cf41a..ec3c1a4 100644
  }
 
  void
+@@ -714,14 +713,18 @@ hev_socks5_tunnel_stats (size_t *tx_packets, size_t *tx_bytes,
+     LOG_D ("socks5 tunnel stats");
+
+     if (tx_packets)
+-        *tx_packets = stat_tx_packets;
++        *tx_packets =
++            atomic_load_explicit (&stat_tx_packets, memory_order_relaxed);
+
+     if (tx_bytes)
+-        *tx_bytes = stat_tx_bytes;
++        *tx_bytes = atomic_load_explicit (&stat_tx_bytes,
++                                          memory_order_relaxed);
+
+     if (rx_packets)
+-        *rx_packets = stat_rx_packets;
++        *rx_packets =
++            atomic_load_explicit (&stat_rx_packets, memory_order_relaxed);
+
+     if (rx_bytes)
+-        *rx_bytes = stat_rx_bytes;
++        *rx_bytes = atomic_load_explicit (&stat_rx_bytes,
++                                          memory_order_relaxed);
+ }
