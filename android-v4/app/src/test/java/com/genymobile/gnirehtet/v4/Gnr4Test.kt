@@ -95,4 +95,12 @@ class Gnr4Test {
         assertEquals(Gnr4Heartbeat(52, 987_654_321), Gnr4.parseHeartbeatPayload(payload))
         assertEquals(null, Gnr4.parseHeartbeatPayload(ByteArray(8)))
     }
+
+    @Test
+    fun suspendMessageValuesMatchTheHost() {
+        assertEquals(9, Gnr4MessageType.SUSPEND.wireValue)
+        assertEquals(10, Gnr4MessageType.SUSPENDED.wireValue)
+        assertEquals(Gnr4MessageType.SUSPEND, Gnr4MessageType.fromWire(9))
+        assertEquals(Gnr4MessageType.SUSPENDED, Gnr4MessageType.fromWire(10))
+    }
 }

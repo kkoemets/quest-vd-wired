@@ -222,8 +222,8 @@ class CommandLineToolsTest(unittest.TestCase):
                 "#!/bin/sh\n"
                 "case \"$2\" in\n"
                 "application-id) echo com.genymobile.gnirehtet ;;\n"
-                "version-code) echo 43 ;;\n"
-                "version-name) echo 4.0.0 ;;\n"
+                "version-code) echo 44 ;;\n"
+                "version-name) echo 4.0.1 ;;\n"
                 "min-sdk) echo 29 ;;\n"
                 "target-sdk) echo 36 ;;\n"
                 "debuggable) echo false ;;\n"
@@ -336,18 +336,19 @@ class ReleasePolicyTest(unittest.TestCase):
         rust_v4 = (REPOSITORY / "host-rust/Cargo.toml").read_text(encoding="utf-8")
         ignore = (REPOSITORY / ".gitignore").read_text(encoding="utf-8")
 
-        self.assertIn("v4.0.0 — current release", readme)
+        self.assertIn("v4.0.1 — current release", readme)
         self.assertIn("v3.1.0 Legacy", readme)
         self.assertIn("gnirehtet-java-v3.1.0.zip", readme)
-        self.assertIn("gnirehtet-v4.0.0-windows-x64.zip", readme)
+        self.assertIn("gnirehtet-v4.0.1-windows-x64.zip", readme)
         self.assertIn("gnirehtet-java-v3.0.0.zip", readme)
         self.assertNotIn("docs/", readme)
         self.assertIn("/docs/", ignore)
         self.assertTrue((REPOSITORY / "release").is_file())
         self.assertTrue((REPOSITORY / "scripts/build_v4_android_rc.sh").is_file())
         self.assertTrue((REPOSITORY / "scripts/build_v4_windows_rc.ps1").is_file())
-        self.assertIn('versionName = "4.0.0"', android_v4)
-        self.assertIn('version = "4.0.0"', rust_v4)
+        self.assertIn('versionCode = 44', android_v4)
+        self.assertIn('versionName = "4.0.1"', android_v4)
+        self.assertIn('version = "4.0.1"', rust_v4)
 
 
 if __name__ == "__main__":

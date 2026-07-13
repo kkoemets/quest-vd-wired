@@ -26,8 +26,8 @@ pub const ANDROID_VPN_SERVICE: &str = "com.genymobile.gnirehtet/.v4.VdLinkVpnSer
 pub const ACTION_START_V4: &str = "com.genymobile.gnirehtet.v4.START";
 pub const ACTION_STOP_V4: &str = "com.genymobile.gnirehtet.v4.STOP";
 pub const VIRTUAL_DESKTOP_PACKAGE: &str = "VirtualDesktop.Android";
-pub const ANDROID_VERSION_CODE: &str = "43";
-pub const ANDROID_VERSION_NAME: &str = "4.0.0";
+pub const ANDROID_VERSION_CODE: &str = "44";
+pub const ANDROID_VERSION_NAME: &str = "4.0.1";
 pub const PLATFORM_TOOLS_VERSION: &str = "37.0.0";
 pub const PLATFORM_TOOLS_WINDOWS_URL: &str =
     "https://dl.google.com/android/repository/platform-tools_r37.0.0-win.zip";
@@ -1559,7 +1559,7 @@ mod tests {
             Ok(AdbOutput::success("Package not found")),
             Ok(AdbOutput::success("Success")),
             Ok(AdbOutput::success(
-                "versionCode=43 minSdk=29 targetSdk=36\nversionName=4.0.0\n",
+                "versionCode=44 minSdk=29 targetSdk=36\nversionName=4.0.1\n",
             )),
         ]));
         AdbController::new(mock.clone())
@@ -1599,7 +1599,7 @@ mod tests {
             Ok(AdbOutput::success("Package not found")),
             Ok(AdbOutput::success("Success")),
             Ok(AdbOutput::success(
-                "versionCode=43 minSdk=29 targetSdk=36\nversionName=4.0.0\n",
+                "versionCode=44 minSdk=29 targetSdk=36\nversionName=4.0.1\n",
             )),
         ]));
         AdbController::new(mock.clone())
@@ -1622,7 +1622,7 @@ mod tests {
         let mock = Arc::new(MockAdb::with_results(vec![
             Ok(AdbOutput::success("device")),
             Ok(AdbOutput::success(
-                "versionCode=43 minSdk=29 targetSdk=36\nversionName=4.0.0\n",
+                "versionCode=44 minSdk=29 targetSdk=36\nversionName=4.0.1\n",
             )),
         ]));
         AdbController::new(mock.clone())

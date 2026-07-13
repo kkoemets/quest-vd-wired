@@ -17,7 +17,9 @@ enum class Gnr4MessageType(val wireValue: Int) {
     STOP(5),
     STOPPED(6),
     STATUS(7),
-    ERROR(8);
+    ERROR(8),
+    SUSPEND(9),
+    SUSPENDED(10);
 
     companion object {
         fun fromWire(value: Int): Gnr4MessageType = entries.firstOrNull { it.wireValue == value }

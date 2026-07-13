@@ -98,6 +98,8 @@ pub enum MessageType {
     Stopped = 6,
     Status = 7,
     Error = 8,
+    Suspend = 9,
+    Suspended = 10,
 }
 
 impl TryFrom<u16> for MessageType {
@@ -113,6 +115,8 @@ impl TryFrom<u16> for MessageType {
             6 => Ok(Self::Stopped),
             7 => Ok(Self::Status),
             8 => Ok(Self::Error),
+            9 => Ok(Self::Suspend),
+            10 => Ok(Self::Suspended),
             other => Err(ProtocolError::UnknownMessageType(other)),
         }
     }
@@ -255,6 +259,16 @@ mod tests {
             b"bounded".to_vec(),
         );
         assert_eq!(Frame::decode(&frame.encode().unwrap()).unwrap(), frame);
+    }
+
+    #[test]
+    fn suspend_messages_are_append_only_protocol_extensions() {
+        assert_eq!(MessageType::try_from(9).unwrap(), MessageType::Suspend);
+        assert_eq!(MessageType::try_from(10).unwrap(), MessageType::Suspended);
+        for message_type in [MessageType::Suspend, MessageType::Suspended] {
+            let frame = Frame::new(message_type, SessionId([0x6a; 16]), Vec::new());
+            assert_eq!(Frame::decode(&frame.encode().unwrap()).unwrap(), frame);
+        }
     }
 
     #[test]
