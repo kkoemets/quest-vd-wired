@@ -22,6 +22,7 @@ class DeterministicWindowsZipTest(unittest.TestCase):
             root = Path(directory)
             staging = root / "staging"
             staging.mkdir()
+            (staging / "quest-vd-wired.exe").write_bytes(b"MZ")
             (staging / "z.txt").write_text("last\n", encoding="utf-8")
             android = staging / "android"
             android.mkdir()
@@ -40,7 +41,13 @@ class DeterministicWindowsZipTest(unittest.TestCase):
             with zipfile.ZipFile(first) as archive:
                 infos = archive.infolist()
                 self.assertEqual(
-                    ["a.txt", "android/", "android/artifact.txt", "z.txt"],
+                    [
+                        "a.txt",
+                        "android/",
+                        "android/artifact.txt",
+                        "quest-vd-wired.exe",
+                        "z.txt",
+                    ],
                     [info.filename for info in infos],
                 )
                 expected_time = dt.datetime.fromtimestamp(epoch, tz=dt.timezone.utc)
@@ -71,6 +78,7 @@ class DeterministicWindowsZipTest(unittest.TestCase):
             root = Path(directory)
             staging = root / "staging"
             staging.mkdir()
+            (staging / "quest-vd-wired.exe").write_bytes(b"MZ")
             (staging / "release.txt").write_text("release", encoding="utf-8")
             output = root / "release.zip"
             environment = os.environ.copy()
@@ -95,6 +103,7 @@ class DeterministicWindowsZipTest(unittest.TestCase):
             root = Path(directory)
             staging = root / "staging"
             staging.mkdir()
+            (staging / "quest-vd-wired.exe").write_bytes(b"MZ")
             (staging / "release.txt").write_text("release", encoding="utf-8")
             output = root / "release.zip"
             package_v4_windows_zip.package(
@@ -111,7 +120,7 @@ class DeterministicWindowsZipTest(unittest.TestCase):
             root = Path(directory)
             with_android = root / "with-android"
             with_android.mkdir()
-            (with_android / "gnirehtet-vd.exe").write_bytes(b"MZ")
+            (with_android / "quest-vd-wired.exe").write_bytes(b"MZ")
             (with_android / "android").mkdir()
             first = root / "with.zip"
             package_v4_windows_zip.package(with_android, first, source_date_epoch=0)
@@ -120,7 +129,7 @@ class DeterministicWindowsZipTest(unittest.TestCase):
 
             without_android = root / "without-android"
             without_android.mkdir()
-            (without_android / "gnirehtet-vd.exe").write_bytes(b"MZ")
+            (without_android / "quest-vd-wired.exe").write_bytes(b"MZ")
             second = root / "without.zip"
             package_v4_windows_zip.package(without_android, second, source_date_epoch=0)
             with zipfile.ZipFile(second) as archive:
@@ -154,6 +163,34 @@ class DeterministicWindowsZipTest(unittest.TestCase):
             with self.subTest(name=name):
                 with self.assertRaises(package_v4_windows_zip.PackagingError):
                     package_v4_windows_zip._validate_component(name)
+
+    def test_release_executable_name_is_enforced(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            staging = root / "staging"
+            staging.mkdir()
+            (staging / "release.txt").write_text("release", encoding="utf-8")
+            with self.assertRaisesRegex(
+                package_v4_windows_zip.PackagingError,
+                "missing quest-vd-wired.exe",
+            ):
+                package_v4_windows_zip.package(
+                    staging,
+                    root / "missing.zip",
+                    source_date_epoch=0,
+                )
+
+            (staging / "quest-vd-wired.exe").write_bytes(b"MZ")
+            (staging / "gnirehtet-vd.exe").write_bytes(b"MZ")
+            with self.assertRaisesRegex(
+                package_v4_windows_zip.PackagingError,
+                "still contains gnirehtet-vd.exe",
+            ):
+                package_v4_windows_zip.package(
+                    staging,
+                    root / "duplicate.zip",
+                    source_date_epoch=0,
+                )
 
 
 if __name__ == "__main__":

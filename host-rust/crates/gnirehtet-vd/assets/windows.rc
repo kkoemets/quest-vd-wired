@@ -1,1 +1,36 @@
+#define STRINGIFY_INNER(value) #value
+#define STRINGIFY(value) STRINGIFY_INNER(value)
+#define VERSION_TUPLE VERSION_MAJOR,VERSION_MINOR,VERSION_PATCH,0
+#define VERSION_TEXT STRINGIFY(VERSION_MAJOR) "." STRINGIFY(VERSION_MINOR) "." STRINGIFY(VERSION_PATCH)
+#define FILE_VERSION_TEXT VERSION_TEXT ".0"
+
 1 ICON "tray-on.ico"
+
+1 VERSIONINFO
+FILEVERSION VERSION_TUPLE
+PRODUCTVERSION VERSION_TUPLE
+FILEFLAGSMASK 0x3fL
+FILEFLAGS 0x0L
+FILEOS 0x40004L
+FILETYPE 0x1L
+FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "Quest VD Wired contributors\0"
+            VALUE "FileDescription", "Quest VD Wired\0"
+            VALUE "FileVersion", FILE_VERSION_TEXT "\0"
+            VALUE "InternalName", "quest-vd-wired\0"
+            VALUE "LegalCopyright", "Licensed under Apache-2.0\0"
+            VALUE "OriginalFilename", "quest-vd-wired.exe\0"
+            VALUE "ProductName", "Quest VD Wired\0"
+            VALUE "ProductVersion", VERSION_TEXT "\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

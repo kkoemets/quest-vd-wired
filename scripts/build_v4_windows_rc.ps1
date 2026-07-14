@@ -14,7 +14,8 @@ $apk = (Resolve-Path $ApkPath).Path
 $androidArtifacts = (Resolve-Path $AndroidArtifactsDirectory).Path
 $output = [System.IO.Path]::GetFullPath($OutputDirectory)
 $target = "x86_64-pc-windows-msvc"
-$builtExe = Join-Path $repoRoot "host-rust\target\$target\release\gnirehtet-vd.exe"
+$expectedVersion = "4.1.0"
+$builtExe = Join-Path $repoRoot "host-rust\target\$target\release\quest-vd-wired.exe"
 
 function Invoke-Checked {
     param([string]$Command, [string[]]$Arguments)
@@ -91,8 +92,39 @@ function Test-ReleaseExecutable {
     foreach ($localRoot in $localRoots) {
         $arguments += @("--local-root", $localRoot)
     }
-    $arguments += @("--llvm-readobj", $llvmReadObj.Source)
+    $arguments += @(
+        "--llvm-readobj", $llvmReadObj.Source,
+        "--product-name", "Quest VD Wired",
+        "--original-filename", "quest-vd-wired.exe",
+        "--product-version", $expectedVersion
+    )
     Invoke-Checked "python" $arguments
+
+    $versionInfo = (Get-Item -LiteralPath $Executable).VersionInfo
+    $expectedValues = @{
+        ProductName = "Quest VD Wired"
+        FileDescription = "Quest VD Wired"
+        OriginalFilename = "quest-vd-wired.exe"
+        InternalName = "quest-vd-wired"
+        FileVersion = "$expectedVersion.0"
+        ProductVersion = $expectedVersion
+    }
+    foreach ($field in $expectedValues.Keys) {
+        if ($versionInfo.$field -ne $expectedValues[$field]) {
+            throw "Windows version field $field is '$($versionInfo.$field)', expected '$($expectedValues[$field])'"
+        }
+    }
+
+    $resources = & $llvmReadObj.Source --coff-resources $Executable
+    if ($LASTEXITCODE -ne 0) {
+        throw "llvm-readobj could not inspect Windows resources"
+    }
+    $resourcesText = $resources -join "`n"
+    foreach ($resourceType in @("ICON", "GROUP_ICON", "VERSION")) {
+        if ($resourcesText -notmatch "Type:\s+$resourceType") {
+            throw "Windows executable is missing the $resourceType resource"
+        }
+    }
 }
 
 Invoke-Checked "cargo" @("fmt", "--manifest-path", $manifest, "--all", "--", "--check")
@@ -106,7 +138,7 @@ if (-not (Test-Path -LiteralPath $builtExe -PathType Leaf)) {
     throw "Windows x64 host executable was not produced"
 }
 Test-ReleaseExecutable $builtExe
-$firstExe = Join-Path $output "gnirehtet-vd.exe"
+$firstExe = Join-Path $output "quest-vd-wired.exe"
 Copy-Item -LiteralPath $builtExe -Destination $firstExe
 Invoke-Checked "python" @((Join-Path $repoRoot "scripts\verify_embedded_apk.py"), $firstExe, $apk)
 
@@ -117,7 +149,7 @@ Test-ReleaseExecutable $builtExe
 $firstHash = (Get-FileHash -LiteralPath $firstExe -Algorithm SHA256).Hash.ToLowerInvariant()
 $secondHash = (Get-FileHash -LiteralPath $builtExe -Algorithm SHA256).Hash.ToLowerInvariant()
 @(
-    "artifact=gnirehtet-vd.exe"
+    "artifact=quest-vd-wired.exe"
     "first_sha256=$firstHash"
     "second_sha256=$secondHash"
     "reproducible=$($firstHash -eq $secondHash)".ToLowerInvariant()

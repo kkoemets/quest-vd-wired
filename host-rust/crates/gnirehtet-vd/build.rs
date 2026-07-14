@@ -1,19 +1,33 @@
 use std::{env, fs, path::PathBuf};
 
-fn embed_windows_icon() {
+fn embed_windows_resources() {
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
 
     println!("cargo:rerun-if-changed=assets/windows.rc");
     println!("cargo:rerun-if-changed=assets/tray-on.ico");
-    embed_resource::compile_for("assets/windows.rc", ["gnirehtet-vd"], embed_resource::NONE)
+    let version_macros = [
+        format!(
+            "VERSION_MAJOR={}",
+            env::var("CARGO_PKG_VERSION_MAJOR").expect("Cargo package major version")
+        ),
+        format!(
+            "VERSION_MINOR={}",
+            env::var("CARGO_PKG_VERSION_MINOR").expect("Cargo package minor version")
+        ),
+        format!(
+            "VERSION_PATCH={}",
+            env::var("CARGO_PKG_VERSION_PATCH").expect("Cargo package patch version")
+        ),
+    ];
+    embed_resource::compile_for("assets/windows.rc", ["quest-vd-wired"], &version_macros)
         .manifest_required()
-        .expect("embedding the Windows executable icon");
+        .expect("embedding the Windows executable resources");
 }
 
 fn main() {
-    embed_windows_icon();
+    embed_windows_resources();
     println!("cargo:rerun-if-env-changed=GNIREHTET_VD_APK");
     println!("cargo:rerun-if-env-changed=CARGO_CFG_FUZZING");
     let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
