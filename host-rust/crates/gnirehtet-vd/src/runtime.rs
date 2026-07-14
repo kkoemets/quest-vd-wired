@@ -34,7 +34,10 @@ use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeServer, ServerOpti
 
 use crate::{
     adb::{AdbController, AndroidVpnStatus, CONTROL_PORT, SOCKS_PORT, UDP_STREAM_PORT},
-    control::{ControlConfig, ControlHandle, ControlServer, StateObserver, SuspendObserver},
+    control::{
+        ControlConfig, ControlHandle, ControlServer, StateObserver, SuspendObserver,
+        CONTROL_TRANSPORT_LOST_REASON,
+    },
     diagnostics::Diagnostics,
     protocol::{AndroidMetricsV1, SessionId},
     socks::{RelayGate, SocksCommandPolicy, SocksConfig, SocksServer},
@@ -303,34 +306,91 @@ pub struct AdbHealthMonitor {
 struct RelayEligibility {
     carrier_healthy: bool,
     control_authenticated: bool,
+    control_loss_pending: bool,
+    control_epoch: u64,
 }
 
 #[derive(Clone)]
 struct RelayGateController {
     gate: RelayGate,
     eligibility: Arc<StdMutex<RelayEligibility>>,
+    control_loss_grace: Duration,
 }
 
 impl RelayGateController {
     fn new(gate: RelayGate) -> Self {
+        Self::with_control_loss_grace(gate, Duration::from_secs(3))
+    }
+
+    fn with_control_loss_grace(gate: RelayGate, control_loss_grace: Duration) -> Self {
         Self {
             gate,
             eligibility: Arc::new(StdMutex::new(RelayEligibility {
                 carrier_healthy: true,
                 control_authenticated: false,
+                control_loss_pending: false,
+                control_epoch: 0,
             })),
+            control_loss_grace,
         }
     }
 
     fn control_connected(&self) {
         if let Ok(mut eligibility) = self.eligibility.lock() {
+            eligibility.control_epoch = eligibility.control_epoch.wrapping_add(1);
+            eligibility.control_loss_pending = false;
             eligibility.control_authenticated = true;
             self.gate.set_enabled(eligibility.carrier_healthy);
         }
     }
 
+    fn control_degraded(&self) {
+        let epoch = if let Ok(mut eligibility) = self.eligibility.lock() {
+            if !eligibility.control_authenticated || eligibility.control_loss_pending {
+                return;
+            }
+            eligibility.control_epoch = eligibility.control_epoch.wrapping_add(1);
+            eligibility.control_loss_pending = true;
+            eligibility.control_epoch
+        } else {
+            return;
+        };
+        let controller = self.clone();
+        tokio::spawn(async move {
+            time::sleep(controller.control_loss_grace).await;
+            controller.expire_control_loss(epoch);
+        });
+    }
+
+    fn expire_control_loss(&self, epoch: u64) {
+        let _ = self.control_inactive_if_epoch(epoch);
+    }
+
+    fn pending_control_epoch(&self) -> Option<u64> {
+        self.eligibility.lock().ok().and_then(|eligibility| {
+            (eligibility.control_authenticated && eligibility.control_loss_pending)
+                .then_some(eligibility.control_epoch)
+        })
+    }
+
+    fn control_inactive_if_epoch(&self, epoch: u64) -> bool {
+        if let Ok(mut eligibility) = self.eligibility.lock() {
+            if eligibility.control_epoch != epoch || !eligibility.control_authenticated {
+                return false;
+            }
+            eligibility.control_epoch = eligibility.control_epoch.wrapping_add(1);
+            eligibility.control_loss_pending = false;
+            eligibility.control_authenticated = false;
+            self.gate.set_enabled(false);
+            return true;
+        }
+        false
+    }
+
     fn control_inactive(&self) {
         if let Ok(mut eligibility) = self.eligibility.lock() {
+            eligibility.control_epoch = eligibility.control_epoch.wrapping_add(1);
+            eligibility.control_loss_pending = false;
             eligibility.control_authenticated = false;
             self.gate.set_enabled(false);
         }
@@ -338,6 +398,8 @@ impl RelayGateController {
 
     fn carrier_lost(&self) {
         if let Ok(mut eligibility) = self.eligibility.lock() {
+            eligibility.control_epoch = eligibility.control_epoch.wrapping_add(1);
+            eligibility.control_loss_pending = false;
             eligibility.carrier_healthy = false;
             eligibility.control_authenticated = false;
             self.gate.set_enabled(false);
@@ -569,6 +631,10 @@ impl AdbHealthMonitor {
             Ok(Ok(health)) if health.is_healthy() => {
                 self.update_status(true, true, true, None);
                 relay_gate.carrier_healthy();
+                if lifecycle.state == HostState::Degraded {
+                    self.reconcile_android_sleep(adb, diagnostics, relay_gate)
+                        .await;
+                }
             }
             Ok(Ok(health)) => {
                 relay_gate.carrier_lost();
@@ -647,6 +713,31 @@ impl AdbHealthMonitor {
                 )
                 .await;
             }
+        }
+    }
+
+    async fn reconcile_android_sleep(
+        &self,
+        adb: &AdbController,
+        diagnostics: &Diagnostics,
+        relay_gate: &RelayGateController,
+    ) {
+        if self.stopping.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(control_epoch) = relay_gate.pending_control_epoch() else {
+            return;
+        };
+        let status_adb = adb.clone();
+        let status = task::spawn_blocking(move || status_adb.android_status_quick()).await;
+        if matches!(
+            status,
+            Ok(Ok(status))
+                if status.screen_suspended == Some(true)
+                    && status.state.as_deref() == Some("degraded")
+        ) && relay_gate.control_inactive_if_epoch(control_epoch)
+        {
+            let _ = diagnostics.record("android_sleep_confirmed", json!({}));
         }
     }
 
@@ -1198,6 +1289,11 @@ fn flatten_runtime_task(
 fn update_relay_gate(relay_gate: &RelayGateController, snapshot: &StateSnapshot) {
     match snapshot.state {
         HostState::Connected => relay_gate.control_connected(),
+        HostState::Degraded
+            if snapshot.reason.as_deref() == Some(CONTROL_TRANSPORT_LOST_REASON) =>
+        {
+            relay_gate.control_degraded();
+        }
         HostState::Stopped | HostState::Stopping | HostState::Error => {
             relay_gate.control_inactive();
         }
@@ -2227,6 +2323,7 @@ mod tests {
         calls: StdMutex<Vec<Vec<String>>>,
         mapping_adds: AtomicU64,
         mapping_delay_ms: AtomicU64,
+        screen_suspended: AtomicBool,
     }
 
     impl AdbExecutor for MonitorMockAdb {
@@ -2234,6 +2331,17 @@ mod tests {
             self.calls.lock().unwrap().push(args.to_vec());
             if args.iter().any(|argument| argument == "get-state") {
                 return Ok(AdbOutput::success("device\n"));
+            }
+            if args.iter().any(|argument| argument == "activity") {
+                return Ok(AdbOutput::success(format!(
+                    "gnirehtet.state={}\nscreenSuspended={}\n",
+                    if self.screen_suspended.load(Ordering::Relaxed) {
+                        "DEGRADED"
+                    } else {
+                        "CONNECTED"
+                    },
+                    self.screen_suspended.load(Ordering::Relaxed),
+                )));
             }
             if args.iter().any(|argument| argument == "--list") {
                 if self.mapping_adds.load(Ordering::Relaxed) >= REVERSE_MAPPINGS.len() as u64 {
@@ -2673,16 +2781,20 @@ mod tests {
         assert_eq!(fifth, maximum);
     }
 
-    #[test]
-    fn transient_degradation_keeps_the_relay_generation_alive() {
+    #[tokio::test]
+    async fn transient_degradation_keeps_the_relay_generation_alive() {
         let relay_gate = RelayGate::default();
-        let relay_controller = RelayGateController::new(relay_gate.clone());
+        let relay_controller = RelayGateController::with_control_loss_grace(
+            relay_gate.clone(),
+            Duration::from_millis(30),
+        );
         let session = SessionId([0x79; 16]).to_string();
         let snapshot = |state| StateSnapshot {
             state,
             session_id: Some(session.clone()),
             missed_heartbeats: 0,
-            reason: None,
+            reason: (state == HostState::Degraded)
+                .then(|| CONTROL_TRANSPORT_LOST_REASON.to_owned()),
         };
 
         update_relay_gate(&relay_controller, &snapshot(HostState::Connected));
@@ -2694,12 +2806,265 @@ mod tests {
         assert_eq!(relay_gate.generation(), connected_generation);
 
         update_relay_gate(&relay_controller, &snapshot(HostState::Connected));
+        time::sleep(Duration::from_millis(50)).await;
         assert!(relay_gate.is_enabled());
         assert_eq!(relay_gate.generation(), connected_generation);
 
         update_relay_gate(&relay_controller, &snapshot(HostState::Stopping));
         assert!(!relay_gate.is_enabled());
         assert!(relay_gate.generation() > connected_generation);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_only_degradation_never_resets_healthy_flows() {
+        let relay_gate = RelayGate::default();
+        let relay_controller = RelayGateController::with_control_loss_grace(
+            relay_gate.clone(),
+            Duration::from_millis(20),
+        );
+        let session = SessionId([0x7a; 16]).to_string();
+        update_relay_gate(
+            &relay_controller,
+            &StateSnapshot {
+                state: HostState::Connected,
+                session_id: Some(session.clone()),
+                missed_heartbeats: 0,
+                reason: None,
+            },
+        );
+        let connected_generation = relay_gate.generation();
+        update_relay_gate(
+            &relay_controller,
+            &StateSnapshot {
+                state: HostState::Degraded,
+                session_id: Some(session),
+                missed_heartbeats: 3,
+                reason: Some("three heartbeat intervals missed; VPN remains active".into()),
+            },
+        );
+
+        time::sleep(Duration::from_millis(40)).await;
+        assert!(relay_gate.is_enabled());
+        assert_eq!(relay_gate.generation(), connected_generation);
+    }
+
+    #[tokio::test]
+    async fn sustained_control_loss_invalidates_flows_until_fresh_started() {
+        let relay_gate = RelayGate::default();
+        let relay_controller = RelayGateController::with_control_loss_grace(
+            relay_gate.clone(),
+            Duration::from_millis(20),
+        );
+        let session = SessionId([0x7b; 16]).to_string();
+        let snapshot = |state| StateSnapshot {
+            state,
+            session_id: Some(session.clone()),
+            missed_heartbeats: 0,
+            reason: (state == HostState::Degraded)
+                .then(|| CONTROL_TRANSPORT_LOST_REASON.to_owned()),
+        };
+
+        update_relay_gate(&relay_controller, &snapshot(HostState::Connected));
+        let connected_generation = relay_gate.generation();
+        update_relay_gate(&relay_controller, &snapshot(HostState::Degraded));
+        assert!(relay_gate.is_enabled());
+
+        time::timeout(Duration::from_secs(1), async {
+            while relay_gate.is_enabled() {
+                time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("sustained control loss did not close relay flows");
+        assert!(!relay_gate.is_enabled());
+        assert!(relay_gate.generation() > connected_generation);
+
+        update_relay_gate(&relay_controller, &snapshot(HostState::Connected));
+        assert!(relay_gate.is_enabled());
+    }
+
+    #[tokio::test]
+    async fn wake_token_cancels_stale_timer_and_sleep_probe() {
+        let relay_gate = RelayGate::default();
+        let relay_controller = RelayGateController::with_control_loss_grace(
+            relay_gate.clone(),
+            Duration::from_millis(30),
+        );
+
+        relay_controller.control_connected();
+        relay_controller.control_degraded();
+        let stale_epoch = relay_controller.pending_control_epoch().unwrap();
+        relay_controller.control_connected();
+        let wake_generation = relay_gate.generation();
+
+        assert_eq!(relay_controller.pending_control_epoch(), None);
+        assert!(!relay_controller.control_inactive_if_epoch(stale_epoch));
+        time::sleep(Duration::from_millis(50)).await;
+        assert!(relay_gate.is_enabled());
+        assert_eq!(relay_gate.generation(), wake_generation);
+    }
+
+    #[tokio::test]
+    async fn stale_degraded_reconcile_cannot_probe_reconnected_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let diagnostics = Diagnostics::open(directory.path()).unwrap();
+        let executor = Arc::new(MonitorMockAdb::default());
+        executor.screen_suspended.store(true, Ordering::Relaxed);
+        let adb = AdbController::new(executor.clone());
+        let monitor = AdbHealthMonitor::default();
+        let relay_gate = RelayGate::default();
+        let relay_controller = RelayGateController::new(relay_gate.clone());
+
+        relay_controller.control_connected();
+        relay_controller.control_degraded();
+        relay_controller.control_connected();
+        let wake_generation = relay_gate.generation();
+        monitor
+            .reconcile_android_sleep(&adb, &diagnostics, &relay_controller)
+            .await;
+
+        assert!(relay_gate.is_enabled());
+        assert_eq!(relay_gate.generation(), wake_generation);
+        assert!(!executor
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|args| args.iter().any(|argument| argument == "activity")));
+    }
+
+    #[tokio::test]
+    async fn repeated_degradation_does_not_extend_the_cleanup_deadline() {
+        let relay_gate = RelayGate::default();
+        let relay_controller = RelayGateController::with_control_loss_grace(
+            relay_gate.clone(),
+            Duration::from_millis(60),
+        );
+
+        relay_controller.control_connected();
+        relay_controller.control_degraded();
+        time::sleep(Duration::from_millis(40)).await;
+        relay_controller.control_degraded();
+        time::sleep(Duration::from_millis(35)).await;
+
+        assert!(!relay_gate.is_enabled());
+    }
+
+    #[tokio::test]
+    async fn confirmed_android_sleep_closes_flows_when_control_is_degraded() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = AppPaths::discover(Some(directory.path().to_owned())).unwrap();
+        let diagnostics = Diagnostics::open(&paths.logs).unwrap();
+        let store = StateStore::new(&paths.status);
+        let session = SessionId([0x7d; 16]);
+        let control = ControlServer::new(ControlConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            session_id: session,
+        })
+        .unwrap();
+        control
+            .state()
+            .lock()
+            .await
+            .peer_started(session, std::time::Instant::now())
+            .unwrap();
+        control
+            .command_handle()
+            .transport_lost("test control loss")
+            .await;
+        let executor = Arc::new(MonitorMockAdb::default());
+        executor
+            .mapping_adds
+            .store(REVERSE_MAPPINGS.len() as u64, Ordering::Relaxed);
+        executor.screen_suspended.store(true, Ordering::Relaxed);
+        let adb = AdbController::new(executor.clone());
+        let monitor = AdbHealthMonitor::default();
+        let relay_gate = RelayGate::default();
+        let relay_controller = RelayGateController::new(relay_gate.clone());
+        relay_controller.control_connected();
+        relay_controller.control_degraded();
+
+        monitor
+            .reconcile(
+                &adb,
+                &control.command_handle(),
+                &store,
+                &diagnostics,
+                &relay_controller,
+                true,
+            )
+            .await;
+
+        assert!(!relay_gate.is_enabled());
+        monitor
+            .reconcile(
+                &adb,
+                &control.command_handle(),
+                &store,
+                &diagnostics,
+                &relay_controller,
+                true,
+            )
+            .await;
+        assert_eq!(
+            executor
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|args| args.iter().any(|argument| argument == "activity"))
+                .count(),
+            1,
+        );
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_control_degradation_keeps_flows_alive_during_grace() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = AppPaths::discover(Some(directory.path().to_owned())).unwrap();
+        let diagnostics = Diagnostics::open(&paths.logs).unwrap();
+        let store = StateStore::new(&paths.status);
+        let session = SessionId([0x7e; 16]);
+        let control = ControlServer::new(ControlConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            session_id: session,
+        })
+        .unwrap();
+        control
+            .state()
+            .lock()
+            .await
+            .peer_started(session, std::time::Instant::now())
+            .unwrap();
+        control
+            .command_handle()
+            .transport_lost("test control loss")
+            .await;
+        let executor = Arc::new(MonitorMockAdb::default());
+        executor
+            .mapping_adds
+            .store(REVERSE_MAPPINGS.len() as u64, Ordering::Relaxed);
+        let adb = AdbController::new(executor);
+        let monitor = AdbHealthMonitor::default();
+        let relay_gate = RelayGate::default();
+        let relay_controller = RelayGateController::new(relay_gate.clone());
+        relay_controller.control_connected();
+        relay_controller.control_degraded();
+        let connected_generation = relay_gate.generation();
+
+        monitor
+            .reconcile(
+                &adb,
+                &control.command_handle(),
+                &store,
+                &diagnostics,
+                &relay_controller,
+                true,
+            )
+            .await;
+
+        assert!(relay_gate.is_enabled());
+        assert_eq!(relay_gate.generation(), connected_generation);
     }
 
     #[tokio::test]

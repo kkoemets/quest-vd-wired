@@ -49,14 +49,14 @@ internal fun stopTargetsGeneration(
     (teardownInProgress && closingGeneration == expectedGeneration)
 
 internal fun isHeadsetDisplaySuspended(displayState: Int?, isInteractive: Boolean): Boolean =
-    when (displayState) {
+    !isInteractive || when (displayState) {
         Display.STATE_ON, Display.STATE_VR -> false
         Display.STATE_OFF,
         Display.STATE_DOZE,
         Display.STATE_DOZE_SUSPEND,
         Display.STATE_ON_SUSPEND,
         -> true
-        else -> !isInteractive
+        else -> false
     }
 
 class VdLinkVpnService : VpnService() {
@@ -81,6 +81,13 @@ class VdLinkVpnService : VpnService() {
     private val screenSuspended = AtomicBoolean()
     private val screenReceiverRegistered = AtomicBoolean()
     private val displayListenerRegistered = AtomicBoolean()
+    private val sleepStatePoller = object : Runnable {
+        override fun run() {
+            if (destroyed.get()) return
+            refreshScreenState()
+            mainHandler.postDelayed(this, SLEEP_STATE_POLL_INTERVAL_MS)
+        }
+    }
 
     private val screenReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -127,6 +134,7 @@ class VdLinkVpnService : VpnService() {
         }
         screenReceiverRegistered.set(true)
         refreshScreenState()
+        mainHandler.postDelayed(sleepStatePoller, SLEEP_STATE_POLL_INTERVAL_MS)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -349,6 +357,7 @@ class VdLinkVpnService : VpnService() {
     }
 
     private fun refreshScreenState() {
+        if (destroyed.get()) return
         val displayState = getSystemService(DisplayManager::class.java)
             .getDisplay(Display.DEFAULT_DISPLAY)
             ?.state
@@ -543,6 +552,8 @@ class VdLinkVpnService : VpnService() {
     }
 
     override fun onDestroy() {
+        destroyed.set(true)
+        mainHandler.removeCallbacks(sleepStatePoller)
         if (displayListenerRegistered.compareAndSet(true, false)) {
             runCatching {
                 getSystemService(DisplayManager::class.java).unregisterDisplayListener(displayListener)
@@ -552,7 +563,6 @@ class VdLinkVpnService : VpnService() {
             runCatching { unregisterReceiver(screenReceiver) }
                 .onFailure { Log.w(TAG, "Could not unregister screen receiver", it) }
         }
-        destroyed.set(true)
         requestStop(failure = if (state.get() == LifecycleState.ERROR) {
             IllegalStateException(lastError.get() ?: "VPN service terminated with an error")
         } else {
@@ -575,6 +585,7 @@ class VdLinkVpnService : VpnService() {
         writer.println("vpnFdOpen=${vpnDescriptorOpen.get()}")
         writer.println("sessionId=${sessionId ?: "none"}")
         writer.println("lastError=${lastError.get() ?: "none"}")
+        writer.println("screenSuspended=${screenSuspended.get()}")
         writer.println("socksPort=${resources?.parameters?.socksPort ?: "none"}")
         writer.println("udpPort=${resources?.parameters?.udpPort ?: "none"}")
         writer.println("controlPort=${resources?.parameters?.controlPort ?: "none"}")
@@ -656,6 +667,7 @@ class VdLinkVpnService : VpnService() {
         private const val ENGINE_START_TIMEOUT_MS = 5_000
         private const val ENGINE_QUIESCE_BEFORE_CLOSE_TIMEOUT_MS = 500
         private const val ENGINE_STOP_TIMEOUT_MS = 1_500
+        private const val SLEEP_STATE_POLL_INTERVAL_MS = 500L
 
         fun start(context: Context, source: Intent) {
             val intent = Intent(context, VdLinkVpnService::class.java)

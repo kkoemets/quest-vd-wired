@@ -26,8 +26,8 @@ pub const ANDROID_VPN_SERVICE: &str = "com.genymobile.gnirehtet/.v4.VdLinkVpnSer
 pub const ACTION_START_V4: &str = "com.genymobile.gnirehtet.v4.START";
 pub const ACTION_STOP_V4: &str = "com.genymobile.gnirehtet.v4.STOP";
 pub const VIRTUAL_DESKTOP_PACKAGE: &str = "VirtualDesktop.Android";
-pub const ANDROID_VERSION_CODE: &str = "48";
-pub const ANDROID_VERSION_NAME: &str = "4.0.5";
+pub const ANDROID_VERSION_CODE: &str = "49";
+pub const ANDROID_VERSION_NAME: &str = "4.0.6";
 pub const PLATFORM_TOOLS_VERSION: &str = "37.0.0";
 pub const PLATFORM_TOOLS_WINDOWS_URL: &str =
     "https://dl.google.com/android/repository/platform-tools_r37.0.0-win.zip";
@@ -847,14 +847,25 @@ impl AdbController {
     }
 
     pub fn android_status(&self) -> Result<AndroidVpnStatus, AdbError> {
-        let output = self.run_checked(&strings(&[
-            "-d",
-            "shell",
-            "dumpsys",
-            "activity",
-            "service",
-            ANDROID_VPN_SERVICE,
-        ]))?;
+        self.android_status_with_timeout(self.command_timeout)
+    }
+
+    pub(crate) fn android_status_quick(&self) -> Result<AndroidVpnStatus, AdbError> {
+        self.android_status_with_timeout(self.command_timeout.min(Duration::from_secs(1)))
+    }
+
+    fn android_status_with_timeout(&self, timeout: Duration) -> Result<AndroidVpnStatus, AdbError> {
+        let output = self.run_checked_with(
+            &strings(&[
+                "-d",
+                "shell",
+                "dumpsys",
+                "activity",
+                "service",
+                ANDROID_VPN_SERVICE,
+            ]),
+            timeout,
+        )?;
         Ok(AndroidVpnStatus::parse(&output.stdout))
     }
 
@@ -1003,6 +1014,7 @@ pub struct AndroidVpnStatus {
     pub vpn_fd_open: Option<bool>,
     pub session_id: Option<String>,
     pub last_error: Option<String>,
+    pub screen_suspended: Option<bool>,
     pub tx_packets: Option<u64>,
     pub tx_bytes: Option<u64>,
     pub rx_packets: Option<u64>,
@@ -1032,6 +1044,9 @@ impl AndroidVpnStatus {
             } else if let Some(value) = line.strip_prefix("lastError=") {
                 status.present = true;
                 status.last_error = (value != "none").then(|| value.to_owned());
+            } else if let Some(value) = line.strip_prefix("screenSuspended=") {
+                status.present = true;
+                status.screen_suspended = value.parse().ok();
             } else if let Some(value) = line.strip_prefix("controlRttSamples=") {
                 status.control_rtt_samples = value.parse().ok();
             } else if let Some(value) = line.strip_prefix("controlRttP99Us=") {
@@ -1567,7 +1582,7 @@ mod tests {
             Ok(AdbOutput::success("Package not found")),
             Ok(AdbOutput::success("Success")),
             Ok(AdbOutput::success(
-                "versionCode=48 minSdk=29 targetSdk=36\nversionName=4.0.5\n",
+                "versionCode=49 minSdk=29 targetSdk=36\nversionName=4.0.6\n",
             )),
         ]));
         AdbController::new(mock.clone())
@@ -1607,7 +1622,7 @@ mod tests {
             Ok(AdbOutput::success("Package not found")),
             Ok(AdbOutput::success("Success")),
             Ok(AdbOutput::success(
-                "versionCode=48 minSdk=29 targetSdk=36\nversionName=4.0.5\n",
+                "versionCode=49 minSdk=29 targetSdk=36\nversionName=4.0.6\n",
             )),
         ]));
         AdbController::new(mock.clone())
@@ -1630,7 +1645,7 @@ mod tests {
         let mock = Arc::new(MockAdb::with_results(vec![
             Ok(AdbOutput::success("device")),
             Ok(AdbOutput::success(
-                "versionCode=48 minSdk=29 targetSdk=36\nversionName=4.0.5\n",
+                "versionCode=49 minSdk=29 targetSdk=36\nversionName=4.0.6\n",
             )),
         ]));
         AdbController::new(mock.clone())
@@ -1732,10 +1747,11 @@ mod tests {
     #[test]
     fn parses_payload_free_android_rtt_and_traffic_status() {
         let status = AndroidVpnStatus::parse(
-            "gnirehtet.state=CONNECTED\nvpnFdOpen=true\nsessionId=00112233-4455-6677-8899-aabbccddeeff\nlastError=none\ntxPackets=10 txBytes=20 rxPackets=30 rxBytes=40\ncontrolRttSamples=5\ncontrolRttP99Us=2000\ncontrolRttMaxUs=3000\ncontrolRttHistogram=1,2,2,0,0,0,0,0,0,0\n",
+            "gnirehtet.state=CONNECTED\nvpnFdOpen=true\nsessionId=00112233-4455-6677-8899-aabbccddeeff\nlastError=none\nscreenSuspended=true\ntxPackets=10 txBytes=20 rxPackets=30 rxBytes=40\ncontrolRttSamples=5\ncontrolRttP99Us=2000\ncontrolRttMaxUs=3000\ncontrolRttHistogram=1,2,2,0,0,0,0,0,0,0\n",
         );
         assert!(status.present);
         assert_eq!(status.state.as_deref(), Some("connected"));
+        assert_eq!(status.screen_suspended, Some(true));
         assert_eq!(status.tx_bytes, Some(20));
         assert_eq!(status.control_rtt_p99_us, Some(2_000));
         assert_eq!(status.control_rtt_histogram.len(), 10);

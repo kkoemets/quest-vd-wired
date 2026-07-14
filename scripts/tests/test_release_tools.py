@@ -373,8 +373,8 @@ class CommandLineToolsTest(unittest.TestCase):
                 "#!/bin/sh\n"
                 "case \"$2\" in\n"
                 "application-id) echo com.genymobile.gnirehtet ;;\n"
-                "version-code) echo 48 ;;\n"
-                "version-name) echo 4.0.5 ;;\n"
+                "version-code) echo 49 ;;\n"
+                "version-name) echo 4.0.6 ;;\n"
                 "min-sdk) echo 29 ;;\n"
                 "target-sdk) echo 36 ;;\n"
                 "debuggable) echo false ;;\n"
@@ -487,10 +487,11 @@ class ReleasePolicyTest(unittest.TestCase):
         rust_v4 = (REPOSITORY / "host-rust/Cargo.toml").read_text(encoding="utf-8")
         ignore = (REPOSITORY / ".gitignore").read_text(encoding="utf-8")
 
-        self.assertIn("v4.0.5 — current release", readme)
+        self.assertIn("v4.0.6 — current release", readme)
         self.assertIn("v3.1.0 Legacy", readme)
         self.assertIn("gnirehtet-java-v3.1.0.zip", readme)
-        self.assertIn("gnirehtet-v4.0.5-windows-x64.zip", readme)
+        self.assertIn("gnirehtet-v4.0.6-windows-x64.zip", readme)
+        self.assertNotIn("v4.0.5", readme)
         self.assertNotIn("v4.0.4", readme)
         self.assertNotIn("v4.0.3", readme)
         self.assertNotIn("v4.0.1", readme)
@@ -501,9 +502,9 @@ class ReleasePolicyTest(unittest.TestCase):
         self.assertTrue((REPOSITORY / "release").is_file())
         self.assertTrue((REPOSITORY / "scripts/build_v4_android_rc.sh").is_file())
         self.assertTrue((REPOSITORY / "scripts/build_v4_windows_rc.ps1").is_file())
-        self.assertIn('versionCode = 48', android_v4)
-        self.assertIn('versionName = "4.0.5"', android_v4)
-        self.assertIn('version = "4.0.5"', rust_v4)
+        self.assertIn('versionCode = 49', android_v4)
+        self.assertIn('versionName = "4.0.6"', android_v4)
+        self.assertIn('version = "4.0.6"', rust_v4)
 
     def test_android_release_dependency_compliance_is_fail_closed(self) -> None:
         gradle = (REPOSITORY / "android-v4/app/build.gradle.kts").read_text(encoding="utf-8")

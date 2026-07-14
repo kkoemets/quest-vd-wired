@@ -18,6 +18,7 @@ use tokio::{
 
 const CONTROL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
 const CONTROL_FRAME_TIMEOUT: Duration = Duration::from_secs(4);
+pub(crate) const CONTROL_TRANSPORT_LOST_REASON: &str = "control transport lost; VPN remains active";
 
 use crate::{
     diagnostics::{Diagnostics, LatencyHistogram, LatencyHistogramSnapshot},
@@ -480,7 +481,7 @@ impl ControlServer {
                     "control transport was lost during explicit stop; VPN state is unverified",
                 );
             } else {
-                state.transport_lost("control transport lost; VPN remains active");
+                state.transport_lost(CONTROL_TRANSPORT_LOST_REASON);
             }
         }
         self.publish().await;
