@@ -12,6 +12,7 @@ import android.content.IntentFilter
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.hardware.display.DisplayManager
 import android.net.VpnService
 import android.os.Build
 import android.os.Handler
@@ -21,6 +22,7 @@ import android.os.ParcelFileDescriptor
 import android.os.PowerManager
 import android.os.Process
 import android.util.Log
+import android.view.Display
 import java.io.FileDescriptor
 import java.io.IOException
 import java.io.PrintWriter
@@ -46,6 +48,17 @@ internal fun stopTargetsGeneration(
     activeGeneration == expectedGeneration ||
     (teardownInProgress && closingGeneration == expectedGeneration)
 
+internal fun isHeadsetDisplaySuspended(displayState: Int?, isInteractive: Boolean): Boolean =
+    when (displayState) {
+        Display.STATE_ON, Display.STATE_VR -> false
+        Display.STATE_OFF,
+        Display.STATE_DOZE,
+        Display.STATE_DOZE_SUSPEND,
+        Display.STATE_ON_SUSPEND,
+        -> true
+        else -> !isInteractive
+    }
+
 class VdLinkVpnService : VpnService() {
     private data class SessionResources(
         val generation: Long,
@@ -67,13 +80,28 @@ class VdLinkVpnService : VpnService() {
     private val destroyed = AtomicBoolean()
     private val screenSuspended = AtomicBoolean()
     private val screenReceiverRegistered = AtomicBoolean()
+    private val displayListenerRegistered = AtomicBoolean()
 
     private val screenReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             when (intent?.action) {
                 Intent.ACTION_SCREEN_OFF -> setScreenSuspended(true)
-                Intent.ACTION_SCREEN_ON -> setScreenSuspended(false)
+                Intent.ACTION_SCREEN_ON -> refreshScreenState()
             }
+        }
+    }
+
+    private val displayListener = object : DisplayManager.DisplayListener {
+        override fun onDisplayAdded(displayId: Int) {
+            if (displayId == Display.DEFAULT_DISPLAY) refreshScreenState()
+        }
+
+        override fun onDisplayRemoved(displayId: Int) {
+            if (displayId == Display.DEFAULT_DISPLAY) refreshScreenState()
+        }
+
+        override fun onDisplayChanged(displayId: Int) {
+            if (displayId == Display.DEFAULT_DISPLAY) refreshScreenState()
         }
     }
 
@@ -85,7 +113,8 @@ class VdLinkVpnService : VpnService() {
 
     override fun onCreate() {
         super.onCreate()
-        screenSuspended.set(!getSystemService(PowerManager::class.java).isInteractive)
+        getSystemService(DisplayManager::class.java).registerDisplayListener(displayListener, mainHandler)
+        displayListenerRegistered.set(true)
         val filter = IntentFilter().apply {
             addAction(Intent.ACTION_SCREEN_OFF)
             addAction(Intent.ACTION_SCREEN_ON)
@@ -97,6 +126,7 @@ class VdLinkVpnService : VpnService() {
             registerReceiver(screenReceiver, filter)
         }
         screenReceiverRegistered.set(true)
+        refreshScreenState()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -318,6 +348,14 @@ class VdLinkVpnService : VpnService() {
         }
     }
 
+    private fun refreshScreenState() {
+        val displayState = getSystemService(DisplayManager::class.java)
+            .getDisplay(Display.DEFAULT_DISPLAY)
+            ?.state
+        val interactive = getSystemService(PowerManager::class.java).isInteractive
+        setScreenSuspended(isHeadsetDisplaySuspended(displayState, interactive))
+    }
+
     private fun failGeneration(generation: Long, error: Throwable) {
         synchronized(lifecycleLock) {
             if (!generationGate.isCurrent(generation)) return
@@ -505,6 +543,11 @@ class VdLinkVpnService : VpnService() {
     }
 
     override fun onDestroy() {
+        if (displayListenerRegistered.compareAndSet(true, false)) {
+            runCatching {
+                getSystemService(DisplayManager::class.java).unregisterDisplayListener(displayListener)
+            }.onFailure { Log.w(TAG, "Could not unregister display listener", it) }
+        }
         if (screenReceiverRegistered.compareAndSet(true, false)) {
             runCatching { unregisterReceiver(screenReceiver) }
                 .onFailure { Log.w(TAG, "Could not unregister screen receiver", it) }

@@ -124,8 +124,8 @@ struct RelayGateState {
     generation: u64,
 }
 
-/// Invalidates every active relay flow when the authenticated control session
-/// degrades, while keeping the listeners alive for a fresh wake connection.
+/// Invalidates every active relay flow on confirmed suspend or carrier loss,
+/// while keeping the listeners alive for a fresh wake connection.
 #[derive(Clone, Debug)]
 pub struct RelayGate {
     sender: watch::Sender<RelayGateState>,
