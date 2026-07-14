@@ -2738,12 +2738,12 @@ mod tests {
             pid: 42,
             creation_time_100ns: 100,
             session_id: session,
-            executable_path: r"C:\Program Files\Gnirehtet\gnirehtet-vd.exe".into(),
+            executable_path: r"C:\Program Files\Quest VD Wired\quest-vd-wired.exe".into(),
         };
         let valid = WindowsProcessSnapshot {
             active: true,
             creation_time_100ns: 100,
-            executable_path: r"c:\program files\gnirehtet\GNIREHTET-VD.EXE".into(),
+            executable_path: r"c:\program files\quest vd wired\QUEST-VD-WIRED.EXE".into(),
         };
         assert!(daemon_identity_matches(&identity, &valid));
 
@@ -2751,7 +2751,7 @@ mod tests {
         reused.creation_time_100ns += 1;
         assert!(!daemon_identity_matches(&identity, &reused));
         let mut wrong_image = valid.clone();
-        wrong_image.executable_path = r"C:\Other\gnirehtet-vd.exe".into();
+        wrong_image.executable_path = r"C:\Other\quest-vd-wired.exe".into();
         assert!(!daemon_identity_matches(&identity, &wrong_image));
         let mut zero_session = identity.clone();
         zero_session.session_id = SessionId::ZERO.to_string();

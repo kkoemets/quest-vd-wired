@@ -39,7 +39,7 @@ use serde_json::json;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 #[derive(Debug, Parser)]
 #[command(
-    name = "gnirehtet-vd",
+    name = "quest-vd-wired",
     version,
     about = "Quest 3 Virtual Desktop wired link"
 )]
@@ -177,7 +177,10 @@ async fn execute_public_command(
         }
         Command::Doctor => Ok(serde_json::to_string_pretty(&doctor(paths, adb))?),
         Command::Diagnostics(args) => diagnostics(paths, adb, args).await,
-        Command::Version => Ok(format!("gnirehtet-vd {} (GNR4)", env!("CARGO_PKG_VERSION"))),
+        Command::Version => Ok(format!(
+            "quest-vd-wired {} (GNR4)",
+            env!("CARGO_PKG_VERSION")
+        )),
         Command::Daemon(_) => bail!("internal daemon commands cannot enter the public broker"),
     }
 }
@@ -491,7 +494,10 @@ impl BrokerContext {
 
     async fn execute(&self, command: Command) -> Result<String> {
         match command {
-            Command::Version => Ok(format!("gnirehtet-vd {} (GNR4)", env!("CARGO_PKG_VERSION"))),
+            Command::Version => Ok(format!(
+                "quest-vd-wired {} (GNR4)",
+                env!("CARGO_PKG_VERSION")
+            )),
             Command::Diagnostics(DiagnosticsArgs {
                 command: DiagnosticsCommand::Export { path },
             }) => {
@@ -765,7 +771,7 @@ async fn send_broker_command(
         let response: BrokerResponse = read_broker_frame(&mut stream).await?;
         if response.protocol_version != BROKER_PROTOCOL_VERSION {
             bail!(
-                "another Gnirehtet VD version is already running (broker protocol {}, expected {}); turn Wired link off, choose Exit, then start {}",
+                "another Quest VD Wired version is already running (broker protocol {}, expected {}); turn Wired link off, choose Exit, then start {}",
                 response.protocol_version,
                 BROKER_PROTOCOL_VERSION,
                 env!("CARGO_PKG_VERSION")
@@ -906,7 +912,7 @@ async fn stop(paths: &AppPaths, adb: &AdbController) -> Result<String> {
                 // require a fresh Stop transaction to remove and verify.
                 thread::sleep(ADB_MAPPING_COMMAND_TIMEOUT);
                 bail!(
-                    "host command lane failed ({command_error}); the verified daemon and ADB clients were quiesced and the mapping-command drain elapsed without changing the VPN; run `gnirehtet-vd stop` again"
+                    "host command lane failed ({command_error}); the verified daemon and ADB clients were quiesced and the mapping-command drain elapsed without changing the VPN; run `quest-vd-wired stop` again"
                 );
             } else if runtime_may_be_active(paths) {
                 bail!(
@@ -1252,7 +1258,7 @@ async fn no_argument_entry(
             println!("{}", serde_json::to_string_pretty(&response)?);
             return Ok(());
         }
-        bail!("no-argument notification-area mode is Windows-only; use `gnirehtet-vd start`")
+        bail!("no-argument notification-area mode is Windows-only; use `quest-vd-wired start`")
     }
 }
 
@@ -1674,7 +1680,7 @@ fn tray_tooltip(desired_on: bool, observation: Option<TrayHostObservation>) -> &
     if observation
         .is_some_and(|state| state.daemon_running && state.lifecycle == HostState::Connected)
     {
-        "Gnirehtet VD — connected"
+        "Quest VD Wired — connected"
     } else if observation.is_some_and(|state| state.lifecycle == HostState::Degraded) {
         "Wired link: headset asleep — reconnecting"
     } else {
@@ -2105,7 +2111,7 @@ fn run_windows_tray(
                 if let Ok(mut last_error) = TRAY_LAST_ERROR.lock() {
                     if let Some(error) = last_error.take() {
                         let message = wide_windows(&error);
-                        let title = wide_windows("Gnirehtet VD needs attention");
+                        let title = wide_windows("Quest VD Wired needs attention");
                         MessageBoxW(
                             null_mut(),
                             message.as_ptr(),
@@ -2296,13 +2302,18 @@ mod tests {
     #[test]
     fn public_start_cli_does_not_allow_a_package_override() {
         assert!(Cli::try_parse_from([
-            "gnirehtet-vd",
+            "quest-vd-wired",
             "start",
             "--vd-package",
             "com.example.unexpected",
         ])
         .is_err());
-        assert!(Cli::try_parse_from(["gnirehtet-vd", "start", "--all-traffic"]).is_ok());
+        assert!(Cli::try_parse_from(["quest-vd-wired", "start", "--all-traffic"]).is_ok());
+    }
+
+    #[test]
+    fn public_cli_uses_the_quest_vd_wired_name() {
+        assert_eq!(Cli::command().get_name(), "quest-vd-wired");
     }
 
     #[test]
@@ -2338,7 +2349,7 @@ mod tests {
     #[test]
     fn daemon_cli_rejects_zero_session_nonce() {
         assert!(Cli::try_parse_from([
-            "gnirehtet-vd",
+            "quest-vd-wired",
             "daemon",
             "--session",
             "00000000-0000-0000-0000-000000000000",
@@ -2465,7 +2476,7 @@ mod tests {
         assert_eq!(tray_tooltip(false, Some(connected)), "Wired link: stopping");
         assert_eq!(
             tray_tooltip(true, Some(connected)),
-            "Gnirehtet VD — connected"
+            "Quest VD Wired — connected"
         );
         assert_eq!(
             tray_tooltip(true, Some(sleeping)),

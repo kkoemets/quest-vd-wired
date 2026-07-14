@@ -83,6 +83,40 @@ def verify_no_local_paths(executable: Path, local_roots: Sequence[str] = ()) -> 
             )
 
 
+def verify_version_metadata(
+    executable: Path,
+    *,
+    product_name: str,
+    original_filename: str,
+    product_version: str,
+) -> None:
+    data = executable.read_bytes()
+    expected = {
+        "product name": ("ProductName", product_name),
+        "original filename": ("OriginalFilename", original_filename),
+        "product version": ("ProductVersion", product_version),
+    }
+    for label, (key, value) in expected.items():
+        key_bytes = f"{key}\0".encode("utf-16-le")
+        value_bytes = f"{value}\0".encode("utf-16-le")
+        search_from = 0
+        matched = False
+        while True:
+            key_offset = data.find(key_bytes, search_from)
+            if key_offset < 0:
+                break
+            value_offset = key_offset + len(key_bytes)
+            if any(
+                data.startswith(b"\0" * padding + value_bytes, value_offset)
+                for padding in range(4)
+            ):
+                matched = True
+                break
+            search_from = key_offset + 2
+        if not matched:
+            raise VerificationError(f"Windows release executable omits the {label}")
+
+
 def verify_static_runtime_imports(executable: Path, llvm_readobj: Path) -> list[str]:
     process = subprocess.run(
         [str(llvm_readobj), "--coff-imports", str(executable)],
@@ -110,6 +144,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("executable", type=Path)
     parser.add_argument("--local-root", action="append", default=[])
     parser.add_argument("--llvm-readobj", type=Path)
+    parser.add_argument("--product-name")
+    parser.add_argument("--original-filename")
+    parser.add_argument("--product-version")
     return parser.parse_args(argv)
 
 
@@ -118,6 +155,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         verify_no_local_paths(args.executable, args.local_root)
         print("local_build_paths=none")
+        metadata_values = (
+            args.product_name,
+            args.original_filename,
+            args.product_version,
+        )
+        if any(metadata_values):
+            if not all(metadata_values):
+                raise VerificationError(
+                    "product name, original filename, and product version must be checked together"
+                )
+            verify_version_metadata(
+                args.executable,
+                product_name=args.product_name,
+                original_filename=args.original_filename,
+                product_version=args.product_version,
+            )
+            print("windows_version_metadata=verified")
         if args.llvm_readobj is not None:
             imports = verify_static_runtime_imports(args.executable, args.llvm_readobj)
             print("external_vc_runtime_imports=none")

@@ -25,6 +25,8 @@ WINDOWS_RESERVED_NAMES = frozenset(
     | {f"COM{index}" for index in range(1, 10)}
     | {f"LPT{index}" for index in range(1, 10)}
 )
+RELEASE_EXECUTABLE = "quest-vd-wired.exe"
+RETIRED_EXECUTABLE = "gnirehtet-vd.exe"
 
 
 class PackagingError(ValueError):
@@ -100,6 +102,15 @@ def _collect_entries(root: Path) -> list[Entry]:
     entries.sort(key=lambda entry: entry.archive_name)
     if not any(not entry.is_directory for entry in entries):
         raise PackagingError("staging directory contains no release files")
+    files = {
+        entry.archive_name.casefold()
+        for entry in entries
+        if not entry.is_directory
+    }
+    if RELEASE_EXECUTABLE.casefold() not in files:
+        raise PackagingError(f"staging directory is missing {RELEASE_EXECUTABLE}")
+    if RETIRED_EXECUTABLE.casefold() in files:
+        raise PackagingError(f"staging directory still contains {RETIRED_EXECUTABLE}")
     return entries
 
 

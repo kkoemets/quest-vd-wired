@@ -9,9 +9,12 @@ a special network driver, SideQuest, or a rooted headset.
 
 ## Download for Windows
 
-[**Download Quest VD Wired v4.0.7 for Windows 10/11**](https://github.com/kkoemets/quest-vd-wired/releases/download/v4.0.7/gnirehtet-v4.0.7-windows-x64.zip)
+[**Download Quest VD Wired v4.1.0 for Windows 10/11**](https://github.com/kkoemets/quest-vd-wired/releases/download/v4.1.0/quest-vd-wired-v4.1.0-windows-x64.zip)
 
-Extract the ZIP, connect your Quest 3, and double-click `gnirehtet-vd.exe`.
+Extract the ZIP, connect your Quest 3, and double-click `quest-vd-wired.exe`.
+
+If an older version is already open, choose **Exit** from its tray icon before
+starting v4.1.0.
 
 ## Before you start
 
@@ -31,7 +34,7 @@ prompt. Select **Always allow from this computer** if that choice is shown.
 
 1. Download and extract the ZIP.
 2. Connect the Quest 3 and accept the USB debugging prompt.
-3. Double-click `gnirehtet-vd.exe`.
+3. Double-click `quest-vd-wired.exe`.
 4. Accept the VPN prompt inside the headset if it appears.
 5. Open Virtual Desktop on the Quest.
 

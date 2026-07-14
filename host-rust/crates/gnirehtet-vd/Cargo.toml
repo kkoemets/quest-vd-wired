@@ -12,7 +12,7 @@ name = "gnirehtet_vd"
 path = "src/lib.rs"
 
 [[bin]]
-name = "gnirehtet-vd"
+name = "quest-vd-wired"
 path = "src/main.rs"
 
 [dependencies]

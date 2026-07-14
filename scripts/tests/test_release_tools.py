@@ -119,6 +119,53 @@ class WindowsReleaseVerificationTest(unittest.TestCase):
                     ),
                 )
 
+    def test_windows_version_metadata_is_required_exactly(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / "release.exe"
+            metadata = "".join(
+                (
+                    "ProductName\0Quest VD Wired\0",
+                    "OriginalFilename\0quest-vd-wired.exe\0",
+                    "ProductVersion\0" "4.1.0\0",
+                )
+            ).encode("utf-16-le")
+            executable.write_bytes(b"MZ" + metadata)
+            verify_windows_release.verify_version_metadata(
+                executable,
+                product_name="Quest VD Wired",
+                original_filename="quest-vd-wired.exe",
+                product_version="4.1.0",
+            )
+            with self.assertRaises(verify_windows_release.VerificationError):
+                verify_windows_release.verify_version_metadata(
+                    executable,
+                    product_name="Quest VD Wired",
+                    original_filename="gnirehtet-vd.exe",
+                    product_version="4.1.0",
+                )
+
+    def test_windows_version_metadata_rejects_loose_or_wrong_field_strings(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / "release.exe"
+            metadata = "".join(
+                (
+                    "FileDescription\0Quest VD Wired\0",
+                    "InternalName\0quest-vd-wired.exe\0",
+                    "FileVersion\0" "4.1.0\0",
+                    "ProductName\0Wrong product\0",
+                    "OriginalFilename\0wrong.exe\0",
+                    "ProductVersion\0" "4.1.0.0\0",
+                )
+            ).encode("utf-16-le")
+            executable.write_bytes(b"MZ" + metadata)
+            with self.assertRaises(verify_windows_release.VerificationError):
+                verify_windows_release.verify_version_metadata(
+                    executable,
+                    product_name="Quest VD Wired",
+                    original_filename="quest-vd-wired.exe",
+                    product_version="4.1.0",
+                )
+
     def test_dynamic_vc_runtime_import_is_rejected(self) -> None:
         for runtime in ("VCRUNTIME140.dll", "ucrtbase.dll", "api-ms-win-crt-runtime-l1-1-0.dll"):
             with self.subTest(runtime=runtime):
@@ -373,8 +420,8 @@ class CommandLineToolsTest(unittest.TestCase):
                 "#!/bin/sh\n"
                 "case \"$2\" in\n"
                 "application-id) echo com.genymobile.gnirehtet ;;\n"
-                "version-code) echo 50 ;;\n"
-                "version-name) echo 4.0.7 ;;\n"
+                "version-code) echo 51 ;;\n"
+                "version-name) echo 4.1.0 ;;\n"
                 "min-sdk) echo 29 ;;\n"
                 "target-sdk) echo 36 ;;\n"
                 "debuggable) echo false ;;\n"
@@ -484,13 +531,17 @@ class ReleasePolicyTest(unittest.TestCase):
         android_v4 = (REPOSITORY / "android-v4/app/build.gradle.kts").read_text(
             encoding="utf-8"
         )
+        android_strings = (
+            REPOSITORY / "android-v4/app/src/main/res/values/strings.xml"
+        ).read_text(encoding="utf-8")
         rust_v4 = (REPOSITORY / "host-rust/Cargo.toml").read_text(encoding="utf-8")
         ignore = (REPOSITORY / ".gitignore").read_text(encoding="utf-8")
 
-        self.assertIn("v4.0.7 — current release", readme)
+        self.assertIn("Quest VD Wired v4.1.0 for Windows 10/11", readme)
         self.assertIn("v3.1.0 Legacy", readme)
         self.assertIn("gnirehtet-java-v3.1.0.zip", readme)
-        self.assertIn("gnirehtet-v4.0.7-windows-x64.zip", readme)
+        self.assertIn("quest-vd-wired-v4.1.0-windows-x64.zip", readme)
+        self.assertIn("quest-vd-wired.exe", readme)
         self.assertNotIn("v4.0.6", readme)
         self.assertNotIn("v4.0.5", readme)
         self.assertNotIn("v4.0.4", readme)
@@ -503,9 +554,10 @@ class ReleasePolicyTest(unittest.TestCase):
         self.assertTrue((REPOSITORY / "release").is_file())
         self.assertTrue((REPOSITORY / "scripts/build_v4_android_rc.sh").is_file())
         self.assertTrue((REPOSITORY / "scripts/build_v4_windows_rc.ps1").is_file())
-        self.assertIn('versionCode = 50', android_v4)
-        self.assertIn('versionName = "4.0.7"', android_v4)
-        self.assertIn('version = "4.0.7"', rust_v4)
+        self.assertIn('versionCode = 51', android_v4)
+        self.assertIn('versionName = "4.1.0"', android_v4)
+        self.assertIn('<string name="app_name">Quest VD Wired</string>', android_strings)
+        self.assertIn('version = "4.1.0"', rust_v4)
 
     def test_windows_executable_uses_the_green_tray_icon(self) -> None:
         crate = (REPOSITORY / "host-rust/crates/gnirehtet-vd/Cargo.toml").read_text(
@@ -521,8 +573,20 @@ class ReleasePolicyTest(unittest.TestCase):
         self.assertIn('embed-resource = "=3.0.7"', crate)
         self.assertIn('embed_resource::compile_for(', build)
         self.assertIn('"assets/windows.rc"', build)
-        self.assertIn('["gnirehtet-vd"]', build)
-        self.assertEqual('1 ICON "tray-on.ico"\n', resource)
+        self.assertIn('["quest-vd-wired"]', build)
+        self.assertIn('VERSION_MAJOR=', build)
+        self.assertIn('1 ICON "tray-on.ico"', resource)
+        self.assertIn("1 VERSIONINFO", resource)
+        self.assertIn('VALUE "ProductName", "Quest VD Wired\\0"', resource)
+        self.assertIn('VALUE "OriginalFilename", "quest-vd-wired.exe\\0"', resource)
+
+        builder = (REPOSITORY / "scripts/build_v4_windows_rc.ps1").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("quest-vd-wired.exe", builder)
+        self.assertNotIn("gnirehtet-vd.exe", builder)
+        self.assertIn("ProductVersion", builder)
+        self.assertIn('("ICON", "GROUP_ICON", "VERSION")', builder)
 
     def test_android_release_dependency_compliance_is_fail_closed(self) -> None:
         gradle = (REPOSITORY / "android-v4/app/build.gradle.kts").read_text(encoding="utf-8")

@@ -69,7 +69,7 @@ class RustSbomSanitizerTest(unittest.TestCase):
                         {
                             "type": "application",
                             "bom-ref": f"{root_ref} bin-target-1",
-                            "name": "gnirehtet-vd",
+                            "name": "quest-vd-wired",
                             "version": "4.0.5",
                             "purl": "pkg:cargo/gnirehtet-vd@4.0.5?download_url=file://.#src/main.rs",
                         },
@@ -125,7 +125,7 @@ class RustSbomSanitizerTest(unittest.TestCase):
         self.assertEqual(stable_root, root["purl"])
         self.assertEqual(
             [
-                "pkg:cargo/gnirehtet-vd@4.0.5?target=application%3Agnirehtet-vd",
+                "pkg:cargo/gnirehtet-vd@4.0.5?target=application%3Aquest-vd-wired",
                 "pkg:cargo/gnirehtet-vd@4.0.5?target=library%3Agnirehtet_vd",
             ],
             [component["bom-ref"] for component in root["components"]],
