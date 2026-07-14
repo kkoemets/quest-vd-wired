@@ -1,6 +1,19 @@
 use std::{env, fs, path::PathBuf};
 
+fn embed_windows_icon() {
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+
+    println!("cargo:rerun-if-changed=assets/windows.rc");
+    println!("cargo:rerun-if-changed=assets/tray-on.ico");
+    embed_resource::compile_for("assets/windows.rc", ["gnirehtet-vd"], embed_resource::NONE)
+        .manifest_required()
+        .expect("embedding the Windows executable icon");
+}
+
 fn main() {
+    embed_windows_icon();
     println!("cargo:rerun-if-env-changed=GNIREHTET_VD_APK");
     println!("cargo:rerun-if-env-changed=CARGO_CFG_FUZZING");
     let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());

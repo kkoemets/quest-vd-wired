@@ -31,3 +31,6 @@ windows-sys.workspace = true
 [dev-dependencies]
 proptest = "1.5"
 tempfile = "3.12"
+
+[build-dependencies]
+embed-resource = "=3.0.7"
