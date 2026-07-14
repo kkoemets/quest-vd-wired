@@ -1,40 +1,17 @@
-# Wired Virtual Desktop for Meta Quest 3
+# Quest VD Wired: Virtual Desktop over USB-C on Meta Quest 3
 
-Use Virtual Desktop on your Quest 3 through a USB cable instead of relying on
-Quest Wi-Fi. The PC keeps its normal internet connection and shares it with the
-headset through the cable.
+Quest VD Wired is a free, open-source Windows app that gives Virtual Desktop a
+wired connection through a USB 3 or link cable instead of Quest Wi-Fi. It is
+based on the open-source gnirehtet project and made specifically for Quest 3.
 
-This project is for one Quest 3 and a Windows 10 or Windows 11 PC. It does not
-need administrator access, a special network driver, SideQuest, or a rooted
-headset.
+It works with Windows 10 and Windows 11. It does not need administrator access,
+a special network driver, SideQuest, or a rooted headset.
 
-## Choose your download
+## Download for Windows
 
-### v4.0.7 — current release
+[**Download Quest VD Wired v4.0.7 for Windows 10/11**](https://github.com/kkoemets/quest-vd-wired/releases/download/v4.0.7/gnirehtet-v4.0.7-windows-x64.zip)
 
-This is the latest version and the recommended download. It starts from a
-simple icon near the Windows clock and reconnects automatically. Opening the
-app again returns to the same icon instead of leaving another copy running. It
-disconnects when the headset sleeps and reconnects when you put it back on.
-
-[Download v4.0.7](https://github.com/kkoemets/quest-vd-wired/releases/download/v4.0.7/gnirehtet-v4.0.7-windows-x64.zip)
-
-### v3.1.0 Legacy — older Java version
-
-This is the previous Java version, kept available for users who need to roll
-back. New users should choose v4.0.7.
-
-[Download v3.1.0 Legacy](https://github.com/kkoemets/quest-vd-wired/releases/download/v3.1.0/gnirehtet-java-v3.1.0.zip)
-
-### v3.0.1 Legacy — older fallback
-
-This older release remains available as an additional fallback. New users
-should choose v4.0.7 instead.
-
-[Download v3.0.1 Legacy](https://github.com/kkoemets/quest-vd-wired/releases/download/v3.0.1/gnirehtet-java-v3.0.1.zip)
-
-If a download has not been published yet, check the
-[Releases page](https://github.com/kkoemets/quest-vd-wired/releases).
+Extract the ZIP, connect your Quest 3, and double-click `gnirehtet-vd.exe`.
 
 ## Before you start
 
@@ -50,32 +27,22 @@ You need:
 The first time you connect the headset, put it on and accept the USB debugging
 prompt. Select **Always allow from this computer** if that choice is shown.
 
-## Use v4.0.7
+## Get connected
 
-1. Download and extract the v4.0.7 zip.
+1. Download and extract the ZIP.
 2. Connect the Quest 3 and accept the USB debugging prompt.
 3. Double-click `gnirehtet-vd.exe`.
 4. Accept the VPN prompt inside the headset if it appears.
 5. Open Virtual Desktop on the Quest.
 
 The wired link switches on automatically. Its icon near the Windows clock is
-green while it is on and gray while it is off. Right-click the icon to turn
-the link on or off, run **Diagnose and fix**, or exit safely.
+green while it is on and gray while it is off. Right-click the icon to turn the
+link on or off, run **Diagnose and fix**, or exit safely.
 
 The app keeps trying quietly if the headset is not ready. Put on and unlock the
 headset if Windows is waiting for USB debugging permission.
 
-## Use v3.1.0 Legacy
-
-1. Download and extract the v3.1.0 Legacy zip.
-2. Connect the Quest 3 to the PC.
-3. Put on the headset and accept the USB debugging prompt.
-4. Double-click `gnirehtet-run.cmd`.
-5. Accept the VPN prompt inside the headset.
-6. Open Virtual Desktop on the Quest.
-
-Keep the launcher window open while using the legacy version. It requires a
-Java 11 or newer runtime.
+![Quest VD Wired tray menu](https://github.com/user-attachments/assets/2ce519de-3997-47e5-ac38-84eb974fd804)
 
 ## What success looks like
 
@@ -85,8 +52,7 @@ Java 11 or newer runtime.
 - The wired link reconnects after the cable is reattached and USB debugging is
   accepted again.
 
-If this wired link helps you, starring the project on GitHub makes it easier for
-other Quest users to find.
+If this wired link helps you, [star the project](https://github.com/kkoemets/quest-vd-wired) and share the repository link so other Quest users can find it.
 
 ![Quest VPN permission request](assets/request.jpg)
 
@@ -104,7 +70,7 @@ while setting this up.
 
 Make sure Virtual Desktop Streamer is running on Windows before opening Virtual
 Desktop on the Quest. If you force-closed the Streamer, start it again normally.
-The wired-link app will not start or restart Virtual Desktop for you.
+Quest VD Wired will not start or restart Virtual Desktop for you.
 
 ### Performance suddenly becomes worse
 
@@ -118,20 +84,59 @@ Reconnect it, put on the headset, and approve USB debugging again if asked. The
 wired link keeps trying to reconnect. Uncheck **Wired link** from the tray icon
 if you want to return the Quest to its normal network setup.
 
-### An older install will not update
+### Still need help?
 
-Official v3.1.0 and v4.0.7 releases use the same project signing identity and
-should update in place. Very old builds from another source may need to be
-removed once before installing this project.
+[Ask in GitHub Discussions](https://github.com/kkoemets/quest-vd-wired/discussions/categories/q-a).
 
-## Current or legacy?
+## Frequently asked questions
 
-Use **v4.0.7** for the current experience. Use **v3.1.0 Legacy** only if you
-need the older Java version. Both remain available from the Releases page.
+### Can Virtual Desktop use a USB cable on Quest 3?
+
+Yes, with Quest VD Wired. It creates a wired network connection through the
+cable so Virtual Desktop does not have to rely on Quest Wi-Fi.
+
+### Do I still need Virtual Desktop and Virtual Desktop Streamer?
+
+Yes. Virtual Desktop must be installed on the Quest, and Virtual Desktop
+Streamer must be running on the Windows PC. Quest VD Wired provides the wired
+connection between them.
+
+### Does this use Meta Quest Link?
+
+No. This is a separate community-made connection for Virtual Desktop. It does
+not install or replace Meta Quest Link.
+
+### Can it work with Quest Wi-Fi turned off?
+
+Yes. The PC keeps its normal internet connection and shares it with the Quest
+through the USB cable.
+
+### Is Quest VD Wired official?
+
+No. It is an independent, open-source community project. It is not made by or
+affiliated with Meta or Virtual Desktop.
+
+## Older versions
+
+### v3.1.0 Legacy
+
+This is the older Java version. New users should choose the current release.
+
+[Download v3.1.0 Legacy](https://github.com/kkoemets/quest-vd-wired/releases/download/v3.1.0/gnirehtet-java-v3.1.0.zip)
+
+### v3.0.1 Legacy fallback
+
+Use this only as an additional fallback if you need the older release.
+
+[Download v3.0.1 Legacy fallback](https://github.com/kkoemets/quest-vd-wired/releases/download/v3.0.1/gnirehtet-java-v3.0.1.zip)
 
 ## Privacy
 
 The app does not upload diagnostics or record the contents of your network
 traffic. Support information is saved locally only when you ask for it.
 
-This project is licensed under Apache License 2.0.
+Quest VD Wired is based on [Genymobile's gnirehtet](https://github.com/Genymobile/gnirehtet).
+Virtual Desktop is required separately. This unofficial community project is
+not affiliated with Meta or Virtual Desktop.
+
+Licensed under the Apache License 2.0.
