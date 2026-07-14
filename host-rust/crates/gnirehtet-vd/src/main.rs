@@ -1177,6 +1177,21 @@ async fn wait_for_daemon_exit(paths: &AppPaths, timeout: Duration) -> Result<()>
     bail!("daemon did not exit before {timeout:?}")
 }
 
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, Eq, PartialEq)]
+enum NoArgumentTrayAction<T> {
+    StartPrimary(T),
+    ExitWithoutBroker,
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn no_argument_tray_action<T>(instance: Option<T>) -> NoArgumentTrayAction<T> {
+    match instance {
+        Some(instance) => NoArgumentTrayAction::StartPrimary(instance),
+        None => NoArgumentTrayAction::ExitWithoutBroker,
+    }
+}
+
 async fn no_argument_entry(
     paths: AppPaths,
     adb_program: PathBuf,
@@ -1190,13 +1205,11 @@ async fn no_argument_entry(
         unsafe {
             windows_sys::Win32::System::Console::FreeConsole();
         }
-        let Some(instance) = acquire_tray_instance()? else {
-            if let Err(error) =
-                send_broker_command(&paths, &adb_program, BrokerCommand::Version).await
-            {
-                show_windows_message("Gnirehtet VD could not start", &format!("{error:#}"));
-            }
-            return Ok(());
+        let instance = match no_argument_tray_action(acquire_tray_instance()?) {
+            NoArgumentTrayAction::StartPrimary(instance) => instance,
+            // The existing window was already notified. Exit immediately: a
+            // broker connection here could spawn copies while it starts up.
+            NoArgumentTrayAction::ExitWithoutBroker => return Ok(()),
         };
         let class_name = instance.class_name.clone();
         // Prepare the first, ACL-restricted pipe before exposing the tray icon.
@@ -1903,23 +1916,6 @@ fn wide_windows(value: &str) -> Vec<u16> {
 }
 
 #[cfg(target_os = "windows")]
-fn show_windows_message(title: &str, message: &str) {
-    use std::ptr::null_mut;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OK};
-
-    let title = wide_windows(title);
-    let message = wide_windows(message);
-    unsafe {
-        MessageBoxW(
-            null_mut(),
-            message.as_ptr(),
-            title.as_ptr(),
-            MB_OK | MB_ICONINFORMATION,
-        );
-    }
-}
-
-#[cfg(target_os = "windows")]
 fn acquire_tray_instance() -> Result<Option<TrayInstance>> {
     use std::ptr::null;
     use windows_sys::Win32::{
@@ -2284,6 +2280,18 @@ mod tests {
     use clap::CommandFactory;
 
     use super::*;
+
+    #[test]
+    fn duplicate_no_argument_launch_exits_without_broker() {
+        assert_eq!(
+            no_argument_tray_action::<()>(None),
+            NoArgumentTrayAction::ExitWithoutBroker
+        );
+        assert_eq!(
+            no_argument_tray_action(Some(7)),
+            NoArgumentTrayAction::StartPrimary(7)
+        );
+    }
 
     #[test]
     fn public_start_cli_does_not_allow_a_package_override() {
