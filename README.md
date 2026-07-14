@@ -26,12 +26,12 @@ back. New users should choose v4.0.7.
 
 [Download v3.1.0 Legacy](https://github.com/kkoemets/quest-vd-wired/releases/download/v3.1.0/gnirehtet-java-v3.1.0.zip)
 
-### v3.0.0 Legacy — older fallback
+### v3.0.1 Legacy — older fallback
 
 This older release remains available as an additional fallback. New users
 should choose v4.0.7 instead.
 
-[Download v3.0.0 Legacy](https://github.com/kkoemets/quest-vd-wired/releases/download/v3.0.0/gnirehtet-java-v3.0.0.zip)
+[Download v3.0.1 Legacy](https://github.com/kkoemets/quest-vd-wired/releases/download/v3.0.1/gnirehtet-java-v3.0.1.zip)
 
 If a download has not been published yet, check the
 [Releases page](https://github.com/kkoemets/quest-vd-wired/releases).

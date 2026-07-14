@@ -497,7 +497,7 @@ class ReleasePolicyTest(unittest.TestCase):
         self.assertNotIn("v4.0.3", readme)
         self.assertNotIn("v4.0.1", readme)
         self.assertNotIn("v4.0.2", readme)
-        self.assertIn("gnirehtet-java-v3.0.0.zip", readme)
+        self.assertIn("gnirehtet-java-v3.0.1.zip", readme)
         self.assertNotIn("docs/", readme)
         self.assertIn("/docs/", ignore)
         self.assertTrue((REPOSITORY / "release").is_file())
