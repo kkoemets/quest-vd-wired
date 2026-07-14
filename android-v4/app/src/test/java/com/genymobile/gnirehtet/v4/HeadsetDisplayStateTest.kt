@@ -7,11 +7,11 @@ import org.junit.Test
 
 class HeadsetDisplayStateTest {
     @Test
-    fun onAndVrStatesAreAwake() {
+    fun onAndVrStatesAreAwakeOnlyWhileInteractive() {
         assertFalse(isHeadsetDisplaySuspended(Display.STATE_ON, isInteractive = true))
         assertFalse(isHeadsetDisplaySuspended(Display.STATE_VR, isInteractive = true))
-        assertFalse(isHeadsetDisplaySuspended(Display.STATE_ON, isInteractive = false))
-        assertFalse(isHeadsetDisplaySuspended(Display.STATE_VR, isInteractive = false))
+        assertTrue(isHeadsetDisplaySuspended(Display.STATE_ON, isInteractive = false))
+        assertTrue(isHeadsetDisplaySuspended(Display.STATE_VR, isInteractive = false))
     }
 
     @Test

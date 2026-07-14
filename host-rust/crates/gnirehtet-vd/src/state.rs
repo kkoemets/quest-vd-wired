@@ -113,6 +113,10 @@ impl StateMachine {
         if matches!(self.state, HostState::Preparing | HostState::Connected) {
             self.state = HostState::Degraded;
             self.reason = Some(reason.into());
+        } else if self.state == HostState::Degraded
+            && self.reason.as_deref() != Some(HEADSET_SUSPENDED_REASON)
+        {
+            self.reason = Some(reason.into());
         }
     }
 
@@ -251,11 +255,29 @@ mod tests {
         machine.peer_started(session, Instant::now()).unwrap();
 
         machine.peer_suspended(session).unwrap();
+        machine.transport_lost("control transport lost; VPN remains active");
 
         let snapshot = machine.snapshot();
         assert_eq!(snapshot.state, HostState::Degraded);
         assert_eq!(snapshot.reason.as_deref(), Some(HEADSET_SUSPENDED_REASON));
         assert_eq!(snapshot.missed_heartbeats, 0);
+    }
+
+    #[test]
+    fn transport_loss_replaces_heartbeat_only_degradation_reason() {
+        let session = SessionId([4; 16]);
+        let start = Instant::now();
+        let mut machine = StateMachine::new();
+        machine.begin_start(session).unwrap();
+        machine.peer_started(session, start).unwrap();
+        machine.tick(start + Duration::from_secs(3));
+
+        machine.transport_lost("control transport lost; VPN remains active");
+
+        assert_eq!(
+            machine.snapshot().reason.as_deref(),
+            Some("control transport lost; VPN remains active"),
+        );
     }
 
     #[test]
