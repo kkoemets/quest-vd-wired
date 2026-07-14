@@ -37,4 +37,4 @@ Notes
 - Java still needs to be installed separately if the launcher reports it
   missing.
 
-This is the legacy Java release. v4.0.4 is the recommended current version.
+This is the legacy Java release. v4.0.5 is the recommended current version.
