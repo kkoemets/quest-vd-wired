@@ -22,13 +22,35 @@ You need:
 
 - a Meta Quest 3 with Developer Mode enabled;
 - USB debugging enabled on the headset;
-- a USB 3 data cable;
+- a USB 3 data cable rated for 5 Gbps;
 - Virtual Desktop installed on the Quest;
 - Virtual Desktop Streamer running on the PC;
 - the PC connected to its normal internet network.
 
 The first time you connect the headset, put it on and accept the USB debugging
 prompt. Select **Always allow from this computer** if that choice is shown.
+
+## Use the right cable
+
+A USB-C plug does not guarantee that a cable is suitable. Some USB-C cables
+are made only for charging, while others carry slower USB 2 data.
+
+When buying a cable, look for **5 Gbps data**, **USB 3**, **USB 3.0**, **USB
+3.1 Gen 1**, **USB 3.2 Gen 1**, or **SuperSpeed** on the product page or
+packaging. A cable marked only **480 Mbps** or **USB 2.0** is not recommended.
+The headset end must be USB-C. The PC end may be USB-C or USB-A, but the PC
+port must also support USB 3.
+
+Do not choose a cable only by its charging rating, such as 60 W or 100 W.
+Charging speed and data speed are separate. Connect it directly to the PC while
+setting up instead of using a hub or adapter. For a long cable, choose one sold
+specifically for Quest Link, or an active or fibre-optic USB 3 cable.
+
+The safest choice is Meta's official [5 m fibre-optic Quest Link
+cable](https://www.meta.com/quest/accessories/link-cable/), which Meta lists as
+compatible with Quest 3. A third-party cable is fine when it clearly meets the
+USB 3 and 5 Gbps data requirement. USB-IF calls this speed [SuperSpeed USB or
+USB 3.2 Gen 1](https://www.usb.org/usb-32-0).
 
 ## Get connected
 
@@ -66,8 +88,9 @@ If this wired link helps you, [star the project](https://github.com/kkoemets/que
 ### The headset is not found
 
 Put on the Quest and look for the USB debugging prompt. Try another USB port or
-data cable if Windows still cannot see it. Disconnect other Android devices
-while setting this up.
+5 Gbps USB 3 data cable if Windows still cannot see it. Connect directly to the
+PC instead of through a hub or adapter. Disconnect other Android devices while
+setting this up.
 
 ### Virtual Desktop cannot find the PC
 
