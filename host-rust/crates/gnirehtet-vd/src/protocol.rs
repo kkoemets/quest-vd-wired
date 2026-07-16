@@ -10,6 +10,7 @@ pub const VERSION: u16 = 4;
 pub const HEADER_LEN: usize = 28;
 pub const MAX_PAYLOAD_LEN: usize = 64 * 1024;
 pub const METRICS_V1_PAYLOAD_LEN: usize = 60;
+pub const STARTED_WAKE_PAYLOAD: &[u8] = &[1];
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct SessionId(pub [u8; 16]);

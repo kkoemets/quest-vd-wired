@@ -49,6 +49,8 @@ class ControlSupervisor(
     private val suspendAcknowledgement = AtomicReference<CountDownLatch?>()
     private val controlReady = AtomicBoolean()
     private val stopRequested = AtomicBoolean()
+    private val wakePending = AtomicBoolean()
+    private val resetReconnectDelay = AtomicBoolean()
     @Volatile private var socket: Socket? = null
     @Volatile private var thread: Thread? = null
 
@@ -67,6 +69,7 @@ class ControlSupervisor(
     fun suspend() {
         var connected: Socket? = null
         var acknowledgement: CountDownLatch? = null
+        var acknowledged = false
         synchronized(pauseLock) {
             if (!paused.compareAndSet(false, true)) return
             connected = socket
@@ -77,6 +80,7 @@ class ControlSupervisor(
         }
         if (acknowledgement != null) {
             runCatching {
+                connected!!.soTimeout = WAKE_CONFIRM_TIMEOUT_MS
                 write(connected!!, Gnr4Frame(Gnr4MessageType.SUSPEND, sessionId))
             }.onFailure {
                 suspendAcknowledgement.compareAndSet(acknowledgement, null)
@@ -84,25 +88,51 @@ class ControlSupervisor(
             }
         }
         try {
-            acknowledgement?.await(SUSPEND_ACK_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            acknowledged = acknowledgement?.await(
+                SUSPEND_ACK_TIMEOUT_MS,
+                TimeUnit.MILLISECONDS,
+            ) == true
         } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
         }
         suspendAcknowledgement.compareAndSet(acknowledgement, null)
-        if (!stopRequested.get()) connected?.close()
+        if (!stopRequested.get() && !acknowledged) connected?.close()
     }
 
     fun resume() {
+        var connected: Socket? = null
         synchronized(pauseLock) {
             if (!paused.compareAndSet(true, false)) return
+            wakePending.set(true)
+            resetReconnectDelay.set(true)
+            connected = socket?.takeIf {
+                controlReady.get() && !stopRequested.get() && !it.isClosed
+            }
             pauseLock.notifyAll()
+        }
+        val reusable = connected ?: return
+        runCatching {
+            reusable.soTimeout = WAKE_CONFIRM_TIMEOUT_MS
+            write(
+                reusable,
+                Gnr4Frame(
+                    Gnr4MessageType.STARTED,
+                    sessionId,
+                    Gnr4.startedPayload(wake = true),
+                ),
+            )
+        }.onFailure {
+            reusable.close()
         }
     }
 
     private fun runLoop() {
-        var delayMs = 250L
+        var delayMs = RECONNECT_INITIAL_DELAY_MS
         while (running.get()) {
             if (!awaitResume()) return
+            if (resetReconnectDelay.getAndSet(false)) {
+                delayMs = WAKE_RECONNECT_DELAY_MS
+            }
             try {
                 Socket().use { connected ->
                     synchronized(pauseLock) {
@@ -111,7 +141,7 @@ class ControlSupervisor(
                     }
                     connected.connect(InetSocketAddress(IPV4_LOOPBACK, port), CONNECT_TIMEOUT_MS)
                     connected.tcpNoDelay = true
-                    connected.soTimeout = 1_000
+                    connected.soTimeout = CONTROL_READ_TIMEOUT_MS
                     synchronized(pauseLock) {
                         if (!isActiveSocket(connected)) return@use
                         val hello = Gnr4.HELLO_CAPABILITIES.toByteArray(StandardCharsets.UTF_8)
@@ -124,19 +154,27 @@ class ControlSupervisor(
                     val metricsEnabled = Gnr4.helloAckSupportsMetrics(acknowledgement.payload)
                     synchronized(pauseLock) {
                         if (!isActiveSocket(connected) || !listener.shouldReportStarted()) return@use
-                        write(connected, Gnr4Frame(Gnr4MessageType.STARTED, sessionId))
+                        val wake = wakePending.get()
+                        write(
+                            connected,
+                            Gnr4Frame(
+                                Gnr4MessageType.STARTED,
+                                sessionId,
+                                Gnr4.startedPayload(wake),
+                            ),
+                        )
                         controlReady.set(true)
-                        listener.onControlConnected()
+                        if (wake) {
+                            connected.soTimeout = WAKE_CONFIRM_TIMEOUT_MS
+                        } else {
+                            listener.onControlConnected()
+                        }
                     }
-                    delayMs = 250L
+                    delayMs = RECONNECT_INITIAL_DELAY_MS
                     var missed = 0
                     val outstandingHeartbeats = linkedMapOf<Long, Long>()
                     var lastMetricsAt = System.nanoTime()
-                    while (
-                        running.get() &&
-                        (!paused.get() || suspendAcknowledgement.get() != null) &&
-                        !connected.isClosed
-                    ) {
+                    while (running.get() && !connected.isClosed) {
                         try {
                             val frame = Gnr4.read(connected.getInputStream(), sessionId)
                             when (frame.type) {
@@ -155,7 +193,14 @@ class ControlSupervisor(
                                         )
                                     }
                                 }
-                                Gnr4MessageType.STATUS -> missed = 0
+                                Gnr4MessageType.STATUS -> {
+                                    missed = 0
+                                    if (!paused.get() && wakePending.compareAndSet(true, false)) {
+                                        resetReconnectDelay.set(false)
+                                        connected.soTimeout = CONTROL_READ_TIMEOUT_MS
+                                        listener.onControlConnected()
+                                    }
+                                }
                                 Gnr4MessageType.SUSPENDED -> {
                                     missed = 0
                                     suspendAcknowledgement.getAndSet(null)?.countDown()
@@ -182,6 +227,9 @@ class ControlSupervisor(
                             }
                         } catch (_: SocketTimeoutException) {
                             if (paused.get()) continue
+                            if (wakePending.get()) {
+                                throw SocketTimeoutException("Wake confirmation timed out")
+                            }
                             val heartbeatSequence = sequence.incrementAndGet()
                             val sentAt = System.nanoTime()
                             while (outstandingHeartbeats.size >= MAX_OUTSTANDING_HEARTBEATS) {
@@ -199,7 +247,7 @@ class ControlSupervisor(
                             missed += 1
                             if (missed >= 3) throw SocketTimeoutException("Three host heartbeats missed")
                         }
-                        if (metricsEnabled) {
+                        if (metricsEnabled && !paused.get()) {
                             lastMetricsAt = writeMetricsIfDue(connected, lastMetricsAt)
                         }
                     }
@@ -208,8 +256,10 @@ class ControlSupervisor(
                 if (running.get() && !paused.get()) {
                     Log.w(TAG, "Control lane degraded", error)
                     listener.onControlDegraded(error)
-                    waitForReconnect(delayMs)
-                    delayMs = nextControlReconnectDelayMs(delayMs)
+                    val retryDelayMs =
+                        if (wakePending.get()) WAKE_RECONNECT_DELAY_MS else delayMs
+                    waitForReconnect(retryDelayMs)
+                    delayMs = nextControlReconnectDelayMs(retryDelayMs)
                 }
             } finally {
                 controlReady.set(false)
@@ -284,6 +334,10 @@ class ControlSupervisor(
     companion object {
         private const val TAG = "Gnr4Control"
         private const val CONNECT_TIMEOUT_MS = 1_000
+        private const val CONTROL_READ_TIMEOUT_MS = 1_000
+        private const val WAKE_CONFIRM_TIMEOUT_MS = 250
+        private const val RECONNECT_INITIAL_DELAY_MS = 250L
+        private const val WAKE_RECONNECT_DELAY_MS = 100L
         private const val STOP_ACK_TIMEOUT_MS = 5_000L
         private const val SUSPEND_ACK_TIMEOUT_MS = 500L
         private const val MAX_OUTSTANDING_HEARTBEATS = 8

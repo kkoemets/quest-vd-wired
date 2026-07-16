@@ -56,8 +56,8 @@ version_name="$("$apkanalyzer" manifest version-name "$apk")"
 min_sdk="$("$apkanalyzer" manifest min-sdk "$apk")"
 target_sdk="$("$apkanalyzer" manifest target-sdk "$apk")"
 debuggable="$("$apkanalyzer" manifest debuggable "$apk" | tr '[:upper:]' '[:lower:]')"
-if [[ "$version_code" != "52" || "$version_name" != "4.1.1" ]]; then
-    echo "APK version is not the exact v4.1.1 release identity" >&2
+if [[ "$version_code" != "54" || "$version_name" != "4.1.2" ]]; then
+    echo "APK version is not the exact v4.1.2 release identity" >&2
     exit 1
 fi
 if [[ "$debuggable" != "false" ]]; then

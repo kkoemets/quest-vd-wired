@@ -8,6 +8,7 @@ import java.util.UUID
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class Gnr4Test {
@@ -133,5 +134,16 @@ class Gnr4Test {
         assertEquals(Gnr4MessageType.SUSPENDED, Gnr4MessageType.fromWire(10))
         assertEquals(11, Gnr4MessageType.METRICS.wireValue)
         assertEquals(Gnr4MessageType.METRICS, Gnr4MessageType.fromWire(11))
+    }
+
+    @Test
+    fun wakeStartedPayloadIsExplicitAndFreshlyAllocated() {
+        assertTrue(Gnr4.startedPayload(wake = false).isEmpty())
+        val first = Gnr4.startedPayload(wake = true)
+        val second = Gnr4.startedPayload(wake = true)
+        assertTrue(first.contentEquals(byteArrayOf(1)))
+        assertTrue(second.contentEquals(byteArrayOf(1)))
+        first[0] = 9
+        assertTrue(second.contentEquals(byteArrayOf(1)))
     }
 }

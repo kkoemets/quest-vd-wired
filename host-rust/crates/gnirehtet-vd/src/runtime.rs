@@ -35,7 +35,7 @@ use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeServer, ServerOpti
 use crate::{
     adb::{AdbController, AndroidVpnStatus, CONTROL_PORT, SOCKS_PORT, UDP_STREAM_PORT},
     control::{
-        ControlConfig, ControlHandle, ControlServer, StateObserver, SuspendObserver,
+        ControlConfig, ControlHandle, ControlServer, StateObserver, SuspendObserver, WakeObserver,
         CONTROL_TRANSPORT_LOST_REASON,
     },
     diagnostics::Diagnostics,
@@ -296,6 +296,7 @@ pub struct AdbMonitorSnapshot {
 #[derive(Clone, Default)]
 pub struct AdbHealthMonitor {
     stopping: Arc<AtomicBool>,
+    authenticated_reconcile: Arc<AtomicBool>,
     reconnect_generation: Arc<AtomicU64>,
     status: Arc<StdMutex<AdbMonitorSnapshot>>,
     operation: Arc<Mutex<()>>,
@@ -341,6 +342,15 @@ impl RelayGateController {
             eligibility.control_loss_pending = false;
             eligibility.control_authenticated = true;
             self.gate.set_enabled(eligibility.carrier_healthy);
+        }
+    }
+
+    fn authenticated_wake(&self) {
+        if let Ok(mut eligibility) = self.eligibility.lock() {
+            eligibility.control_epoch = eligibility.control_epoch.wrapping_add(1);
+            eligibility.control_loss_pending = false;
+            eligibility.control_authenticated = false;
+            self.gate.set_enabled(false);
         }
     }
 
@@ -454,6 +464,11 @@ impl AdbHealthMonitor {
         self.changed.notify_one();
     }
 
+    pub fn notify_authenticated_connection(&self) {
+        self.authenticated_reconcile.store(true, Ordering::Release);
+        self.changed.notify_one();
+    }
+
     async fn run(
         self,
         adb: AdbController,
@@ -523,14 +538,20 @@ impl AdbHealthMonitor {
                                 };
                                 for available in updates {
                                     device_available = Some(available);
+                                    let forced = self
+                                        .authenticated_reconcile
+                                        .swap(false, Ordering::AcqRel);
                                     self.reconcile(
                                         &adb,
                                         &control,
                                         &store,
                                         &diagnostics,
                                         &relay_gate,
-                                        available,
+                                        available || forced,
                                     ).await;
+                                    if forced {
+                                        self.retry_authenticated_reconcile_if_needed();
+                                    }
                                 }
                             }
                             Err(_) => {
@@ -544,7 +565,10 @@ impl AdbHealthMonitor {
                         // health interval is stable enough to reset restart
                         // backoff. Fast crash loops continue toward the cap.
                         backoff = INITIAL_BACKOFF;
-                        if cached_device_is_available(device_available) {
+                        let forced = self
+                            .authenticated_reconcile
+                            .swap(false, Ordering::AcqRel);
+                        if forced || cached_device_is_available(device_available) {
                             self.reconcile(
                                 &adb,
                                 &control,
@@ -553,13 +577,19 @@ impl AdbHealthMonitor {
                                 &relay_gate,
                                 true,
                             ).await;
+                            if forced {
+                                self.retry_authenticated_reconcile_if_needed();
+                            }
                         }
                     }
                     _ = self.changed.notified() => {
                         if self.stopping.load(Ordering::Acquire) {
                             break;
                         }
-                        if cached_device_is_available(device_available) {
+                        let forced = self
+                            .authenticated_reconcile
+                            .swap(false, Ordering::AcqRel);
+                        if forced || cached_device_is_available(device_available) {
                             self.reconcile(
                                 &adb,
                                 &control,
@@ -568,6 +598,9 @@ impl AdbHealthMonitor {
                                 &relay_gate,
                                 true,
                             ).await;
+                            if forced {
+                                self.retry_authenticated_reconcile_if_needed();
+                            }
                         }
                     }
                 }
@@ -589,6 +622,18 @@ impl AdbHealthMonitor {
                 backoff = next_backoff(backoff, MAX_BACKOFF);
             }
         }
+    }
+
+    fn retry_authenticated_reconcile_if_needed(&self) {
+        if self.stopping.load(Ordering::Acquire) || self.snapshot().mappings_healthy {
+            return;
+        }
+        self.authenticated_reconcile.store(true, Ordering::Release);
+        let changed = self.changed.clone();
+        tokio::spawn(async move {
+            time::sleep(Duration::from_millis(100)).await;
+            changed.notify_one();
+        });
     }
 
     async fn reconcile(
@@ -1109,7 +1154,11 @@ impl HostRuntime {
         let observer_adb_monitor = adb_monitor.clone();
         let observer: StateObserver = Arc::new(move |snapshot| {
             update_relay_gate(&observer_relay_gate, snapshot);
-            observer_adb_monitor.notify_state_change();
+            if snapshot.state == HostState::Connected {
+                observer_adb_monitor.notify_authenticated_connection();
+            } else {
+                observer_adb_monitor.notify_state_change();
+            }
             if let Err(error) = observer_store.write(snapshot, Some(std::process::id())) {
                 let _ = observer_diagnostics.record(
                     "state_persistence_error",
@@ -1121,6 +1170,12 @@ impl HostRuntime {
         let suspend_observer: SuspendObserver = Arc::new(move || {
             suspend_relay_gate.control_inactive();
         });
+        let wake_relay_gate = relay_gate_controller.clone();
+        let wake_adb_monitor = adb_monitor.clone();
+        let wake_observer: WakeObserver = Arc::new(move || {
+            wake_relay_gate.authenticated_wake();
+            wake_adb_monitor.notify_authenticated_connection();
+        });
 
         let control = ControlServer::new(ControlConfig {
             bind: self.config.control_bind,
@@ -1128,7 +1183,8 @@ impl HostRuntime {
         })?
         .with_diagnostics(diagnostics.clone())
         .with_observer(observer)
-        .with_suspend_observer(suspend_observer);
+        .with_suspend_observer(suspend_observer)
+        .with_wake_observer(wake_observer);
         let control_handle = control.command_handle();
         let shutdown = Arc::new(Notify::new());
         let admin = AdminServer::new(
@@ -2795,8 +2851,9 @@ mod tests {
             let relay_controller = RelayGateController::new(relay_gate.clone());
 
             relay_controller.carrier_lost();
+            relay_controller.authenticated_wake();
             relay_controller.control_connected();
-            assert!(!relay_gate.is_enabled());
+            assert!(relay_gate.is_enabled());
 
             // This is the predicate used by both timer and lifecycle wakeups.
             // Entering it for a stale false would erase the fresh control auth.
@@ -2804,15 +2861,31 @@ mod tests {
                 relay_controller.carrier_lost();
             }
 
-            // A fresh track-devices update or mapping probe restores carrier
-            // health. The authenticated wake connection must still be present.
-            relay_controller.carrier_healthy();
             assert!(
                 relay_gate.is_enabled(),
                 "stale cache was replayed: {cached:?}"
             );
         }
         assert!(cached_device_is_available(Some(true)));
+    }
+
+    #[test]
+    fn authenticated_wake_rotates_stale_flows_before_immediate_reenable() {
+        let relay_gate = RelayGate::default();
+        let relay_controller = RelayGateController::new(relay_gate.clone());
+
+        relay_controller.control_connected();
+        let connected_generation = relay_gate.generation();
+        assert!(relay_gate.is_enabled());
+
+        relay_controller.authenticated_wake();
+        assert!(!relay_gate.is_enabled());
+        assert!(relay_gate.generation() > connected_generation);
+        let suspended_generation = relay_gate.generation();
+
+        relay_controller.control_connected();
+        assert!(relay_gate.is_enabled());
+        assert!(relay_gate.generation() > suspended_generation);
     }
 
     #[tokio::test]

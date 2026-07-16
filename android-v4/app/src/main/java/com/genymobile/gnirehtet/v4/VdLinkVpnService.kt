@@ -21,6 +21,7 @@ import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.os.PowerManager
 import android.os.Process
+import android.os.SystemClock
 import android.util.Log
 import android.view.Display
 import java.io.FileDescriptor
@@ -32,6 +33,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.ThreadFactory
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
 internal fun canFinishRejectedStart(hasActiveResources: Boolean, teardownInProgress: Boolean): Boolean =
@@ -65,6 +67,12 @@ internal fun screenSuspendedFromBroadcast(action: String?): Boolean? = when (act
     else -> null
 }
 
+internal fun shouldDeferDisplaySuspension(
+    suspended: Boolean,
+    nowElapsedRealtimeMs: Long,
+    wakeDebounceUntilMs: Long,
+): Boolean = suspended && nowElapsedRealtimeMs < wakeDebounceUntilMs
+
 class VdLinkVpnService : VpnService() {
     private data class SessionResources(
         val generation: Long,
@@ -72,6 +80,8 @@ class VdLinkVpnService : VpnService() {
         val vpnInterface: ParcelFileDescriptor,
         val tunnel: NativeTunnel,
         val engineStartLock: Any = Any(),
+        val engineSuspended: AtomicBoolean = AtomicBoolean(),
+        val engineResumeQueued: AtomicBoolean = AtomicBoolean(),
         @Volatile var control: ControlSupervisor? = null,
     )
 
@@ -87,6 +97,7 @@ class VdLinkVpnService : VpnService() {
     private val screenSuspended = AtomicBoolean()
     private val screenReceiverRegistered = AtomicBoolean()
     private val displayListenerRegistered = AtomicBoolean()
+    private val wakeDebounceUntilMs = AtomicLong()
     private val sleepStatePoller = object : Runnable {
         override fun run() {
             if (destroyed.get()) return
@@ -97,7 +108,14 @@ class VdLinkVpnService : VpnService() {
 
     private val screenReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
-            screenSuspendedFromBroadcast(intent?.action)?.let(::setScreenSuspended)
+            val action = intent?.action
+            when (action) {
+                Intent.ACTION_SCREEN_ON -> wakeDebounceUntilMs.set(
+                    SystemClock.elapsedRealtime() + WAKE_DISPLAY_DEBOUNCE_MS,
+                )
+                Intent.ACTION_SCREEN_OFF -> wakeDebounceUntilMs.set(0)
+            }
+            screenSuspendedFromBroadcast(action)?.let(::setScreenSuspended)
         }
     }
 
@@ -275,11 +293,7 @@ class VdLinkVpnService : VpnService() {
                     override fun shouldReportStarted(): Boolean = isCurrent(resources, supervisor)
 
                     override fun onControlConnected() {
-                        if (isCurrent(resources, supervisor)) {
-                            state.set(LifecycleState.CONNECTED)
-                            lastError.set(null)
-                            updateNotification()
-                        }
+                        onControlReady(resources, supervisor)
                     }
 
                     override fun onControlDegraded(error: Exception?) {
@@ -314,7 +328,12 @@ class VdLinkVpnService : VpnService() {
                     false
                 }
             }
-            if (!accepted) supervisor.close()
+            if (!accepted) {
+                supervisor.close()
+            } else if (screenSuspended.get()) {
+                resources.engineSuspended.set(true)
+                worker.execute { suspendNativeEngine(resources) }
+            }
         } catch (error: Throwable) {
             failGeneration(resources.generation, error)
         }
@@ -347,9 +366,12 @@ class VdLinkVpnService : VpnService() {
 
     private fun setScreenSuspended(suspended: Boolean) {
         if (!screenSuspended.compareAndSet(!suspended, suspended)) return
-        val control = synchronized(lifecycleLock) { active?.control }
+        val resources = synchronized(lifecycleLock) { active }
+        val control = resources?.control
         if (suspended) {
+            resources?.engineSuspended?.set(true)
             control?.suspend()
+            if (resources != null) worker.execute { suspendNativeEngine(resources) }
             if (control != null && state.compareAndSet(LifecycleState.CONNECTED, LifecycleState.DEGRADED)) {
                 lastError.set("Headset is asleep; VPN remains ready to reconnect")
                 updateNotification()
@@ -359,13 +381,94 @@ class VdLinkVpnService : VpnService() {
         }
     }
 
+    private fun onControlReady(resources: SessionResources, supervisor: ControlSupervisor) {
+        if (!isCurrent(resources, supervisor) || screenSuspended.get()) return
+        if (resources.engineSuspended.get()) {
+            queueNativeEngineResume(resources, supervisor)
+            return
+        }
+        state.set(LifecycleState.CONNECTED)
+        lastError.set(null)
+        updateNotification()
+    }
+
+    private fun suspendNativeEngine(resources: SessionResources) {
+        synchronized(resources.engineStartLock) {
+            if (!isCurrent(resources) || !resources.engineSuspended.get()) return
+            runCatching { resources.tunnel.requestStop() }
+                .onFailure { Log.w(TAG, "Could not stop the native engine for sleep", it) }
+            runCatching { resources.tunnel.awaitStopped(ENGINE_STOP_TIMEOUT_MS) }
+                .onFailure { Log.w(TAG, "Native engine sleep shutdown failed", it) }
+        }
+    }
+
+    private fun queueNativeEngineResume(
+        resources: SessionResources,
+        supervisor: ControlSupervisor,
+    ) {
+        if (!resources.engineResumeQueued.compareAndSet(false, true)) return
+        worker.execute {
+            var retry = false
+            try {
+                synchronized(resources.engineStartLock) {
+                    if (
+                        !isCurrent(resources, supervisor) ||
+                        screenSuspended.get() ||
+                        !resources.engineSuspended.get()
+                    ) return@execute
+                    resources.tunnel.requestStop()
+                    check(resources.tunnel.awaitStopped(ENGINE_STOP_TIMEOUT_MS)) {
+                        "Native engine did not stop before wake restart"
+                    }
+                    resources.tunnel.start(
+                        resources.vpnInterface.fd,
+                        resources.parameters.socksPort,
+                        resources.parameters.udpPort,
+                        MTU,
+                    )
+                    resources.tunnel.awaitReady(ENGINE_START_TIMEOUT_MS)
+                    resources.engineSuspended.set(false)
+                }
+                if (isCurrent(resources, supervisor) && !screenSuspended.get()) {
+                    state.set(LifecycleState.CONNECTED)
+                    lastError.set(null)
+                    updateNotification()
+                }
+            } catch (error: Throwable) {
+                retry = isCurrent(resources, supervisor) && !screenSuspended.get()
+                Log.w(TAG, "Native engine wake restart failed", error)
+                if (retry) {
+                    state.set(LifecycleState.DEGRADED)
+                    lastError.set(error.message ?: error.javaClass.simpleName)
+                    updateNotification()
+                }
+            } finally {
+                resources.engineResumeQueued.set(false)
+                if (retry) {
+                    mainHandler.postDelayed(
+                        { queueNativeEngineResume(resources, supervisor) },
+                        ENGINE_RESTART_RETRY_MS,
+                    )
+                }
+            }
+        }
+    }
+
     private fun refreshScreenState() {
         if (destroyed.get()) return
         val displayState = getSystemService(DisplayManager::class.java)
             .getDisplay(Display.DEFAULT_DISPLAY)
             ?.state
         val interactive = getSystemService(PowerManager::class.java).isInteractive
-        setScreenSuspended(isHeadsetDisplaySuspended(displayState, interactive))
+        val suspended = isHeadsetDisplaySuspended(displayState, interactive)
+        if (
+            shouldDeferDisplaySuspension(
+                suspended,
+                SystemClock.elapsedRealtime(),
+                wakeDebounceUntilMs.get(),
+            )
+        ) return
+        setScreenSuspended(suspended)
     }
 
     private fun failGeneration(generation: Long, error: Throwable) {
@@ -670,7 +773,9 @@ class VdLinkVpnService : VpnService() {
         private const val ENGINE_START_TIMEOUT_MS = 5_000
         private const val ENGINE_QUIESCE_BEFORE_CLOSE_TIMEOUT_MS = 500
         private const val ENGINE_STOP_TIMEOUT_MS = 1_500
+        private const val ENGINE_RESTART_RETRY_MS = 100L
         private const val SLEEP_STATE_POLL_INTERVAL_MS = 500L
+        private const val WAKE_DISPLAY_DEBOUNCE_MS = 1_500L
 
         fun start(context: Context, source: Intent) {
             val intent = Intent(context, VdLinkVpnService::class.java)

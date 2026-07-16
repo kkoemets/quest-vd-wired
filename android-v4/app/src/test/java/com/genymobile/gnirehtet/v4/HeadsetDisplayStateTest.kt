@@ -39,4 +39,29 @@ class HeadsetDisplayStateTest {
         assertEquals(false, screenSuspendedFromBroadcast(Intent.ACTION_SCREEN_ON))
         assertNull(screenSuspendedFromBroadcast(Intent.ACTION_USER_PRESENT))
     }
+
+    @Test
+    fun staleDisplaySleepIsDeferredImmediatelyAfterInteractiveWake() {
+        assertTrue(
+            shouldDeferDisplaySuspension(
+                suspended = true,
+                nowElapsedRealtimeMs = 1_000,
+                wakeDebounceUntilMs = 2_000,
+            ),
+        )
+        assertFalse(
+            shouldDeferDisplaySuspension(
+                suspended = false,
+                nowElapsedRealtimeMs = 1_000,
+                wakeDebounceUntilMs = 2_000,
+            ),
+        )
+        assertFalse(
+            shouldDeferDisplaySuspension(
+                suspended = true,
+                nowElapsedRealtimeMs = 2_000,
+                wakeDebounceUntilMs = 2_000,
+            ),
+        )
+    }
 }

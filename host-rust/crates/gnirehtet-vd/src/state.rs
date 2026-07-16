@@ -70,7 +70,11 @@ impl StateMachine {
         now: Instant,
     ) -> Result<(), TransitionError> {
         self.require_session(session_id)?;
-        self.require_state(&[HostState::Preparing, HostState::Degraded])?;
+        self.require_state(&[
+            HostState::Preparing,
+            HostState::Connected,
+            HostState::Degraded,
+        ])?;
         self.state = HostState::Connected;
         self.last_heartbeat = Some(now);
         self.missed_heartbeats = 0;
@@ -84,6 +88,13 @@ impl StateMachine {
         now: Instant,
     ) -> Result<(), TransitionError> {
         self.require_session(session_id)?;
+        if self.state == HostState::Degraded
+            && self.reason.as_deref() == Some(HEADSET_SUSPENDED_REASON)
+        {
+            self.last_heartbeat = Some(now);
+            self.missed_heartbeats = 0;
+            return Ok(());
+        }
         self.require_state(&[HostState::Connected, HostState::Degraded])?;
         self.state = HostState::Connected;
         self.last_heartbeat = Some(now);
@@ -256,6 +267,25 @@ mod tests {
 
         machine.peer_suspended(session).unwrap();
         machine.transport_lost("control transport lost; VPN remains active");
+
+        let snapshot = machine.snapshot();
+        assert_eq!(snapshot.state, HostState::Degraded);
+        assert_eq!(snapshot.reason.as_deref(), Some(HEADSET_SUSPENDED_REASON));
+        assert_eq!(snapshot.missed_heartbeats, 0);
+    }
+
+    #[test]
+    fn heartbeat_keeps_a_suspended_control_lane_alive_without_resuming_flows() {
+        let session = SessionId([5; 16]);
+        let now = Instant::now();
+        let mut machine = StateMachine::new();
+        machine.begin_start(session).unwrap();
+        machine.peer_started(session, now).unwrap();
+        machine.peer_suspended(session).unwrap();
+
+        machine
+            .heartbeat(session, now + Duration::from_secs(1))
+            .unwrap();
 
         let snapshot = machine.snapshot();
         assert_eq!(snapshot.state, HostState::Degraded);
