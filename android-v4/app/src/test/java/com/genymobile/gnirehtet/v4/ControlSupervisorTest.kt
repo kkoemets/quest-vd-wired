@@ -9,6 +9,7 @@ import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -207,7 +208,13 @@ class ControlSupervisorTest {
                         connection.getOutputStream(),
                         Gnr4Frame(Gnr4MessageType.HELLO_ACK, session),
                     )
-                    assertEquals(Gnr4MessageType.STARTED, Gnr4.read(connection.getInputStream(), session).type)
+                    val started = Gnr4.read(connection.getInputStream(), session)
+                    assertEquals(Gnr4MessageType.STARTED, started.type)
+                    assertTrue(started.payload.contentEquals(Gnr4.startedPayload(wake = true)))
+                    Gnr4.write(
+                        connection.getOutputStream(),
+                        Gnr4Frame(Gnr4MessageType.STATUS, session),
+                    )
                 }
             }
         }
@@ -234,7 +241,7 @@ class ControlSupervisorTest {
     }
 
     @Test
-    fun suspendIsAcknowledgedBeforeTheControlConnectionCloses() {
+    fun acknowledgedSuspendResumesOnTheSameControlConnection() {
         val session = UUID.fromString("20314253-6475-8697-a8b9-cadbecfd0e1f")
         val server = ServerSocket().apply {
             bind(InetSocketAddress(InetAddress.getByName("127.0.0.1"), 0))
@@ -254,27 +261,214 @@ class ControlSupervisorTest {
                         connection.getOutputStream(),
                         Gnr4Frame(Gnr4MessageType.SUSPENDED, session),
                     )
-                    assertEquals(-1, connection.getInputStream().read())
+                    val resumed = Gnr4.read(connection.getInputStream(), session)
+                    assertEquals(Gnr4MessageType.STARTED, resumed.type)
+                    assertTrue(resumed.payload.contentEquals(Gnr4.startedPayload(wake = true)))
+                    Gnr4.write(
+                        connection.getOutputStream(),
+                        Gnr4Frame(Gnr4MessageType.STATUS, session),
+                    )
+                    Gnr4.write(connection.getOutputStream(), Gnr4Frame(Gnr4MessageType.STOP, session))
+                    assertEquals(Gnr4MessageType.STOPPED, Gnr4.read(connection.getInputStream(), session).type)
                 }
             }
         }
-        val connected = CountDownLatch(1)
+        val initialConnected = CountDownLatch(1)
+        val resumedConnected = CountDownLatch(1)
+        val connectedCallbacks = AtomicInteger()
         val supervisor = ControlSupervisor(
             session,
             server.localPort,
             object : ControlSupervisor.Listener {
                 override fun shouldReportStarted(): Boolean = true
-                override fun onControlConnected() = connected.countDown()
+                override fun onControlConnected() {
+                    if (connectedCallbacks.incrementAndGet() == 1) {
+                        initialConnected.countDown()
+                    } else {
+                        resumedConnected.countDown()
+                    }
+                }
                 override fun onControlDegraded(error: Exception?) = Unit
                 override fun onControlRttSample(rttNanos: Long) = Unit
-                override fun onControlStopRequested(sendStopped: () -> Unit) = Unit
+                override fun onControlStopRequested(sendStopped: () -> Unit) = sendStopped()
             },
         )
 
         supervisor.start()
-        assertTrue(connected.await(2, TimeUnit.SECONDS))
+        assertTrue(initialConnected.await(2, TimeUnit.SECONDS))
         supervisor.suspend()
+        Thread.sleep(1_200)
+        supervisor.resume()
+        assertTrue(resumedConnected.await(2, TimeUnit.SECONDS))
         exchange.get(2, TimeUnit.SECONDS)
+        supervisor.close()
+        executor.shutdownNow()
+    }
+
+    @Test
+    fun failedReusedWakeRepeatsTheWakeMarkerOnTheReplacementConnection() {
+        val session = UUID.fromString("2a415263-7485-96a7-b8c9-daebfc0d1e2f")
+        val server = ServerSocket().apply {
+            bind(InetSocketAddress(InetAddress.getByName("127.0.0.1"), 0))
+        }
+        val executor = Executors.newSingleThreadExecutor()
+        val exchange = executor.submit {
+            server.use {
+                it.accept().use { first ->
+                    assertEquals(Gnr4MessageType.HELLO, Gnr4.read(first.getInputStream(), session).type)
+                    Gnr4.write(first.getOutputStream(), Gnr4Frame(Gnr4MessageType.HELLO_ACK, session))
+                    assertEquals(Gnr4MessageType.STARTED, Gnr4.read(first.getInputStream(), session).type)
+                    assertEquals(Gnr4MessageType.SUSPEND, Gnr4.read(first.getInputStream(), session).type)
+                    Gnr4.write(first.getOutputStream(), Gnr4Frame(Gnr4MessageType.SUSPENDED, session))
+                    val attemptedWake = Gnr4.read(first.getInputStream(), session)
+                    assertEquals(Gnr4MessageType.STARTED, attemptedWake.type)
+                    assertTrue(attemptedWake.payload.contentEquals(Gnr4.startedPayload(wake = true)))
+                }
+                it.accept().use { replacement ->
+                    assertEquals(
+                        Gnr4MessageType.HELLO,
+                        Gnr4.read(replacement.getInputStream(), session).type,
+                    )
+                    Gnr4.write(
+                        replacement.getOutputStream(),
+                        Gnr4Frame(Gnr4MessageType.HELLO_ACK, session),
+                    )
+                    val replacementWake = Gnr4.read(replacement.getInputStream(), session)
+                    assertEquals(Gnr4MessageType.STARTED, replacementWake.type)
+                    assertTrue(replacementWake.payload.contentEquals(Gnr4.startedPayload(wake = true)))
+                    Gnr4.write(
+                        replacement.getOutputStream(),
+                        Gnr4Frame(Gnr4MessageType.STATUS, session),
+                    )
+                    Gnr4.write(
+                        replacement.getOutputStream(),
+                        Gnr4Frame(Gnr4MessageType.STOP, session),
+                    )
+                    assertEquals(
+                        Gnr4MessageType.STOPPED,
+                        Gnr4.read(replacement.getInputStream(), session).type,
+                    )
+                }
+            }
+        }
+        val initialConnected = CountDownLatch(1)
+        val supervisor = ControlSupervisor(
+            session,
+            server.localPort,
+            object : ControlSupervisor.Listener {
+                override fun shouldReportStarted(): Boolean = true
+                override fun onControlConnected() = initialConnected.countDown()
+                override fun onControlDegraded(error: Exception?) = Unit
+                override fun onControlRttSample(rttNanos: Long) = Unit
+                override fun onControlStopRequested(sendStopped: () -> Unit) = sendStopped()
+            },
+        )
+
+        supervisor.start()
+        assertTrue(initialConnected.await(2, TimeUnit.SECONDS))
+        supervisor.suspend()
+        supervisor.resume()
+        exchange.get(4, TimeUnit.SECONDS)
+        supervisor.close()
+        executor.shutdownNow()
+    }
+
+    @Test
+    fun halfOpenWakeReconnectsAndAuthenticatesWithinOneSecond() {
+        val session = UUID.fromString("3a516273-8495-a6b7-c8d9-eafb0c1d2e3f")
+        val server = ServerSocket().apply {
+            bind(InetSocketAddress(InetAddress.getByName("127.0.0.1"), 0))
+        }
+        val executor = Executors.newSingleThreadExecutor()
+        val exchange = executor.submit {
+            server.use {
+                val first = it.accept()
+                first.use { connection ->
+                    assertEquals(
+                        Gnr4MessageType.HELLO,
+                        Gnr4.read(connection.getInputStream(), session).type,
+                    )
+                    Gnr4.write(
+                        connection.getOutputStream(),
+                        Gnr4Frame(Gnr4MessageType.HELLO_ACK, session),
+                    )
+                    assertEquals(
+                        Gnr4MessageType.STARTED,
+                        Gnr4.read(connection.getInputStream(), session).type,
+                    )
+                    assertEquals(
+                        Gnr4MessageType.SUSPEND,
+                        Gnr4.read(connection.getInputStream(), session).type,
+                    )
+                    Gnr4.write(
+                        connection.getOutputStream(),
+                        Gnr4Frame(Gnr4MessageType.SUSPENDED, session),
+                    )
+                    val attemptedWake = Gnr4.read(connection.getInputStream(), session)
+                    assertEquals(Gnr4MessageType.STARTED, attemptedWake.type)
+                    assertTrue(attemptedWake.payload.contentEquals(Gnr4.startedPayload(wake = true)))
+
+                    val reconnectStarted = System.nanoTime()
+                    it.accept().use { replacement ->
+                        val reconnectMs =
+                            TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - reconnectStarted)
+                        assertTrue("wake replacement took ${reconnectMs}ms", reconnectMs < 1_000)
+                        assertEquals(
+                            Gnr4MessageType.HELLO,
+                            Gnr4.read(replacement.getInputStream(), session).type,
+                        )
+                        Gnr4.write(
+                            replacement.getOutputStream(),
+                            Gnr4Frame(Gnr4MessageType.HELLO_ACK, session),
+                        )
+                        val replacementWake = Gnr4.read(replacement.getInputStream(), session)
+                        assertEquals(Gnr4MessageType.STARTED, replacementWake.type)
+                        assertTrue(
+                            replacementWake.payload.contentEquals(Gnr4.startedPayload(wake = true)),
+                        )
+                        Gnr4.write(
+                            replacement.getOutputStream(),
+                            Gnr4Frame(Gnr4MessageType.STATUS, session),
+                        )
+                        Gnr4.write(
+                            replacement.getOutputStream(),
+                            Gnr4Frame(Gnr4MessageType.STOP, session),
+                        )
+                        assertEquals(
+                            Gnr4MessageType.STOPPED,
+                            Gnr4.read(replacement.getInputStream(), session).type,
+                        )
+                    }
+                }
+            }
+        }
+        val initialConnected = CountDownLatch(1)
+        val resumedConnected = CountDownLatch(1)
+        val connectedCallbacks = AtomicInteger()
+        val supervisor = ControlSupervisor(
+            session,
+            server.localPort,
+            object : ControlSupervisor.Listener {
+                override fun shouldReportStarted(): Boolean = true
+                override fun onControlConnected() {
+                    if (connectedCallbacks.incrementAndGet() == 1) {
+                        initialConnected.countDown()
+                    } else {
+                        resumedConnected.countDown()
+                    }
+                }
+                override fun onControlDegraded(error: Exception?) = Unit
+                override fun onControlRttSample(rttNanos: Long) = Unit
+                override fun onControlStopRequested(sendStopped: () -> Unit) = sendStopped()
+            },
+        )
+
+        supervisor.start()
+        assertTrue(initialConnected.await(2, TimeUnit.SECONDS))
+        supervisor.suspend()
+        supervisor.resume()
+        assertTrue(resumedConnected.await(1, TimeUnit.SECONDS))
+        exchange.get(3, TimeUnit.SECONDS)
         supervisor.close()
         executor.shutdownNow()
     }

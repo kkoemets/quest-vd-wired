@@ -9,12 +9,12 @@ a special network driver, SideQuest, or a rooted headset.
 
 ## Download for Windows
 
-[**Download Quest VD Wired v4.1.1 for Windows 10/11**](https://github.com/kkoemets/quest-vd-wired/releases/download/v4.1.1/quest-vd-wired-v4.1.1-windows-x64.zip)
+[**Download Quest VD Wired v4.1.2 for Windows 10/11**](https://github.com/kkoemets/quest-vd-wired/releases/download/v4.1.2/quest-vd-wired-v4.1.2-windows-x64.zip)
 
 Extract the ZIP, connect your Quest 3, and double-click `quest-vd-wired.exe`.
 
 If an older version is already open, choose **Exit** from its tray icon before
-starting v4.1.1.
+starting v4.1.2.
 
 ## Before you start
 

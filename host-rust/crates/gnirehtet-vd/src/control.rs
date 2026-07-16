@@ -2,7 +2,7 @@ use std::{
     net::{Ipv4Addr, SocketAddr},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, RwLock,
+        Arc, Mutex as StdMutex, RwLock,
     },
     time::{Duration, Instant},
 };
@@ -12,26 +12,42 @@ use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::{mpsc, oneshot, Mutex, Semaphore},
+    sync::{mpsc, oneshot, watch, Mutex, Semaphore},
     time,
 };
 
 const CONTROL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
 const CONTROL_FRAME_TIMEOUT: Duration = Duration::from_secs(4);
+const MAX_CONTROL_HANDLERS: usize = 4;
 pub(crate) const CONTROL_TRANSPORT_LOST_REASON: &str = "control transport lost; VPN remains active";
 
 use crate::{
     diagnostics::{Diagnostics, LatencyHistogram, LatencyHistogramSnapshot},
-    protocol::{AndroidMetricsV1, Frame, MessageType, ProtocolError, SessionId, VERSION},
+    protocol::{
+        AndroidMetricsV1, Frame, MessageType, ProtocolError, SessionId, STARTED_WAKE_PAYLOAD,
+        VERSION,
+    },
     state::{HostState, StateMachine, StateSnapshot, TransitionError, HEARTBEAT_INTERVAL},
 };
 
 pub type StateObserver = Arc<dyn Fn(&StateSnapshot) + Send + Sync>;
 pub type SuspendObserver = Arc<dyn Fn() + Send + Sync>;
+pub type WakeObserver = Arc<dyn Fn() + Send + Sync>;
 
 struct ControlCommand {
     deadline: Instant,
     result: oneshot::Sender<Result<(), String>>,
+}
+
+#[derive(Clone, Copy)]
+enum ControlReadMode {
+    Active,
+    Suspended,
+}
+
+struct ActiveConnection {
+    epoch: u64,
+    cancel: watch::Sender<bool>,
 }
 
 #[derive(Clone)]
@@ -157,6 +173,8 @@ pub struct ControlServer {
     diagnostics: Option<Diagnostics>,
     observer: Arc<RwLock<Option<StateObserver>>>,
     suspend_observer: Arc<RwLock<Option<SuspendObserver>>>,
+    wake_observer: Arc<RwLock<Option<WakeObserver>>>,
+    active_connection: Arc<StdMutex<Option<ActiveConnection>>>,
     publication: Arc<Mutex<()>>,
     commands: Arc<Mutex<mpsc::Receiver<ControlCommand>>>,
     handle: ControlHandle,
@@ -174,6 +192,7 @@ impl ControlServer {
         let (command_tx, command_rx) = mpsc::channel(4);
         let observer = Arc::new(RwLock::new(None));
         let suspend_observer = Arc::new(RwLock::new(None));
+        let wake_observer = Arc::new(RwLock::new(None));
         let publication = Arc::new(Mutex::new(()));
         Ok(Self {
             config,
@@ -181,6 +200,8 @@ impl ControlServer {
             diagnostics: None,
             observer: observer.clone(),
             suspend_observer,
+            wake_observer,
+            active_connection: Arc::new(StdMutex::new(None)),
             commands: Arc::new(Mutex::new(command_rx)),
             handle: ControlHandle {
                 sender: command_tx,
@@ -207,6 +228,13 @@ impl ControlServer {
 
     pub fn with_suspend_observer(self, observer: SuspendObserver) -> Self {
         if let Ok(mut slot) = self.suspend_observer.write() {
+            *slot = Some(observer);
+        }
+        self
+    }
+
+    pub fn with_wake_observer(self, observer: WakeObserver) -> Self {
+        if let Ok(mut slot) = self.wake_observer.write() {
             *slot = Some(observer);
         }
         self
@@ -239,10 +267,10 @@ impl ControlServer {
             return Err(ControlError::NonLoopbackBind(address));
         }
         self.publish().await;
-        let connection = Arc::new(Semaphore::new(1));
+        let handlers = Arc::new(Semaphore::new(MAX_CONTROL_HANDLERS));
         loop {
             let (stream, _) = listener.accept().await?;
-            let permit = match connection.clone().try_acquire_owned() {
+            let permit = match handlers.clone().try_acquire_owned() {
                 Ok(permit) => permit,
                 Err(_) => continue,
             };
@@ -272,13 +300,29 @@ impl ControlServer {
         if first.message_type != MessageType::Hello {
             return Err(ControlError::ExpectedHello);
         }
+        let (connection_epoch, mut connection_cancelled) = {
+            let state = self.state.lock().await;
+            if state.state() == HostState::Stopping {
+                return Err(ControlError::ReplacementDuringStop);
+            }
+            let epoch = self
+                .metrics
+                .0
+                .connection_generation
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1);
+            let (cancel, cancelled) = watch::channel(false);
+            if let Ok(mut active) = self.active_connection.lock() {
+                if let Some(previous) = active.replace(ActiveConnection { epoch, cancel }) {
+                    let _ = previous.cancel.send(true);
+                }
+            }
+            drop(state);
+            (epoch, cancelled)
+        };
         if let Ok(mut latest) = self.metrics.0.android.write() {
             *latest = None;
         }
-        self.metrics
-            .0
-            .connection_generation
-            .fetch_add(1, Ordering::Relaxed);
         Frame::new(
             MessageType::HelloAck,
             self.config.session_id,
@@ -291,15 +335,24 @@ impl ControlServer {
         .await?;
 
         let (frame_tx, mut frame_rx) = mpsc::channel::<Result<Frame, ControlError>>(16);
+        let (read_mode_tx, mut read_mode_rx) = mpsc::channel::<ControlReadMode>(1);
         let reader_task = tokio::spawn(async move {
+            let mut mode = ControlReadMode::Active;
             loop {
-                match read_frame_with_timeout(
-                    &mut reader,
-                    CONTROL_FRAME_TIMEOUT,
-                    "authenticated control frame",
-                )
-                .await
-                {
+                let frame = match mode {
+                    ControlReadMode::Active => {
+                        read_frame_with_timeout(
+                            &mut reader,
+                            CONTROL_FRAME_TIMEOUT,
+                            "authenticated control frame",
+                        )
+                        .await
+                    }
+                    ControlReadMode::Suspended => Frame::read_from(&mut reader)
+                        .await
+                        .map_err(ControlError::Protocol),
+                };
+                match frame {
                     Ok(frame) => {
                         if frame_tx.send(Ok(frame)).await.is_err() {
                             return;
@@ -310,21 +363,38 @@ impl ControlServer {
                         return;
                     }
                 }
+                let Some(next_mode) = read_mode_rx.recv().await else {
+                    return;
+                };
+                mode = next_mode;
             }
         });
 
         let mut heartbeat = time::interval(HEARTBEAT_INTERVAL);
         heartbeat.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
         let mut pending_stop = PendingStop::default();
+        let mut peer_suspended = false;
         let result = loop {
             let stop_deadline = pending_stop
                 .deadline()
                 .unwrap_or_else(|| Instant::now() + Duration::from_secs(24 * 60 * 60));
             tokio::select! {
+                biased;
+                cancelled = connection_cancelled.changed() => {
+                    if cancelled.is_err() || *connection_cancelled.borrow() {
+                        break Ok(());
+                    }
+                }
                 _ = heartbeat.tick() => {
-                    let before = self.state.lock().await.state();
-                    self.state.lock().await.tick(Instant::now());
-                    let after = self.state.lock().await.state();
+                    let (before, after) = {
+                        let mut state = self.state.lock().await;
+                        if !self.is_current_connection(connection_epoch) {
+                            break Ok(());
+                        }
+                        let before = state.state();
+                        state.tick(Instant::now());
+                        (before, state.state())
+                    };
                     if before != after {
                         self.publish().await;
                     }
@@ -342,15 +412,47 @@ impl ControlServer {
                     self.validate_session(&frame)?;
                     match frame.message_type {
                         MessageType::Started => {
+                            let authenticated_wake = match frame.payload.as_slice() {
+                                [] => false,
+                                payload if payload == STARTED_WAKE_PAYLOAD => true,
+                                payload => {
+                                    break Err(ControlError::InvalidStartedPayload(payload.len()))
+                                }
+                            };
                             let mut state = self.state.lock().await;
+                            if !self.is_current_connection(connection_epoch) {
+                                break Ok(());
+                            }
                             // STARTED may already be queued when an explicit stop
                             // is issued during preparation. It must not undo the
                             // stopping transaction or tear down the control lane.
-                            if state.state() != HostState::Stopping {
+                            let accepted_start = state.state() != HostState::Stopping;
+                            if accepted_start {
                                 state.peer_started(frame.session_id, Instant::now())?;
+                            }
+                            peer_suspended = false;
+                            if authenticated_wake && accepted_start {
+                                if let Some(observer) = self
+                                    .wake_observer
+                                    .read()
+                                    .ok()
+                                    .and_then(|observer| observer.clone())
+                                {
+                                    observer();
+                                }
                             }
                             drop(state);
                             self.publish().await;
+                            if authenticated_wake && accepted_start {
+                                let snapshot = self.state.lock().await.snapshot();
+                                Frame::new(
+                                    MessageType::Status,
+                                    frame.session_id,
+                                    serde_json::to_vec(&snapshot)?,
+                                )
+                                .write_to(&mut writer)
+                                .await?;
+                            }
                         }
                         MessageType::Heartbeat => {
                             let received_at = Instant::now();
@@ -358,9 +460,17 @@ impl ControlServer {
                                 self.metrics.0.invalid_heartbeats.fetch_add(1, Ordering::Relaxed);
                                 break Err(ControlError::InvalidHeartbeatPayload(frame.payload.len()));
                             }
-                            let before = self.state.lock().await.state();
-                            self.state.lock().await.heartbeat(frame.session_id, Instant::now())?;
-                            let after = self.state.lock().await.state();
+                            let (before, after) = {
+                                let mut state = self.state.lock().await;
+                                if !self.is_current_connection(connection_epoch) {
+                                    break Ok(());
+                                }
+                                let before = state.state();
+                                if before != HostState::Stopping {
+                                    state.heartbeat(frame.session_id, Instant::now())?;
+                                }
+                                (before, state.state())
+                            };
                             Frame::new(MessageType::Heartbeat, frame.session_id, frame.payload)
                                 .write_to(&mut writer).await?;
                             self.metrics.0.heartbeats_echoed.fetch_add(1, Ordering::Relaxed);
@@ -374,6 +484,9 @@ impl ControlServer {
                         }
                         MessageType::Stopped => {
                             let mut state = self.state.lock().await;
+                            if !self.is_current_connection(connection_epoch) {
+                                break Ok(());
+                            }
                             if !pending_stop.is_pending() || state.state() != HostState::Stopping {
                                 break Err(ControlError::UnsolicitedStopped);
                             }
@@ -383,7 +496,13 @@ impl ControlServer {
                             self.publish().await;
                         }
                         MessageType::Status => {
-                            let snapshot = self.state.lock().await.snapshot();
+                            let snapshot = {
+                                let state = self.state.lock().await;
+                                if !self.is_current_connection(connection_epoch) {
+                                    break Ok(());
+                                }
+                                state.snapshot()
+                            };
                             Frame::new(
                                 MessageType::Status,
                                 frame.session_id,
@@ -391,6 +510,10 @@ impl ControlServer {
                             ).write_to(&mut writer).await?;
                         }
                         MessageType::Metrics => {
+                            let state = self.state.lock().await;
+                            if !self.is_current_connection(connection_epoch) {
+                                break Ok(());
+                            }
                             match AndroidMetricsV1::decode(&frame.payload) {
                                 Ok(metrics) => {
                                     if let Ok(mut latest) = self.metrics.0.android.write() {
@@ -407,33 +530,60 @@ impl ControlServer {
                                     }
                                 }
                             }
+                            drop(state);
                         }
                         MessageType::Suspend => {
                             if !frame.payload.is_empty() {
                                 break Err(ControlError::InvalidSuspendPayload(frame.payload.len()));
                             }
-                            self.state.lock().await.peer_suspended(frame.session_id)?;
-                            if let Some(observer) = self
-                                .suspend_observer
-                                .read()
-                                .ok()
-                                .and_then(|observer| observer.clone())
-                            {
-                                observer();
+                            let mut state = self.state.lock().await;
+                            if !self.is_current_connection(connection_epoch) {
+                                break Ok(());
                             }
-                            self.publish().await;
+                            let stopping = state.state() == HostState::Stopping;
+                            if !stopping {
+                                state.peer_suspended(frame.session_id)?;
+                                if let Some(observer) = self
+                                    .suspend_observer
+                                    .read()
+                                    .ok()
+                                    .and_then(|observer| observer.clone())
+                                {
+                                    observer();
+                                }
+                                peer_suspended = true;
+                            }
+                            drop(state);
+                            if !stopping {
+                                self.publish().await;
+                            }
                             Frame::new(MessageType::Suspended, frame.session_id, Vec::new())
                                 .write_to(&mut writer).await?;
-                            break Ok(());
                         }
                         MessageType::Error => {
-                            self.state.lock().await.fail("Android peer reported an error");
+                            let mut state = self.state.lock().await;
+                            if !self.is_current_connection(connection_epoch) {
+                                break Ok(());
+                            }
+                            state.fail("Android peer reported an error");
+                            drop(state);
                             self.publish().await;
                         }
                         MessageType::Hello
                         | MessageType::HelloAck
                         | MessageType::Suspended
                         | MessageType::Stop => break Err(ControlError::UnexpectedMessage(frame.message_type)),
+                    }
+                    if read_mode_tx
+                        .send(if peer_suspended {
+                            ControlReadMode::Suspended
+                        } else {
+                            ControlReadMode::Active
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break Ok(());
                     }
                 }
                 command = async { self.commands.lock().await.recv().await } => {
@@ -446,13 +596,18 @@ impl ControlServer {
                         let _ = command.result.send(Err("stop is already pending".into()));
                         continue;
                     }
-                    {
-                        let mut state = self.state.lock().await;
-                        if let Err(error) = state.begin_stop() {
-                            let _ = command.result.send(Err(error.to_string()));
-                            continue;
-                        }
+                    let mut state = self.state.lock().await;
+                    if !self.is_current_connection(connection_epoch) {
+                        drop(state);
+                        self.requeue_command(command).await;
+                        break Ok(());
                     }
+                    if let Err(error) = state.begin_stop() {
+                        drop(state);
+                        let _ = command.result.send(Err(error.to_string()));
+                        continue;
+                    }
+                    drop(state);
                     pending_stop.set(command.result, command.deadline);
                     self.publish().await;
                     Frame::new(MessageType::Stop, self.config.session_id, Vec::new())
@@ -470,21 +625,42 @@ impl ControlServer {
         };
         reader_task.abort();
         let _ = writer.shutdown().await;
-        if let Ok(mut latest) = self.metrics.0.android.write() {
-            *latest = None;
-        }
-        {
+        let current_connection = {
             let mut state = self.state.lock().await;
-            if pending_stop.is_pending() {
+            let current = self.active_connection.lock().ok().is_some_and(|active| {
+                active
+                    .as_ref()
+                    .is_some_and(|active| active.epoch == connection_epoch)
+            });
+            if current {
+                if let Ok(mut active) = self.active_connection.lock() {
+                    if active
+                        .as_ref()
+                        .is_some_and(|active| active.epoch == connection_epoch)
+                    {
+                        *active = None;
+                    }
+                }
+                if let Ok(mut latest) = self.metrics.0.android.write() {
+                    *latest = None;
+                }
+            }
+            if !current {
+                false
+            } else if pending_stop.is_pending() {
                 pending_stop.fail("control connection closed before STOPPED");
                 state.fail(
                     "control transport was lost during explicit stop; VPN state is unverified",
                 );
+                true
             } else {
                 state.transport_lost(CONTROL_TRANSPORT_LOST_REASON);
+                true
             }
+        };
+        if current_connection {
+            self.publish().await;
         }
-        self.publish().await;
         result
     }
 
@@ -493,6 +669,36 @@ impl ControlServer {
             Ok(())
         } else {
             Err(ControlError::StaleSession(frame.session_id))
+        }
+    }
+
+    fn is_current_connection(&self, connection_epoch: u64) -> bool {
+        self.active_connection
+            .lock()
+            .ok()
+            .and_then(|active| active.as_ref().map(|active| active.epoch))
+            == Some(connection_epoch)
+    }
+
+    async fn requeue_command(&self, mut command: ControlCommand) {
+        loop {
+            if Instant::now() > command.deadline {
+                let _ = command.result.send(Err("stop request expired".into()));
+                return;
+            }
+            match self.handle.sender.try_send(command) {
+                Ok(()) => return,
+                Err(mpsc::error::TrySendError::Full(returned)) => {
+                    command = returned;
+                    tokio::task::yield_now().await;
+                }
+                Err(mpsc::error::TrySendError::Closed(returned)) => {
+                    let _ = returned
+                        .result
+                        .send(Err("control command lane is unavailable".into()));
+                    return;
+                }
+            }
         }
     }
 
@@ -588,6 +794,8 @@ pub enum ControlError {
     ExpectedHello,
     #[error("control frame belongs to stale session {0}")]
     StaleSession(SessionId),
+    #[error("control replacement is not allowed while stopping")]
+    ReplacementDuringStop,
     #[error("unexpected control message {0:?}")]
     UnexpectedMessage(MessageType),
     #[error("received STOPPED without a matching host STOP transaction")]
@@ -596,6 +804,8 @@ pub enum ControlError {
     ReadTimeout(&'static str),
     #[error("HEARTBEAT payload must be 16 bytes, got {0}")]
     InvalidHeartbeatPayload(usize),
+    #[error("STARTED payload must be empty or the wake marker, got {0} bytes")]
+    InvalidStartedPayload(usize),
     #[error("SUSPEND payload must be empty, got {0} bytes")]
     InvalidSuspendPayload(usize),
     #[error("control command lane is unavailable")]
@@ -620,10 +830,12 @@ impl ControlError {
             Self::NonLoopbackBind(_) => "non_loopback_bind",
             Self::ExpectedHello => "expected_hello",
             Self::StaleSession(_) => "stale_session",
+            Self::ReplacementDuringStop => "replacement_during_stop",
             Self::UnexpectedMessage(_) => "unexpected_message",
             Self::UnsolicitedStopped => "unsolicited_stopped",
             Self::ReadTimeout(_) => "read_timeout",
             Self::InvalidHeartbeatPayload(_) => "invalid_heartbeat_payload",
+            Self::InvalidStartedPayload(_) => "invalid_started_payload",
             Self::InvalidSuspendPayload(_) => "invalid_suspend_payload",
             Self::CommandUnavailable => "command_unavailable",
             Self::CommandRejected(_) => "command_rejected",
@@ -837,6 +1049,8 @@ mod tests {
         let bind = listener.local_addr().unwrap();
         let notifications = Arc::new(AtomicU64::new(0));
         let observed_notifications = notifications.clone();
+        let wakes = Arc::new(AtomicU64::new(0));
+        let observed_wakes = wakes.clone();
         let server = ControlServer::new(ControlConfig {
             bind,
             session_id: session,
@@ -844,8 +1058,12 @@ mod tests {
         .unwrap()
         .with_suspend_observer(Arc::new(move || {
             observed_notifications.fetch_add(1, Ordering::Relaxed);
+        }))
+        .with_wake_observer(Arc::new(move || {
+            observed_wakes.fetch_add(1, Ordering::Relaxed);
         }));
         let state = server.state();
+        let observed = server.clone();
         let task = tokio::spawn(server.serve_on(listener));
 
         let mut client = TcpStream::connect(bind).await.unwrap();
@@ -873,6 +1091,208 @@ mod tests {
             Some(crate::state::HEADSET_SUSPENDED_REASON)
         );
         assert_eq!(notifications.load(Ordering::Relaxed), 1);
+        time::sleep(CONTROL_FRAME_TIMEOUT + Duration::from_millis(500)).await;
+        assert_eq!(state.lock().await.state(), HostState::Degraded);
+        Frame::new(MessageType::Started, session, STARTED_WAKE_PAYLOAD.to_vec())
+            .write_to(&mut client)
+            .await
+            .unwrap();
+        time::timeout(Duration::from_secs(1), async {
+            while state.lock().await.state() != HostState::Connected {
+                time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("wake STARTED did not reuse the suspended connection");
+        assert_eq!(
+            Frame::read_from(&mut client).await.unwrap().message_type,
+            MessageType::Status
+        );
+        assert_eq!(wakes.load(Ordering::Relaxed), 1);
+        assert_eq!(observed.metrics().connection_generation, 1);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn valid_same_session_connection_preempts_a_silent_current_handler() {
+        let session = SessionId([0x3c; 16]);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bind = listener.local_addr().unwrap();
+        let server = ControlServer::new(ControlConfig {
+            bind,
+            session_id: session,
+        })
+        .unwrap();
+        let state = server.state();
+        let observed = server.clone();
+        let task = tokio::spawn(server.serve_on(listener));
+
+        let mut first = TcpStream::connect(bind).await.unwrap();
+        Frame::new(MessageType::Hello, session, Vec::new())
+            .write_to(&mut first)
+            .await
+            .unwrap();
+        Frame::read_from(&mut first).await.unwrap();
+        Frame::new(MessageType::Started, session, Vec::new())
+            .write_to(&mut first)
+            .await
+            .unwrap();
+
+        let mut replacement = TcpStream::connect(bind).await.unwrap();
+        Frame::new(MessageType::Hello, session, Vec::new())
+            .write_to(&mut replacement)
+            .await
+            .unwrap();
+        let acknowledgement = time::timeout(
+            Duration::from_millis(500),
+            Frame::read_from(&mut replacement),
+        )
+        .await
+        .expect("valid replacement was blocked by the old handler")
+        .unwrap();
+        assert_eq!(acknowledgement.message_type, MessageType::HelloAck);
+        Frame::new(MessageType::Started, session, Vec::new())
+            .write_to(&mut replacement)
+            .await
+            .unwrap();
+
+        time::timeout(Duration::from_secs(1), async {
+            while observed.metrics().connection_generation < 2
+                || state.lock().await.state() != HostState::Connected
+            {
+                time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(time::timeout(Duration::from_secs(1), first.read_u8())
+            .await
+            .expect("superseded connection remained open")
+            .is_err());
+        time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(state.lock().await.state(), HostState::Connected);
+
+        let heartbeat = vec![0x3c; 16];
+        Frame::new(MessageType::Heartbeat, session, heartbeat.clone())
+            .write_to(&mut replacement)
+            .await
+            .unwrap();
+        assert_eq!(
+            Frame::read_from(&mut replacement).await.unwrap().payload,
+            heartbeat
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn queued_frame_from_superseded_handler_cannot_suspend_current_session() {
+        let session = SessionId([0x3e; 16]);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bind = listener.local_addr().unwrap();
+        let notifications = Arc::new(AtomicU64::new(0));
+        let observed_notifications = notifications.clone();
+        let server = ControlServer::new(ControlConfig {
+            bind,
+            session_id: session,
+        })
+        .unwrap()
+        .with_suspend_observer(Arc::new(move || {
+            observed_notifications.fetch_add(1, Ordering::Relaxed);
+        }));
+        let observed = server.clone();
+        let state = server.state();
+        let task = tokio::spawn(server.serve_on(listener));
+
+        let mut first = TcpStream::connect(bind).await.unwrap();
+        Frame::new(MessageType::Hello, session, Vec::new())
+            .write_to(&mut first)
+            .await
+            .unwrap();
+        Frame::read_from(&mut first).await.unwrap();
+        Frame::new(MessageType::Started, session, Vec::new())
+            .write_to(&mut first)
+            .await
+            .unwrap();
+        time::timeout(Duration::from_secs(1), async {
+            while state.lock().await.state() != HostState::Connected {
+                time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let state_guard = state.lock().await;
+        Frame::new(MessageType::Suspend, session, Vec::new())
+            .write_to(&mut first)
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        let (replacement, _replacement_cancelled) = watch::channel(false);
+        let previous = observed
+            .active_connection
+            .lock()
+            .unwrap()
+            .replace(ActiveConnection {
+                epoch: 2,
+                cancel: replacement,
+            })
+            .unwrap();
+        drop(state_guard);
+
+        assert!(time::timeout(Duration::from_secs(1), first.read_u8())
+            .await
+            .expect("superseded connection remained open")
+            .is_err());
+        assert_eq!(state.lock().await.state(), HostState::Connected);
+        assert_eq!(notifications.load(Ordering::Relaxed), 0);
+        drop(previous);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn wrong_session_connection_cannot_preempt_the_current_handler() {
+        let session = SessionId([0x3d; 16]);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bind = listener.local_addr().unwrap();
+        let server = ControlServer::new(ControlConfig {
+            bind,
+            session_id: session,
+        })
+        .unwrap();
+        let observed = server.clone();
+        let task = tokio::spawn(server.serve_on(listener));
+
+        let mut current = TcpStream::connect(bind).await.unwrap();
+        Frame::new(MessageType::Hello, session, Vec::new())
+            .write_to(&mut current)
+            .await
+            .unwrap();
+        Frame::read_from(&mut current).await.unwrap();
+        Frame::new(MessageType::Started, session, Vec::new())
+            .write_to(&mut current)
+            .await
+            .unwrap();
+
+        let mut stale = TcpStream::connect(bind).await.unwrap();
+        Frame::new(MessageType::Hello, SessionId([0xff; 16]), Vec::new())
+            .write_to(&mut stale)
+            .await
+            .unwrap();
+        assert!(time::timeout(Duration::from_secs(1), stale.read_u8())
+            .await
+            .unwrap()
+            .is_err());
+
+        let heartbeat = vec![0x3d; 16];
+        Frame::new(MessageType::Heartbeat, session, heartbeat.clone())
+            .write_to(&mut current)
+            .await
+            .unwrap();
+        assert_eq!(
+            Frame::read_from(&mut current).await.unwrap().payload,
+            heartbeat
+        );
+        assert_eq!(observed.metrics().connection_generation, 1);
         task.abort();
     }
 
@@ -945,6 +1365,176 @@ mod tests {
         let request = Frame::read_from(&mut client).await.unwrap();
         assert_eq!(request.message_type, MessageType::Stop);
         assert!(!stop.is_finished());
+        Frame::new(MessageType::Stopped, session, Vec::new())
+            .write_to(&mut client)
+            .await
+            .unwrap();
+        stop.await.unwrap().unwrap();
+        assert_eq!(handle.snapshot().await.state, HostState::Stopped);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn superseded_handler_does_not_consume_stop_for_replacement() {
+        let session = SessionId([0x48; 16]);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bind = listener.local_addr().unwrap();
+        let server = ControlServer::new(ControlConfig {
+            bind,
+            session_id: session,
+        })
+        .unwrap();
+        let observed = server.clone();
+        let handle = server.command_handle();
+        let task = tokio::spawn(server.serve_on(listener));
+
+        let mut first = TcpStream::connect(bind).await.unwrap();
+        Frame::new(MessageType::Hello, session, Vec::new())
+            .write_to(&mut first)
+            .await
+            .unwrap();
+        Frame::read_from(&mut first).await.unwrap();
+        Frame::new(MessageType::Started, session, Vec::new())
+            .write_to(&mut first)
+            .await
+            .unwrap();
+        time::timeout(Duration::from_secs(1), async {
+            while handle.snapshot().await.state != HostState::Connected {
+                time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let (replacement, _replacement_cancelled) = watch::channel(false);
+        let previous = observed
+            .active_connection
+            .lock()
+            .unwrap()
+            .replace(ActiveConnection {
+                epoch: 2,
+                cancel: replacement,
+            })
+            .unwrap();
+        let stop = tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.request_stop(Duration::from_secs(2)).await }
+        });
+        assert!(time::timeout(Duration::from_secs(1), first.read_u8())
+            .await
+            .expect("superseded connection remained open")
+            .is_err());
+
+        let mut current = TcpStream::connect(bind).await.unwrap();
+        Frame::new(MessageType::Hello, session, Vec::new())
+            .write_to(&mut current)
+            .await
+            .unwrap();
+        assert_eq!(
+            Frame::read_from(&mut current).await.unwrap().message_type,
+            MessageType::HelloAck
+        );
+        assert_eq!(
+            Frame::read_from(&mut current).await.unwrap().message_type,
+            MessageType::Stop
+        );
+        Frame::new(MessageType::Stopped, session, Vec::new())
+            .write_to(&mut current)
+            .await
+            .unwrap();
+        stop.await.unwrap().unwrap();
+        assert_eq!(handle.snapshot().await.state, HostState::Stopped);
+        drop(previous);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn heartbeat_queued_during_stop_does_not_close_control_lane() {
+        let session = SessionId([0x49; 16]);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bind = listener.local_addr().unwrap();
+        let server = ControlServer::new(ControlConfig {
+            bind,
+            session_id: session,
+        })
+        .unwrap();
+        let handle = server.command_handle();
+        let task = tokio::spawn(server.serve_on(listener));
+        let mut client = TcpStream::connect(bind).await.unwrap();
+        Frame::new(MessageType::Hello, session, Vec::new())
+            .write_to(&mut client)
+            .await
+            .unwrap();
+        Frame::read_from(&mut client).await.unwrap();
+        Frame::new(MessageType::Started, session, Vec::new())
+            .write_to(&mut client)
+            .await
+            .unwrap();
+
+        let stop = tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.request_stop(Duration::from_secs(1)).await }
+        });
+        assert_eq!(
+            Frame::read_from(&mut client).await.unwrap().message_type,
+            MessageType::Stop
+        );
+        let heartbeat = vec![0x49; 16];
+        Frame::new(MessageType::Heartbeat, session, heartbeat.clone())
+            .write_to(&mut client)
+            .await
+            .unwrap();
+        let echo = Frame::read_from(&mut client).await.unwrap();
+        assert_eq!(echo.message_type, MessageType::Heartbeat);
+        assert_eq!(echo.payload, heartbeat);
+        Frame::new(MessageType::Stopped, session, Vec::new())
+            .write_to(&mut client)
+            .await
+            .unwrap();
+        stop.await.unwrap().unwrap();
+        assert_eq!(handle.snapshot().await.state, HostState::Stopped);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn suspend_racing_with_stop_is_acknowledged_without_closing_the_lane() {
+        let session = SessionId([0x47; 16]);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bind = listener.local_addr().unwrap();
+        let server = ControlServer::new(ControlConfig {
+            bind,
+            session_id: session,
+        })
+        .unwrap();
+        let handle = server.command_handle();
+        let task = tokio::spawn(server.serve_on(listener));
+        let mut client = TcpStream::connect(bind).await.unwrap();
+        Frame::new(MessageType::Hello, session, Vec::new())
+            .write_to(&mut client)
+            .await
+            .unwrap();
+        Frame::read_from(&mut client).await.unwrap();
+        Frame::new(MessageType::Started, session, Vec::new())
+            .write_to(&mut client)
+            .await
+            .unwrap();
+
+        let stop = tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.request_stop(Duration::from_secs(1)).await }
+        });
+        assert_eq!(
+            Frame::read_from(&mut client).await.unwrap().message_type,
+            MessageType::Stop
+        );
+        Frame::new(MessageType::Suspend, session, Vec::new())
+            .write_to(&mut client)
+            .await
+            .unwrap();
+        assert_eq!(
+            Frame::read_from(&mut client).await.unwrap().message_type,
+            MessageType::Suspended
+        );
         Frame::new(MessageType::Stopped, session, Vec::new())
             .write_to(&mut client)
             .await

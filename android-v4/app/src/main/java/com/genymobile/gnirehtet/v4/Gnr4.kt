@@ -57,6 +57,7 @@ object Gnr4 {
     const val MAX_PAYLOAD = 65_536
     const val METRICS_PAYLOAD_SIZE = 60
     const val HELLO_CAPABILITIES = "android-v4;hev-udp-in-tcp"
+    private val WAKE_STARTED_PAYLOAD = byteArrayOf(1)
     private const val METRICS_VERSION = 1
     private const val METRICS_FLAGS = 0
     private val MAGIC = byteArrayOf('G'.code.toByte(), 'N'.code.toByte(), 'R'.code.toByte(), '4'.code.toByte())
@@ -105,6 +106,9 @@ object Gnr4 {
         .putLong(sequence)
         .putLong(monotonicNanos)
         .array()
+
+    fun startedPayload(wake: Boolean): ByteArray =
+        if (wake) WAKE_STARTED_PAYLOAD.copyOf() else ByteArray(0)
 
     fun parseHeartbeatPayload(payload: ByteArray): Gnr4Heartbeat? {
         if (payload.size != Long.SIZE_BYTES * 2) return null
