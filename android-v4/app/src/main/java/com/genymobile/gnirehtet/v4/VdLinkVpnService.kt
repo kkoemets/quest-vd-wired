@@ -59,6 +59,12 @@ internal fun isHeadsetDisplaySuspended(displayState: Int?, isInteractive: Boolea
         else -> false
     }
 
+internal fun screenSuspendedFromBroadcast(action: String?): Boolean? = when (action) {
+    Intent.ACTION_SCREEN_OFF -> true
+    Intent.ACTION_SCREEN_ON -> false
+    else -> null
+}
+
 class VdLinkVpnService : VpnService() {
     private data class SessionResources(
         val generation: Long,
@@ -91,10 +97,7 @@ class VdLinkVpnService : VpnService() {
 
     private val screenReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
-            when (intent?.action) {
-                Intent.ACTION_SCREEN_OFF -> setScreenSuspended(true)
-                Intent.ACTION_SCREEN_ON -> refreshScreenState()
-            }
+            screenSuspendedFromBroadcast(intent?.action)?.let(::setScreenSuspended)
         }
     }
 

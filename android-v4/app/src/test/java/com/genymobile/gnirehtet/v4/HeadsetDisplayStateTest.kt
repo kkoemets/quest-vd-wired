@@ -1,7 +1,10 @@
 package com.genymobile.gnirehtet.v4
 
+import android.content.Intent
 import android.view.Display
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -28,5 +31,12 @@ class HeadsetDisplayStateTest {
         assertFalse(isHeadsetDisplaySuspended(null, isInteractive = true))
         assertTrue(isHeadsetDisplaySuspended(Display.STATE_UNKNOWN, isInteractive = false))
         assertFalse(isHeadsetDisplaySuspended(Display.STATE_UNKNOWN, isInteractive = true))
+    }
+
+    @Test
+    fun screenBroadcastsApplyTheInteractiveStateImmediately() {
+        assertEquals(true, screenSuspendedFromBroadcast(Intent.ACTION_SCREEN_OFF))
+        assertEquals(false, screenSuspendedFromBroadcast(Intent.ACTION_SCREEN_ON))
+        assertNull(screenSuspendedFromBroadcast(Intent.ACTION_USER_PRESENT))
     }
 }
