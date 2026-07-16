@@ -544,14 +544,14 @@ impl AdbHealthMonitor {
                         // health interval is stable enough to reset restart
                         // backoff. Fast crash loops continue toward the cap.
                         backoff = INITIAL_BACKOFF;
-                        if let Some(available) = device_available {
+                        if cached_device_is_available(device_available) {
                             self.reconcile(
                                 &adb,
                                 &control,
                                 &store,
                                 &diagnostics,
                                 &relay_gate,
-                                available,
+                                true,
                             ).await;
                         }
                     }
@@ -559,14 +559,14 @@ impl AdbHealthMonitor {
                         if self.stopping.load(Ordering::Acquire) {
                             break;
                         }
-                        if let Some(available) = device_available {
+                        if cached_device_is_available(device_available) {
                             self.reconcile(
                                 &adb,
                                 &control,
                                 &store,
                                 &diagnostics,
                                 &relay_gate,
-                                available,
+                                true,
                             ).await;
                         }
                     }
@@ -988,6 +988,13 @@ async fn sleep_or_stop(monitor: &AdbHealthMonitor, duration: Duration) -> bool {
 
 fn next_backoff(current: Duration, maximum: Duration) -> Duration {
     current.saturating_mul(2).min(maximum)
+}
+
+fn cached_device_is_available(device_available: Option<bool>) -> bool {
+    // Unavailable updates are reconciled when track-devices emits them. Replaying
+    // an old `false` on a timer or lifecycle notification can erase the fresh
+    // control authentication that arrives during wake, leaving the relay gated.
+    device_available == Some(true)
 }
 
 pub struct OperationGuard {
@@ -2779,6 +2786,33 @@ mod tests {
         assert_eq!(third, Duration::from_secs(2));
         assert_eq!(fourth, Duration::from_secs(4));
         assert_eq!(fifth, maximum);
+    }
+
+    #[test]
+    fn stale_unavailable_cache_does_not_erase_fresh_wake_authentication() {
+        for cached in [None, Some(false)] {
+            let relay_gate = RelayGate::default();
+            let relay_controller = RelayGateController::new(relay_gate.clone());
+
+            relay_controller.carrier_lost();
+            relay_controller.control_connected();
+            assert!(!relay_gate.is_enabled());
+
+            // This is the predicate used by both timer and lifecycle wakeups.
+            // Entering it for a stale false would erase the fresh control auth.
+            if cached_device_is_available(cached) {
+                relay_controller.carrier_lost();
+            }
+
+            // A fresh track-devices update or mapping probe restores carrier
+            // health. The authenticated wake connection must still be present.
+            relay_controller.carrier_healthy();
+            assert!(
+                relay_gate.is_enabled(),
+                "stale cache was replayed: {cached:?}"
+            );
+        }
+        assert!(cached_device_is_available(Some(true)));
     }
 
     #[tokio::test]
