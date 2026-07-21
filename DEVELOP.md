@@ -101,8 +101,9 @@ Every release must include:
 - reproducibility comparison for independently built artifacts
 - raw hardware-gate evidence or a clear statement that v4 remains experimental
 
-No diagnostics backend exists. Tests and product code must never write packet
-payloads to logs.
+No remote diagnostics backend exists. The bounded local diagnostics recorder
+must never write packet payloads, destinations, account details, or browsing
+history to logs.
 
 The trust boundaries, failure policy, local command-channel requirement, and
 release supply-chain rules must remain enforced by code, tests, and workflows.

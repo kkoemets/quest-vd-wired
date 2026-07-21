@@ -23,7 +23,7 @@ use gnirehtet_vd::{
         repair_adb_if_missing, resolve_adb_program, AdbController, SystemAdb,
         ADB_MAPPING_COMMAND_TIMEOUT, VIRTUAL_DESKTOP_PACKAGE,
     },
-    diagnostics::Diagnostics,
+    diagnostics::{Diagnostics, DEFAULT_FILE_COUNT, DEFAULT_MAX_BYTES, DEFAULT_TOTAL_BYTES},
     embedded,
     protocol::SessionId,
     runtime::{
@@ -997,6 +997,14 @@ async fn status(paths: &AppPaths, adb: &AdbController, args: StatusArgs) -> Resu
             "host": status,
             "android": android.as_ref().ok(),
             "android_error": android.as_ref().err().map(ToString::to_string),
+            "logging": {
+                "directory": &paths.logs,
+                "format": "jsonl",
+                "max_bytes_per_file": DEFAULT_MAX_BYTES,
+                "file_count": DEFAULT_FILE_COUNT,
+                "max_total_bytes": DEFAULT_TOTAL_BYTES,
+                "oldest_file_deleted_on_rotation": true,
+            },
         }))?)
     } else {
         let mut lines = vec![
@@ -1008,6 +1016,12 @@ async fn status(paths: &AppPaths, adb: &AdbController, args: StatusArgs) -> Resu
                 } else {
                     "not running"
                 }
+            ),
+            format!(
+                "logs: {} ({} x {} MiB; oldest auto-deleted)",
+                paths.logs.display(),
+                DEFAULT_FILE_COUNT,
+                DEFAULT_MAX_BYTES / (1024 * 1024)
             ),
         ];
         if let Some(reason) = status.lifecycle.reason {
