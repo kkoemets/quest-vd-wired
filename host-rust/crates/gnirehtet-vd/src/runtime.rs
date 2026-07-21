@@ -7,7 +7,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex as StdMutex,
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(target_os = "windows")]
@@ -38,7 +38,10 @@ use crate::{
         ControlConfig, ControlHandle, ControlServer, StateObserver, SuspendObserver, WakeObserver,
         CONTROL_TRANSPORT_LOST_REASON,
     },
-    diagnostics::Diagnostics,
+    diagnostics::{
+        DiagnosticWriteMetrics, Diagnostics, DEFAULT_FILE_COUNT, DEFAULT_MAX_BYTES,
+        DEFAULT_TOTAL_BYTES,
+    },
     protocol::{AndroidMetricsV1, SessionId},
     socks::{RelayGate, SocksCommandPolicy, SocksConfig, SocksServer},
     state::{HostState, StateSnapshot},
@@ -283,6 +286,13 @@ pub struct RuntimeTelemetry {
     pub process: crate::diagnostics::ProcessSample,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct RuntimePersistenceMetrics {
+    diagnostics: DiagnosticWriteMetrics,
+    status_write_us: u64,
+    failed: bool,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AdbMonitorSnapshot {
     pub active: bool,
@@ -290,6 +300,12 @@ pub struct AdbMonitorSnapshot {
     pub device_available: bool,
     pub mappings_healthy: bool,
     pub reconnect_generation: u64,
+    #[serde(default)]
+    pub mapping_probe_count: u64,
+    #[serde(default)]
+    pub mapping_probe_last_us: u64,
+    #[serde(default)]
+    pub mapping_probe_max_us: u64,
     pub last_error: Option<String>,
 }
 
@@ -298,6 +314,9 @@ pub struct AdbHealthMonitor {
     stopping: Arc<AtomicBool>,
     authenticated_reconcile: Arc<AtomicBool>,
     reconnect_generation: Arc<AtomicU64>,
+    mapping_probe_count: Arc<AtomicU64>,
+    mapping_probe_last_us: Arc<AtomicU64>,
+    mapping_probe_max_us: Arc<AtomicU64>,
     status: Arc<StdMutex<AdbMonitorSnapshot>>,
     operation: Arc<Mutex<()>>,
     changed: Arc<Notify>,
@@ -433,7 +452,19 @@ impl AdbHealthMonitor {
             .unwrap_or_default();
         snapshot.repair_suppressed = self.stopping.load(Ordering::Acquire);
         snapshot.reconnect_generation = self.reconnect_generation.load(Ordering::Relaxed);
+        snapshot.mapping_probe_count = self.mapping_probe_count.load(Ordering::Relaxed);
+        snapshot.mapping_probe_last_us = self.mapping_probe_last_us.load(Ordering::Relaxed);
+        snapshot.mapping_probe_max_us = self.mapping_probe_max_us.load(Ordering::Relaxed);
         snapshot
+    }
+
+    fn record_mapping_probe(&self, duration: Duration) {
+        let duration_us = duration.as_micros().min(u64::MAX as u128) as u64;
+        self.mapping_probe_count.fetch_add(1, Ordering::Relaxed);
+        self.mapping_probe_last_us
+            .store(duration_us, Ordering::Relaxed);
+        self.mapping_probe_max_us
+            .fetch_max(duration_us, Ordering::Relaxed);
     }
 
     /// Convenience shutdown path that suppresses and drains repair work.
@@ -564,11 +595,21 @@ impl AdbHealthMonitor {
                         // A track process that remains alive for a complete
                         // health interval is stable enough to reset restart
                         // backoff. Fast crash loops continue toward the cap.
+                        // Do not continuously invoke `adb reverse --list`
+                        // while all mappings and the authenticated control
+                        // lane are healthy: that command shares the active USB
+                        // transport with forwarded traffic. Device/control
+                        // changes still notify this monitor immediately, and
+                        // an unhealthy result keeps retrying on this tick.
                         backoff = INITIAL_BACKOFF;
                         let forced = self
                             .authenticated_reconcile
                             .swap(false, Ordering::AcqRel);
-                        if forced || cached_device_is_available(device_available) {
+                        if should_reconcile_on_healthy_tick(
+                            forced,
+                            device_available,
+                            self.snapshot().mappings_healthy,
+                        ) {
                             self.reconcile(
                                 &adb,
                                 &control,
@@ -671,7 +712,9 @@ impl AdbHealthMonitor {
             return;
         }
         let probe_adb = adb.clone();
+        let probe_started = Instant::now();
         let health = task::spawn_blocking(move || probe_adb.mapping_health()).await;
+        self.record_mapping_probe(probe_started.elapsed());
         match health {
             Ok(Ok(health)) if health.is_healthy() => {
                 self.update_status(true, true, true, None);
@@ -822,6 +865,9 @@ impl AdbHealthMonitor {
                 device_available,
                 mappings_healthy,
                 reconnect_generation: self.reconnect_generation.load(Ordering::Relaxed),
+                mapping_probe_count: self.mapping_probe_count.load(Ordering::Relaxed),
+                mapping_probe_last_us: self.mapping_probe_last_us.load(Ordering::Relaxed),
+                mapping_probe_max_us: self.mapping_probe_max_us.load(Ordering::Relaxed),
                 last_error,
             };
             let changed = *status != next;
@@ -1042,6 +1088,14 @@ fn cached_device_is_available(device_available: Option<bool>) -> bool {
     device_available == Some(true)
 }
 
+fn should_reconcile_on_healthy_tick(
+    forced: bool,
+    device_available: Option<bool>,
+    mappings_healthy: bool,
+) -> bool {
+    forced || (cached_device_is_available(device_available) && !mappings_healthy)
+}
+
 pub struct OperationGuard {
     path: PathBuf,
     _file: fs::File,
@@ -1134,6 +1188,20 @@ impl HostRuntime {
         install_runtime_kill_job()?;
         let _runtime_guard = OperationGuard::acquire(&self.config.paths.runtime_lock)?;
         let diagnostics = Diagnostics::open(&self.config.paths.logs)?;
+        diagnostics.record(
+            "runtime_started",
+            json!({
+                "version": env!("CARGO_PKG_VERSION"),
+                "logging": {
+                    "format": "jsonl",
+                    "max_bytes_per_file": DEFAULT_MAX_BYTES,
+                    "file_count": DEFAULT_FILE_COUNT,
+                    "max_total_bytes": DEFAULT_TOTAL_BYTES,
+                    "oldest_file_deleted_on_rotation": true,
+                },
+                "runtime_sample_interval_ms": 1_000,
+            }),
+        )?;
         let store = StateStore::new(&self.config.paths.status);
         write_daemon_identity(&self.config.paths.daemon_pid, self.config.session_id)?;
         store.write_runtime_not_ready(
@@ -1224,10 +1292,25 @@ impl HostRuntime {
             .saturating_mul(1_000)
             .saturating_add(u128::from(std::process::id()));
         let metrics = tokio::spawn(async move {
-            let mut interval = time::interval(Duration::from_secs(1));
+            const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+            let mut interval = time::interval(SAMPLE_INTERVAL);
             interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+            let mut last_sample_started = None;
+            let mut previous_persistence = RuntimePersistenceMetrics::default();
             loop {
                 interval.tick().await;
+                let sample_started = Instant::now();
+                let sample_interval_us = last_sample_started
+                    .replace(sample_started)
+                    .map(|previous: Instant| {
+                        sample_started
+                            .saturating_duration_since(previous)
+                            .as_micros()
+                            .min(u64::MAX as u128) as u64
+                    })
+                    .unwrap_or(SAMPLE_INTERVAL.as_micros() as u64);
+                let scheduler_lag_us =
+                    sample_interval_us.saturating_sub(SAMPLE_INTERVAL.as_micros() as u64);
                 let process = crate::diagnostics::process_sample();
                 let mut relay = metrics_udp_socks.stats();
                 let tcp = metrics_tcp_socks.stats();
@@ -1251,24 +1334,48 @@ impl HostRuntime {
                     process,
                 };
                 let snapshot = metrics_control_handle.snapshot().await;
-                let _ = metrics_diagnostics.record(
-                    "runtime_sample",
-                    json!({
-                        "process": {
-                            "pid": std::process::id(),
-                            "role": "daemon",
-                            "generation": process_generation,
-                        },
-                        "runtime_ready": metrics_runtime_ready.load(Ordering::Acquire),
-                        "lifecycle": &snapshot,
-                        "telemetry": &telemetry,
-                    }),
-                );
-                let _ = metrics_store.write_with_telemetry(
-                    &snapshot,
-                    Some(std::process::id()),
-                    telemetry,
-                );
+                let fields = json!({
+                    "process": {
+                        "pid": std::process::id(),
+                        "role": "daemon",
+                        "generation": process_generation,
+                    },
+                    "runtime_ready": metrics_runtime_ready.load(Ordering::Acquire),
+                    "lifecycle": &snapshot,
+                    "telemetry": &telemetry,
+                    "timing": {
+                        "sample_interval_us": sample_interval_us,
+                        "scheduler_lag_us": scheduler_lag_us,
+                        "previous_diagnostics_write_us": previous_persistence.diagnostics.duration_us,
+                        "previous_log_rotated": previous_persistence.diagnostics.rotated,
+                        "previous_status_write_us": previous_persistence.status_write_us,
+                        "previous_persistence_failed": previous_persistence.failed,
+                    },
+                });
+                let persistence_diagnostics = metrics_diagnostics.clone();
+                let persistence_store = metrics_store.clone();
+                previous_persistence = task::spawn_blocking(move || {
+                    let diagnostics_result =
+                        persistence_diagnostics.record_with_metrics("runtime_sample", fields);
+                    let status_started = Instant::now();
+                    let status_result = persistence_store.write_with_telemetry(
+                        &snapshot,
+                        Some(std::process::id()),
+                        telemetry,
+                    );
+                    let diagnostics_failed = diagnostics_result.is_err();
+                    RuntimePersistenceMetrics {
+                        diagnostics: diagnostics_result.unwrap_or_default(),
+                        status_write_us: status_started.elapsed().as_micros().min(u64::MAX as u128)
+                            as u64,
+                        failed: diagnostics_failed || status_result.is_err(),
+                    }
+                })
+                .await
+                .unwrap_or(RuntimePersistenceMetrics {
+                    failed: true,
+                    ..Default::default()
+                });
             }
         });
 
@@ -2853,6 +2960,7 @@ mod tests {
             relay_controller.carrier_lost();
             relay_controller.authenticated_wake();
             relay_controller.control_connected();
+            relay_controller.carrier_healthy();
             assert!(relay_gate.is_enabled());
 
             // This is the predicate used by both timer and lifecycle wakeups.
@@ -2867,6 +2975,15 @@ mod tests {
             );
         }
         assert!(cached_device_is_available(Some(true)));
+    }
+
+    #[test]
+    fn healthy_timer_avoids_repeated_adb_transport_probes() {
+        assert!(!should_reconcile_on_healthy_tick(false, Some(true), true));
+        assert!(!should_reconcile_on_healthy_tick(false, Some(false), false));
+        assert!(!should_reconcile_on_healthy_tick(false, None, false));
+        assert!(should_reconcile_on_healthy_tick(false, Some(true), false));
+        assert!(should_reconcile_on_healthy_tick(true, Some(true), true));
     }
 
     #[test]

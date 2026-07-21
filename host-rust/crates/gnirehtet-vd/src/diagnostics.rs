@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(target_os = "macos")]
@@ -14,8 +14,9 @@ use std::process::Command;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
-pub const DEFAULT_MAX_BYTES: u64 = 10 * 1024 * 1024;
-pub const DEFAULT_FILE_COUNT: usize = 5;
+pub const DEFAULT_MAX_BYTES: u64 = 20 * 1024 * 1024;
+pub const DEFAULT_FILE_COUNT: usize = 10;
+pub const DEFAULT_TOTAL_BYTES: u64 = DEFAULT_MAX_BYTES * DEFAULT_FILE_COUNT as u64;
 pub const LATENCY_BUCKET_UPPER_US: [u64; 9] = [
     250, 500, 1_000, 2_000, 5_000, 10_000, 25_000, 50_000, 100_000,
 ];
@@ -97,6 +98,12 @@ pub struct Diagnostics {
     directory: PathBuf,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct DiagnosticWriteMetrics {
+    pub duration_us: u64,
+    pub rotated: bool,
+}
+
 impl Diagnostics {
     pub fn open(directory: impl Into<PathBuf>) -> io::Result<Self> {
         Self::with_limits(directory, DEFAULT_MAX_BYTES, DEFAULT_FILE_COUNT)
@@ -117,6 +124,14 @@ impl Diagnostics {
     }
 
     pub fn record(&self, kind: &str, fields: Value) -> io::Result<()> {
+        self.record_with_metrics(kind, fields).map(|_| ())
+    }
+
+    pub fn record_with_metrics(
+        &self,
+        kind: &str,
+        fields: Value,
+    ) -> io::Result<DiagnosticWriteMetrics> {
         let event = json!({
             "timestamp_unix_ms": unix_millis(),
             "kind": kind,
@@ -124,10 +139,16 @@ impl Diagnostics {
         });
         let mut encoded = serde_json::to_vec(&event).map_err(io::Error::other)?;
         encoded.push(b'\n');
-        self.inner
+        let started = Instant::now();
+        let rotated = self
+            .inner
             .lock()
             .map_err(|_| io::Error::other("diagnostics lock poisoned"))?
-            .write_record(&encoded)
+            .write_record(&encoded)?;
+        Ok(DiagnosticWriteMetrics {
+            duration_us: started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+            rotated,
+        })
     }
 
     /// Creates a local JSONL support bundle. No network operation is performed.
@@ -210,6 +231,7 @@ impl RotatingWriter {
                 "rotation bounds must be non-zero",
             ));
         }
+        prune_excess_logs(&directory, file_count)?;
         let path = log_path(&directory, 0);
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         let bytes = file.metadata()?.len();
@@ -222,9 +244,11 @@ impl RotatingWriter {
         })
     }
 
-    fn write_record(&mut self, record: &[u8]) -> io::Result<()> {
+    fn write_record(&mut self, record: &[u8]) -> io::Result<bool> {
+        let mut rotated = false;
         if self.bytes > 0 && self.bytes.saturating_add(record.len() as u64) > self.max_bytes {
             self.rotate()?;
+            rotated = true;
         }
         let file = self
             .file
@@ -233,7 +257,7 @@ impl RotatingWriter {
         file.write_all(record)?;
         file.flush()?;
         self.bytes = self.bytes.saturating_add(record.len() as u64);
-        Ok(())
+        Ok(rotated)
     }
 
     fn rotate(&mut self) -> io::Result<()> {
@@ -277,6 +301,31 @@ impl RotatingWriter {
 
 fn log_path(directory: &Path, index: usize) -> PathBuf {
     directory.join(format!("gnirehtet-vd.{index}.jsonl"))
+}
+
+fn prune_excess_logs(directory: &Path, file_count: usize) -> io::Result<()> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(index) = name
+            .strip_prefix("gnirehtet-vd.")
+            .and_then(|value| value.strip_suffix(".jsonl"))
+            .and_then(|value| value.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        if index >= file_count {
+            match fs::remove_file(entry.path()) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(())
 }
 
 fn redact_value(value: Value) -> Value {
@@ -427,6 +476,32 @@ pub fn process_sample() -> ProcessSample {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_retention_is_bounded_to_200_mib() {
+        assert_eq!(DEFAULT_MAX_BYTES, 20 * 1024 * 1024);
+        assert_eq!(DEFAULT_FILE_COUNT, 10);
+        assert_eq!(DEFAULT_TOTAL_BYTES, 200 * 1024 * 1024);
+    }
+
+    #[test]
+    fn write_metrics_report_rotation_and_open_prunes_excess_generations() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(log_path(directory.path(), 4), b"stale").unwrap();
+        let diagnostics = Diagnostics::with_limits(directory.path(), 120, 2).unwrap();
+        assert!(!log_path(directory.path(), 4).exists());
+
+        let mut observed_rotation = false;
+        for index in 0..10 {
+            observed_rotation |= diagnostics
+                .record_with_metrics("rotation_test", json!({"index": index}))
+                .unwrap()
+                .rotated;
+        }
+        assert!(observed_rotation);
+        assert!(log_path(directory.path(), 1).exists());
+        assert!(!log_path(directory.path(), 2).exists());
+    }
 
     #[test]
     fn rotates_and_redacts_export() {

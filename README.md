@@ -9,12 +9,12 @@ a special network driver, SideQuest, or a rooted headset.
 
 ## Download for Windows
 
-[**Download Quest VD Wired v4.1.2 for Windows 10/11**](https://github.com/kkoemets/quest-vd-wired/releases/download/v4.1.2/quest-vd-wired-v4.1.2-windows-x64.zip)
+[**Download Quest VD Wired v4.1.3 for Windows 10/11**](https://github.com/kkoemets/quest-vd-wired/releases/download/v4.1.3/quest-vd-wired-v4.1.3-windows-x64.zip)
 
 Extract the ZIP, connect your Quest 3, and double-click `quest-vd-wired.exe`.
 
 If an older version is already open, choose **Exit** from its tray icon before
-starting v4.1.2.
+starting v4.1.3.
 
 ## Before you start
 
@@ -106,6 +106,13 @@ Quest VD Wired will not start or restart Virtual Desktop for you.
 First restart Virtual Desktop on the Quest. If that fixes it, the slowdown may
 be inside the Virtual Desktop session rather than the cable link. If the wired
 link itself is not working, choose **Diagnose and fix** from the tray icon.
+Quest VD Wired keeps bounded local diagnostics running by default, so note the
+Windows clock time when a stutter happens. A redacted support file can then be
+created from PowerShell in the extracted app directory:
+
+```powershell
+.\quest-vd-wired.exe diagnostics export quest-vd-wired-support.jsonl
+```
 
 ### The cable was unplugged
 
@@ -161,8 +168,16 @@ Use this only as an additional fallback if you need the older release.
 
 ## Privacy
 
-The app does not upload diagnostics or record the contents of your network
-traffic. Support information is saved locally only when you ask for it.
+The app does not upload diagnostics or record packet contents, destination
+addresses, account details, or browsing history. It automatically stores local
+lifecycle, latency, queue, traffic-counter, process, and ADB-health events in
+JSONL files under `%LOCALAPPDATA%\GnirehtetVD\logs` while the wired link runs.
+Sensitive fields are redacted.
+
+Logs rotate automatically: ten files are kept at up to 20 MiB each (about
+200 MiB total), and the oldest file is deleted when the next file rotates. A
+support bundle is created or shared only when you explicitly export it; the app
+never uploads one.
 
 Quest VD Wired is based on [Genymobile's gnirehtet](https://github.com/Genymobile/gnirehtet).
 Virtual Desktop is required separately. This unofficial community project is
