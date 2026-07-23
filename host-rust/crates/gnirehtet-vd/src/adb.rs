@@ -26,8 +26,8 @@ pub const ANDROID_VPN_SERVICE: &str = "com.genymobile.gnirehtet/.v4.VdLinkVpnSer
 pub const ACTION_START_V4: &str = "com.genymobile.gnirehtet.v4.START";
 pub const ACTION_STOP_V4: &str = "com.genymobile.gnirehtet.v4.STOP";
 pub const VIRTUAL_DESKTOP_PACKAGE: &str = "VirtualDesktop.Android";
-pub const ANDROID_VERSION_CODE: &str = "55";
-pub const ANDROID_VERSION_NAME: &str = "4.1.3";
+pub const ANDROID_VERSION_CODE: &str = "56";
+pub const ANDROID_VERSION_NAME: &str = "4.1.4";
 pub const PLATFORM_TOOLS_VERSION: &str = "37.0.0";
 pub const PLATFORM_TOOLS_WINDOWS_URL: &str =
     "https://dl.google.com/android/repository/platform-tools_r37.0.0-win.zip";
@@ -1451,7 +1451,7 @@ mod tests {
     }
 
     #[test]
-    fn start_uses_the_android_v4_contract() {
+    fn start_uses_the_android_v4_all_traffic_contract() {
         let mock = Arc::new(MockAdb::with_results(vec![
             Ok(AdbOutput::success("device")),
             Ok(AdbOutput::success("")),
@@ -1463,7 +1463,7 @@ mod tests {
             Ok(AdbOutput::success("Starting")),
         ]));
         let receipt = AdbController::new(mock.clone())
-            .start(SessionId([0x11; 16]), false)
+            .start(SessionId([0x11; 16]), true)
             .unwrap();
         assert_eq!(receipt.allowed_package, VIRTUAL_DESKTOP_PACKAGE);
         let calls = mock.calls.lock().unwrap();
@@ -1483,7 +1483,7 @@ mod tests {
             "controlPort",
             "31417",
             "allTraffic",
-            "false",
+            "true",
         ] {
             assert!(
                 start.iter().any(|arg| arg == required),
@@ -1584,7 +1584,7 @@ mod tests {
             Ok(AdbOutput::success("Package not found")),
             Ok(AdbOutput::success("Success")),
             Ok(AdbOutput::success(
-                "versionCode=55 minSdk=29 targetSdk=36\nversionName=4.1.3\n",
+                "versionCode=56 minSdk=29 targetSdk=36\nversionName=4.1.4\n",
             )),
         ]));
         AdbController::new(mock.clone())
@@ -1624,7 +1624,7 @@ mod tests {
             Ok(AdbOutput::success("Package not found")),
             Ok(AdbOutput::success("Success")),
             Ok(AdbOutput::success(
-                "versionCode=55 minSdk=29 targetSdk=36\nversionName=4.1.3\n",
+                "versionCode=56 minSdk=29 targetSdk=36\nversionName=4.1.4\n",
             )),
         ]));
         AdbController::new(mock.clone())
@@ -1647,7 +1647,7 @@ mod tests {
         let mock = Arc::new(MockAdb::with_results(vec![
             Ok(AdbOutput::success("device")),
             Ok(AdbOutput::success(
-                "versionCode=55 minSdk=29 targetSdk=36\nversionName=4.1.3\n",
+                "versionCode=56 minSdk=29 targetSdk=36\nversionName=4.1.4\n",
             )),
         ]));
         AdbController::new(mock.clone())

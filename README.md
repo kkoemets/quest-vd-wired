@@ -9,12 +9,12 @@ a special network driver, SideQuest, or a rooted headset.
 
 ## Download for Windows
 
-[**Download Quest VD Wired v4.1.3 for Windows 10/11**](https://github.com/kkoemets/quest-vd-wired/releases/download/v4.1.3/quest-vd-wired-v4.1.3-windows-x64.zip)
+[**Download Quest VD Wired v4.1.4 for Windows 10/11**](https://github.com/kkoemets/quest-vd-wired/releases/download/v4.1.4/quest-vd-wired-v4.1.4-windows-x64.zip)
 
 Extract the ZIP, connect your Quest 3, and double-click `quest-vd-wired.exe`.
 
 If an older version is already open, choose **Exit** from its tray icon before
-starting v4.1.3.
+starting v4.1.4.
 
 ## Before you start
 
@@ -66,6 +66,13 @@ USB 3 Quest cables can work too.
 The wired link switches on automatically. Its icon near the Windows clock is
 green while it is on and gray while it is off. Right-click the icon to turn the
 link on or off, run **Diagnose and fix**, or exit safely.
+
+While the wired link is on, it routes the Quest's network traffic through the
+USB connection. This matches the reliable v3.0.1 Java behavior and does not
+depend on Android exposing the Virtual Desktop package to another app. Turn the
+wired link off when you want the Quest to return to its normal network path.
+The command-line-only `start --virtual-desktop-only` mode retains strict
+Virtual Desktop package routing for advanced diagnostics.
 
 The app keeps trying quietly if the headset is not ready. Put on and unlock the
 headset if Windows is waiting for USB debugging permission.
