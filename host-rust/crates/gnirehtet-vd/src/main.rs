@@ -79,9 +79,28 @@ enum Command {
 
 #[derive(Debug, Args)]
 struct StartArgs {
-    /// Route all Quest traffic; default routing is Virtual Desktop only.
+    /// Route only Virtual Desktop instead of the default whole-Quest connection.
+    #[arg(long, conflicts_with = "all_traffic")]
+    virtual_desktop_only: bool,
+
+    /// Deprecated compatibility flag; all Quest traffic is already the default.
     #[arg(long)]
+    #[arg(hide = true, conflicts_with = "virtual_desktop_only")]
     all_traffic: bool,
+}
+
+impl StartArgs {
+    fn routes_all_traffic(&self) -> bool {
+        self.all_traffic || !self.virtual_desktop_only
+    }
+
+    #[cfg(any(target_os = "windows", test))]
+    fn from_all_traffic(all_traffic: bool) -> Self {
+        Self {
+            virtual_desktop_only: !all_traffic,
+            all_traffic: false,
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -278,7 +297,7 @@ enum BrokerCommand {
 impl BrokerCommand {
     fn into_public_command(self) -> Result<Command> {
         Ok(match self {
-            Self::Start { all_traffic } => Command::Start(StartArgs { all_traffic }),
+            Self::Start { all_traffic } => Command::Start(StartArgs::from_all_traffic(all_traffic)),
             Self::Stop => Command::Stop,
             Self::Status { json } => Command::Status(StatusArgs { json }),
             Self::Repair => Command::Repair,
@@ -323,7 +342,7 @@ impl TryFrom<Command> for BrokerCommand {
     fn try_from(command: Command) -> Result<Self> {
         Ok(match command {
             Command::Start(args) => Self::Start {
-                all_traffic: args.all_traffic,
+                all_traffic: args.routes_all_traffic(),
             },
             Command::Stop => Self::Stop,
             Command::Status(args) => Self::Status { json: args.json },
@@ -590,7 +609,7 @@ impl BrokerContext {
                 &environment.adb_program,
                 &self.paths,
                 &environment.adb,
-                StartArgs { all_traffic: false },
+                StartArgs::from_all_traffic(true),
             )
             .await
         } else {
@@ -833,7 +852,8 @@ async fn start(
         return Err(error);
     }
 
-    let start_result = adb.start(session, args.all_traffic);
+    let all_traffic = args.routes_all_traffic();
+    let start_result = adb.start(session, all_traffic);
     if let Err(error) = start_result {
         let _ = terminate_spawned_daemon(&mut daemon);
         let snapshot = StateSnapshot {
@@ -868,8 +888,13 @@ async fn start(
         }
         return Err(error);
     }
+    let routing = if all_traffic {
+        "all Quest traffic"
+    } else {
+        VIRTUAL_DESKTOP_PACKAGE
+    };
     Ok(format!(
-        "wired link connected (session {session}, package {VIRTUAL_DESKTOP_PACKAGE}, daemon PID {daemon_pid})"
+        "wired link connected (session {session}, routing {routing}, daemon PID {daemon_pid})"
     ))
 }
 
@@ -1813,7 +1838,7 @@ async fn reconcile_tray_desired_state(context: &BrokerContext) -> Result<bool> {
         TrayReconcileAction::None => {}
         TrayReconcileAction::Start => {
             context
-                .execute(Command::Start(StartArgs { all_traffic: false }))
+                .execute(Command::Start(StartArgs::from_all_traffic(true)))
                 .await?;
         }
         TrayReconcileAction::Stop => {
@@ -2314,7 +2339,7 @@ mod tests {
     }
 
     #[test]
-    fn public_start_cli_does_not_allow_a_package_override() {
+    fn public_start_defaults_to_all_traffic_and_keeps_vd_only_explicit() {
         assert!(Cli::try_parse_from([
             "quest-vd-wired",
             "start",
@@ -2322,7 +2347,33 @@ mod tests {
             "com.example.unexpected",
         ])
         .is_err());
-        assert!(Cli::try_parse_from(["quest-vd-wired", "start", "--all-traffic"]).is_ok());
+
+        let default = Cli::try_parse_from(["quest-vd-wired", "start"]).unwrap();
+        let Some(Command::Start(default)) = default.command else {
+            panic!("start command was not parsed");
+        };
+        assert!(default.routes_all_traffic());
+
+        let vd_only =
+            Cli::try_parse_from(["quest-vd-wired", "start", "--virtual-desktop-only"]).unwrap();
+        let Some(Command::Start(vd_only)) = vd_only.command else {
+            panic!("start command was not parsed");
+        };
+        assert!(!vd_only.routes_all_traffic());
+
+        let compatibility =
+            Cli::try_parse_from(["quest-vd-wired", "start", "--all-traffic"]).unwrap();
+        let Some(Command::Start(compatibility)) = compatibility.command else {
+            panic!("start command was not parsed");
+        };
+        assert!(compatibility.routes_all_traffic());
+        assert!(Cli::try_parse_from([
+            "quest-vd-wired",
+            "start",
+            "--all-traffic",
+            "--virtual-desktop-only",
+        ])
+        .is_err());
     }
 
     #[test]
@@ -2720,7 +2771,7 @@ mod tests {
     #[test]
     fn broker_accepts_only_typed_public_commands() {
         assert_eq!(
-            BrokerCommand::try_from(Command::Start(StartArgs { all_traffic: true })).unwrap(),
+            BrokerCommand::try_from(Command::Start(StartArgs::from_all_traffic(true))).unwrap(),
             BrokerCommand::Start { all_traffic: true }
         );
         assert_eq!(
@@ -2743,7 +2794,7 @@ mod tests {
             .is_err());
 
         assert!(command_requires_lifecycle_serialization(&Command::Start(
-            StartArgs { all_traffic: false }
+            StartArgs::from_all_traffic(true)
         )));
         assert!(command_requires_lifecycle_serialization(&Command::Stop));
         assert!(command_requires_lifecycle_serialization(&Command::Repair));

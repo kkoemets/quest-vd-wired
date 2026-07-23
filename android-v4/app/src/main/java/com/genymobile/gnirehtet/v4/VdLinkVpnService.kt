@@ -174,7 +174,7 @@ class VdLinkVpnService : VpnService() {
                 intent.getIntExtra(EXTRA_SOCKS_PORT, DEFAULT_SOCKS_PORT),
                 intent.getIntExtra(EXTRA_UDP_PORT, DEFAULT_UDP_PORT),
                 intent.getIntExtra(EXTRA_CONTROL_PORT, DEFAULT_CONTROL_PORT),
-                intent.getBooleanExtra(EXTRA_ALL_TRAFFIC, false),
+                intent.getBooleanExtra(EXTRA_ALL_TRAFFIC, DEFAULT_ALL_TRAFFIC),
             )
         } catch (error: RuntimeException) {
             rejectStart(error)
@@ -208,7 +208,10 @@ class VdLinkVpnService : VpnService() {
 
         var established: ParcelFileDescriptor? = null
         try {
-            validateVdApplication(parameters.vdPackage)
+            val routingMode = VpnRoutingMode.from(parameters.allTraffic)
+            if (routingMode.requiresVirtualDesktopPackage) {
+                validateVdApplication(parameters.vdPackage)
+            }
             val builder = Builder()
                 .setSession(getString(R.string.app_name))
                 .setMtu(MTU)
@@ -218,10 +221,10 @@ class VdLinkVpnService : VpnService() {
                 .addRoute("0.0.0.0", 0)
                 .addDnsServer("1.1.1.1")
 
-            if (parameters.allTraffic) {
-                builder.addDisallowedApplication(packageName)
-            } else {
-                builder.addAllowedApplication(parameters.vdPackage)
+            when (routingMode) {
+                VpnRoutingMode.ALL_TRAFFIC -> builder.addDisallowedApplication(packageName)
+                VpnRoutingMode.VIRTUAL_DESKTOP_ONLY ->
+                    builder.addAllowedApplication(parameters.vdPackage)
             }
 
             established = builder.establish() ?: throw IllegalStateException("VPN permission is not prepared")
@@ -757,6 +760,7 @@ class VdLinkVpnService : VpnService() {
         const val EXTRA_CONTROL_PORT = "controlPort"
         const val EXTRA_SESSION_ID = "sessionId"
         const val DEFAULT_VD_PACKAGE = "VirtualDesktop.Android"
+        const val DEFAULT_ALL_TRAFFIC = true
         const val DEFAULT_SOCKS_PORT = 31_416
         const val DEFAULT_UDP_PORT = 31_418
         const val DEFAULT_CONTROL_PORT = 31_417
