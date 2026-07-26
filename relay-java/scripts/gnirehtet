@@ -1,7 +1,2 @@
 #!/bin/bash
-set -e
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-if [[ -z "${ADB:-}" && -x "$SCRIPT_DIR/adb" ]]; then
-    export ADB="$SCRIPT_DIR/adb"
-fi
-exec java -jar "$SCRIPT_DIR/gnirehtet.jar" "$@"
+java -jar gnirehtet.jar "$@"

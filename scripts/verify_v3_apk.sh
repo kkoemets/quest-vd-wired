@@ -12,7 +12,7 @@ sdk_root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
 build_tools="${ANDROID_BUILD_TOOLS_VERSION:-36.0.0}"
 
 if [[ ! -f "$apk" ]]; then
-    echo "signed v3.1 APK is missing" >&2
+    echo "signed v3.0.1 APK is missing" >&2
     exit 1
 fi
 if [[ ! "$expected_cert" =~ ^[0-9a-f]{64}$ ]]; then
@@ -55,8 +55,8 @@ if [[ "$package_name" != "com.genymobile.gnirehtet" ]]; then
     echo "APK application identity is incorrect" >&2
     exit 1
 fi
-if [[ "$version_code" != "11" || "$version_name" != "3.1.0" ]]; then
-    echo "APK version is not the exact v3.1 Legacy identity" >&2
+if [[ "$version_code" != "10" || "$version_name" != "3.0.0" ]]; then
+    echo "APK version is not the exact v3.0.1 Legacy bundle identity" >&2
     exit 1
 fi
 if [[ "$min_sdk" != "21" || "$target_sdk" != "29" ]]; then
@@ -64,6 +64,6 @@ if [[ "$min_sdk" != "21" || "$target_sdk" != "29" ]]; then
     exit 1
 fi
 if [[ "$debuggable" != "false" ]]; then
-    echo "v3.1 Legacy APK is debuggable" >&2
+    echo "v3.0.1 Legacy APK is debuggable" >&2
     exit 1
 fi

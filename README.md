@@ -161,17 +161,12 @@ affiliated with Meta or Virtual Desktop.
 
 ## Older versions
 
-### v3.1.0 Legacy
+### v3.0.1 Legacy
 
-This is the older Java version. New users should choose the current release.
+This is the proven older Java version. New users should choose the current
+release.
 
-[Download v3.1.0 Legacy](https://github.com/kkoemets/quest-vd-wired/releases/download/v3.1.0/gnirehtet-java-v3.1.0.zip)
-
-### v3.0.1 Legacy fallback
-
-Use this only as an additional fallback if you need the older release.
-
-[Download v3.0.1 Legacy fallback](https://github.com/kkoemets/quest-vd-wired/releases/download/v3.0.1/gnirehtet-java-v3.0.1.zip)
+[Download v3.0.1 Legacy](https://github.com/kkoemets/quest-vd-wired/releases/download/v3.0.1/gnirehtet-java-v3.0.1.zip)
 
 ## Privacy
 

@@ -464,8 +464,8 @@ class CommandLineToolsTest(unittest.TestCase):
                 "#!/bin/sh\n"
                 "case \"$2\" in\n"
                 "application-id) echo com.genymobile.gnirehtet ;;\n"
-                "version-code) echo 11 ;;\n"
-                "version-name) echo 3.1.0 ;;\n"
+                "version-code) echo 10 ;;\n"
+                "version-name) echo 3.0.0 ;;\n"
                 "min-sdk) echo 21 ;;\n"
                 "target-sdk) echo 29 ;;\n"
                 "debuggable) echo false ;;\n"
@@ -538,8 +538,8 @@ class ReleasePolicyTest(unittest.TestCase):
         ignore = (REPOSITORY / ".gitignore").read_text(encoding="utf-8")
 
         self.assertIn("Quest VD Wired v4.1.4 for Windows 10/11", readme)
-        self.assertIn("v3.1.0 Legacy", readme)
-        self.assertIn("gnirehtet-java-v3.1.0.zip", readme)
+        self.assertNotIn("v3.1.0", readme)
+        self.assertIn("v3.0.1 Legacy", readme)
         self.assertIn("quest-vd-wired-v4.1.4-windows-x64.zip", readme)
         self.assertIn("quest-vd-wired.exe", readme)
         self.assertNotIn("v4.0.6", readme)

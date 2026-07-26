@@ -20,7 +20,6 @@ import java.io.PrintStream;
 import java.text.DateFormat;
 import java.text.SimpleDateFormat;
 import java.util.Date;
-import java.util.function.Supplier;
 
 public final class Log {
 
@@ -79,7 +78,7 @@ public final class Log {
         return isEnabled(Level.ERROR);
     }
 
-    private static synchronized String getDate() {
+    private static String getDate() {
         DATE.setTime(System.currentTimeMillis());
         return FORMAT.format(DATE);
     }
@@ -111,12 +110,6 @@ public final class Log {
 
     public static void d(String tag, String message) {
         d(tag, message, null);
-    }
-
-    public static void d(String tag, Supplier<String> message) {
-        if (isDebugEnabled()) {
-            d(tag, message.get(), null);
-        }
     }
 
     public static void i(String tag, String message, Throwable e) {

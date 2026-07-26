@@ -2,14 +2,14 @@
 
 The repository deliberately carries two product generations:
 
-- `app/` and `relay-java/` are the supported v3.1 safety/performance baseline.
+- `app/` and `relay-java/` are the proven v3.0.1 Java baseline.
 - `android-v4/` and `host-rust/` are the Quest 3/Virtual Desktop v4 Beta.
 
 Do not delete the Java baseline until v4 has reviewable passing evidence from
 the target Quest 3 and Windows hardware, including long runs and lifecycle
 cycling.
 
-## v3.1 build
+## v3.0.1 build
 
 The legacy Gradle build requires JDK 11, Android SDK platform 28, and build
 tools 28.0.3. Point `local.properties` at the Android SDK:
@@ -39,7 +39,7 @@ Signing files belong in `.local-signing/` or another private location and must
 never be committed. `dist/`, root generated APKs, and local signing material are
 ignored.
 
-The root `release` script builds the v3.1 fallback bundle. Its Windows repair
+The root `release` script builds the v3.0.1 fallback bundle. Its Windows repair
 script must remain fail-closed on a pinned official platform-tools checksum.
 
 ## Android v4 build
@@ -59,7 +59,7 @@ and rejects a locally modified dependency tree. Notices are packaged from
 `android-v4/app/src/main/assets/THIRD_PARTY_NOTICES.md`.
 
 Android v4 keeps application ID `com.genymobile.gnirehtet` and accepts the same
-release-signing Gradle properties as v3.1. Namespace changes do not change the
+release-signing Gradle properties as v3.0.1. Namespace changes do not change the
 installed package identity.
 
 ## Rust v4 host

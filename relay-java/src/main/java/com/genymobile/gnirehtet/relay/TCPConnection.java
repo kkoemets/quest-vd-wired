@@ -25,7 +25,6 @@ import java.util.Random;
 public class TCPConnection extends AbstractConnection implements PacketSource {
 
     private static final String TAG = TCPConnection.class.getSimpleName();
-    public static final long IDLE_TIMEOUT = 10 * 60 * 1000;
 
     // same value as GnirehtetService.MTU in the client
     private static final int MTU = 0x4000;
@@ -56,7 +55,7 @@ public class TCPConnection extends AbstractConnection implements PacketSource {
         }
     }
 
-    private final StreamBuffer clientToNetwork = new StreamBuffer(4 * MTU);
+    private final StreamBuffer clientToNetwork = new StreamBuffer(4 * IPv4Packet.MAX_PACKET_LENGTH);
     private final Packetizer networkToClient;
     private IPv4Packet packetForClient;
 
@@ -72,16 +71,14 @@ public class TCPConnection extends AbstractConnection implements PacketSource {
     private Integer finSequenceNumber; // null means "no FIN sent yet"
     private boolean finReceived;
     private int clientWindow;
-    private long idleSince;
 
     public TCPConnection(ConnectionId id, Client client, Selector selector, IPv4Header ipv4Header, TCPHeader tcpHeader) throws IOException {
         super(id, client);
-        touch();
 
         TCPHeader shrinkedTcpHeader = tcpHeader.copy();
         shrinkedTcpHeader.shrinkOptions(); // no TCP options
 
-        networkToClient = new Packetizer(ipv4Header, shrinkedTcpHeader, MTU);
+        networkToClient = new Packetizer(ipv4Header, shrinkedTcpHeader);
         networkToClient.getResponseIPv4Header().swapSourceAndDestination();
         networkToClient.getResponseTransportHeader().swapSourceAndDestination();
 
@@ -116,7 +113,6 @@ public class TCPConnection extends AbstractConnection implements PacketSource {
     }
 
     private void processReceive() {
-        touch();
         try {
             assert packetForClient == null : "The IPv4Packet shares the networkToClient buffer, it must not be corrupted";
             int remainingClientWindow = getRemainingClientWindow();
@@ -128,7 +124,6 @@ public class TCPConnection extends AbstractConnection implements PacketSource {
                 eof();
                 return;
             }
-            Diagnostics.add("bytes.network_to_client_tcp", packetForClient.getPayloadLength());
             consume(this);
         } catch (IOException e) {
             loge(TAG, "Cannot read", e);
@@ -137,27 +132,22 @@ public class TCPConnection extends AbstractConnection implements PacketSource {
     }
 
     private void processSend() {
-        touch();
         try {
             int w = clientToNetwork.writeTo(channel);
             if (w > 0) {
                 acknowledgementNumber += w;
-                Diagnostics.add("bytes.client_to_network_tcp", w);
 
-                logd(TAG, () -> w + " bytes written to the network socket");
+                logd(TAG, w + " bytes written to the network socket");
 
                 if (finReceived && clientToNetwork.isEmpty()) {
                     logd(TAG, "No more pending data, process the pending FIN");
                     doHandleFin();
                 } else {
-                    logd(TAG, () -> "Sending ACK " + numbers() + " to client");
+                    logd(TAG, "Sending ACK " + numbers() + " to client");
                     sendEmptyPacketToClient(TCPHeader.FLAG_ACK);
                 }
             } else {
-                // A non-blocking channel may make no progress even after a
-                // writable readiness notification. Keep OP_WRITE armed and
-                // retry; zero is not EOF for SocketChannel.write().
-                Diagnostics.increment("tcp.zero_length_writes");
+                close();
             }
         } catch (IOException e) {
             loge(TAG, "Cannot write", e);
@@ -175,7 +165,7 @@ public class TCPConnection extends AbstractConnection implements PacketSource {
         } else {
             state = State.FIN_WAIT_1;
         }
-        logd(TAG, () -> "State = " + state);
+        logd(TAG, "State = " + state);
     }
 
     private int getRemainingClientWindow() {
@@ -190,11 +180,8 @@ public class TCPConnection extends AbstractConnection implements PacketSource {
 
     @Override
     public boolean isExpired() {
-        return System.currentTimeMillis() >= idleSince + IDLE_TIMEOUT;
-    }
-
-    private void touch() {
-        idleSince = System.currentTimeMillis();
+        // no external timeout expiration
+        return false;
     }
 
     private void updateHeaders(int flags) {
@@ -215,9 +202,8 @@ public class TCPConnection extends AbstractConnection implements PacketSource {
 
     @Override
     public void sendToNetwork(IPv4Packet packet) {
-        touch();
         handlePacket(packet);
-        logd(TAG, () -> "current ack=" + acknowledgementNumber);
+        logd(TAG, "current ack=" + acknowledgementNumber);
         updateInterests();
     }
 
@@ -247,7 +233,7 @@ public class TCPConnection extends AbstractConnection implements PacketSource {
         clientWindow = tcpHeader.getWindow();
         theirAcknowledgementNumber = tcpHeader.getAcknowledgementNumber();
 
-        logd(TAG, () -> "Receiving expected packet " + packetSequenceNumber + " (flags = " + tcpHeader.getFlags() + ")");
+        logd(TAG, "Receiving expected paquet " + packetSequenceNumber + " (flags = " + tcpHeader.getFlags() + ")");
 
         if (tcpHeader.isRst()) {
             logd(TAG, "Reset requested, closing");
@@ -256,7 +242,7 @@ public class TCPConnection extends AbstractConnection implements PacketSource {
         }
 
         if (tcpHeader.isAck()) {
-            logd(TAG, () -> "Client acked " + tcpHeader.getAcknowledgementNumber());
+            logd(TAG, "Client acked " + tcpHeader.getAcknowledgementNumber());
             handleAck(packet);
         }
 
@@ -286,10 +272,10 @@ public class TCPConnection extends AbstractConnection implements PacketSource {
         synSequenceNumber = theirSequenceNumber;
 
         sequenceNumber = RANDOM.nextInt();
-        logd(TAG, () -> "initialized seqNum=" + sequenceNumber + "; ackNum=" + acknowledgementNumber);
+        logd(TAG, "initialized seqNum=" + sequenceNumber + "; ackNum=" + acknowledgementNumber);
         clientWindow = tcpHeader.getWindow();
         state = State.SYN_SENT;
-        logd(TAG, () -> "State = " + state);
+        logd(TAG, "State = " + state);
     }
 
     private void handleDuplicateSyn(IPv4Packet packet) {
@@ -306,7 +292,7 @@ public class TCPConnection extends AbstractConnection implements PacketSource {
     }
 
     private void handleFin() {
-        logd(TAG, () -> "Received a FIN from the client " + numbers());
+        logd(TAG, "Received a FIN from the client " + numbers());
         finReceived = true;
         if (clientToNetwork.isEmpty()) {
             logd(TAG, "No pending data, process the FIN immediately");
@@ -325,12 +311,12 @@ public class TCPConnection extends AbstractConnection implements PacketSource {
                 ++sequenceNumber; // FIN counts for 1 byte
                 // do not wait for the real network connection, switch immediately to LAST_ACK (bypass CLOSE_WAIT)
                 state = State.LAST_ACK;
-                logd(TAG, () -> "State = " + state);
+                logd(TAG, "State = " + state);
                 break;
             case FIN_WAIT_1:
                 sendEmptyPacketToClient(TCPHeader.FLAG_ACK);
                 state = State.CLOSING;
-                logd(TAG, () -> "State = " + state);
+                logd(TAG, "State = " + state);
                 break;
             case FIN_WAIT_2:
                 sendEmptyPacketToClient(TCPHeader.FLAG_ACK);
@@ -349,7 +335,7 @@ public class TCPConnection extends AbstractConnection implements PacketSource {
                 break;
             case FIN_WAIT_1:
                 state = State.FIN_WAIT_2;
-                logd(TAG, () -> "State = " + state);
+                logd(TAG, "State = " + state);
                 break;
             case FIN_WAIT_2:
                 // do nothing
@@ -363,7 +349,7 @@ public class TCPConnection extends AbstractConnection implements PacketSource {
         logd(TAG, "handleAck()");
         if (state == State.SYN_RECEIVED) {
             state = State.ESTABLISHED;
-            logd(TAG, () -> "State = " + state);
+            logd(TAG, "State = " + state);
             return;
         }
 
@@ -379,8 +365,6 @@ public class TCPConnection extends AbstractConnection implements PacketSource {
 
         if (clientToNetwork.remaining() < payloadLength) {
             logw(TAG, "Not enough space, dropping packet");
-            Diagnostics.increment("drops.tcp_queue_full");
-            Diagnostics.add("drops.tcp_queue_full_bytes", payloadLength);
             return;
         }
 
@@ -394,9 +378,9 @@ public class TCPConnection extends AbstractConnection implements PacketSource {
             close();
             return;
         }
-        logd(TAG, () -> "SYN_RECEIVED, acking " + numbers());
+        logd(TAG, "SYN_RECEIVED, acking " + numbers());
         state = State.SYN_RECEIVED;
-        logd(TAG, () -> "State = " + state);
+        logd(TAG, "State = " + state);
         sendEmptyPacketToClient(TCPHeader.FLAG_SYN | TCPHeader.FLAG_ACK);
         ++sequenceNumber; // SYN counts for 1 byte
     }
@@ -420,12 +404,12 @@ public class TCPConnection extends AbstractConnection implements PacketSource {
     private IPv4Packet createEmptyResponsePacket(int flags) {
         updateHeaders(flags);
         IPv4Packet packet = networkToClient.packetizeEmptyPayload();
-        logd(TAG, () -> "Forging empty response (flags=" + flags + ") " + numbers());
+        logd(TAG, "Forging empty response (flags=" + flags + ") " + numbers());
         if (Log.isVerboseEnabled()) {
             logd(TAG, Binary.buildPacketString(packet.getRaw()));
         }
         if ((flags & TCPHeader.FLAG_ACK) != 0) {
-            logd(TAG, () -> "Acking " + numbers());
+            logd(TAG, "Acking " + numbers());
         }
         return packet;
     }
@@ -480,7 +464,7 @@ public class TCPConnection extends AbstractConnection implements PacketSource {
 
     @Override
     public IPv4Packet get() {
-        // Update only when necessary in a future packet-source revision.
+        // TODO update only when necessary
         updateAcknowledgementNumber(packetForClient);
         return packetForClient;
     }
@@ -493,7 +477,7 @@ public class TCPConnection extends AbstractConnection implements PacketSource {
 
     @Override
     public void next() {
-        logd(TAG, () -> "Packet (" + packetForClient.getPayloadLength() + " bytes) sent to client " + numbers());
+        logd(TAG, "Packet (" + packetForClient.getPayloadLength() + " bytes) sent to client " + numbers());
         if (Log.isVerboseEnabled()) {
             logv(TAG, Binary.buildPacketString(packetForClient.getRaw()));
         }
