@@ -19,16 +19,13 @@ package com.genymobile.gnirehtet;
 import android.net.VpnService;
 
 import java.io.IOException;
-import java.io.InterruptedIOException;
 
 /**
  * Provide a valid {@link RelayTunnel}, creating a new one if necessary.
  */
 public class RelayTunnelProvider {
 
-    // The host repairs ADB mappings independently; retry quickly enough that a
-    // restored carrier can meet the three-second reconnect gate.
-    private static final int DELAY_BETWEEN_ATTEMPTS_MS = 1000;
+    private static final int DELAY_BETWEEN_ATTEMPTS_MS = 5000;
 
     private final Object getCurrentTunnelLock = new Object(); // protects getCurrentTunnel()
 
@@ -37,7 +34,6 @@ public class RelayTunnelProvider {
     private RelayTunnel tunnel; // protected both by "this" and "getCurrentTunnelLock"
     private boolean first = true; // protected by "getCurrentTunnelLock"
     private long lastFailureTimestamp; // protected by "this"
-    private boolean closed; // protected by "this"
 
     public RelayTunnelProvider(VpnService vpnService, RelayTunnelListener listener) {
         this.vpnService = vpnService;
@@ -57,39 +53,28 @@ public class RelayTunnelProvider {
          * invalidateTunnel().
          */
         synchronized (getCurrentTunnelLock) {
-            RelayTunnel tunnelToConnect;
             synchronized (this) {
-                throwIfClosed();
                 if (tunnel != null) {
                     return tunnel;
                 }
 
                 waitUntilNextAttemptSlot();
-                throwIfClosed();
 
                 // "tunnel" has not changed during waiting (only getCurrentTunnel() may write it)
                 tunnel = RelayTunnel.open(vpnService);
-                tunnelToConnect = tunnel;
             }
 
             // the first connection must either notify "connected" or "disconnected"
             boolean notifyDisconnectedOnError = first;
             first = false;
-            connectTunnel(tunnelToConnect, notifyDisconnectedOnError);
-
-            synchronized (this) {
-                if (closed) {
-                    tunnelToConnect.close();
-                    throw new InterruptedIOException("Relay tunnel provider closed");
-                }
-            }
-            return tunnelToConnect;
+            connectTunnel(notifyDisconnectedOnError);
         }
+        return tunnel;
     }
 
-    private void connectTunnel(RelayTunnel tunnelToConnect, boolean notifyDisconnectedOnError) throws IOException {
+    private void connectTunnel(boolean notifyDisconnectedOnError) throws IOException {
         try {
-            tunnelToConnect.connect();
+            tunnel.connect();
             notifyConnected();
         } catch (IOException e) {
             touchFailure();
@@ -105,7 +90,6 @@ public class RelayTunnelProvider {
             touchFailure();
             tunnel.close();
             tunnel = null;
-            notifyAll();
             notifyDisconnected();
         }
     }
@@ -122,43 +106,19 @@ public class RelayTunnelProvider {
         }
     }
 
-    public void close() {
-        RelayTunnel tunnelToClose;
-        synchronized (this) {
-            if (closed) {
-                return;
-            }
-            closed = true;
-            tunnelToClose = tunnel;
-            tunnel = null;
-            notifyAll();
-        }
-        if (tunnelToClose != null) {
-            tunnelToClose.close();
-            notifyDisconnected();
-        }
-    }
-
     private synchronized void touchFailure() {
         lastFailureTimestamp = System.currentTimeMillis();
     }
 
-    private void waitUntilNextAttemptSlot() throws IOException, InterruptedException {
+    private void waitUntilNextAttemptSlot() throws InterruptedException {
         if (first) {
             // do not wait on first attempt
             return;
         }
         long delay = lastFailureTimestamp + DELAY_BETWEEN_ATTEMPTS_MS - System.currentTimeMillis();
-        while (delay > 0 && !closed) {
+        while (delay > 0) {
             wait(delay);
             delay = lastFailureTimestamp + DELAY_BETWEEN_ATTEMPTS_MS - System.currentTimeMillis();
-        }
-        throwIfClosed();
-    }
-
-    private void throwIfClosed() throws InterruptedIOException {
-        if (closed) {
-            throw new InterruptedIOException("Relay tunnel provider closed");
         }
     }
 

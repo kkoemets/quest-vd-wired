@@ -27,7 +27,6 @@ public class CommandLineArguments {
     public static final int PARAM_DNS_SERVER = 1 << 1;
     public static final int PARAM_ROUTES = 1 << 2;
     public static final int PARAM_PORT = 1 << 3;
-    public static final int PARAM_ALL_TRAFFIC = 1 << 4;
 
     public static final int DEFAULT_PORT = 31416;
 
@@ -35,7 +34,6 @@ public class CommandLineArguments {
     private String serial;
     private String dnsServers;
     private String routes;
-    private boolean allTraffic;
 
     public static CommandLineArguments parse(int acceptedParameters, String... args) {
         CommandLineArguments arguments = new CommandLineArguments();
@@ -71,11 +69,6 @@ public class CommandLineArguments {
                     throw new IllegalArgumentException("Invalid port: " + arguments.port);
                 }
                 ++i;
-            } else if ((acceptedParameters & PARAM_ALL_TRAFFIC) != 0 && "--all-traffic".equals(arg)) {
-                if (arguments.allTraffic) {
-                    throw new IllegalArgumentException("--all-traffic already set");
-                }
-                arguments.allTraffic = true;
             } else if ((acceptedParameters & PARAM_SERIAL) != 0 && arguments.serial == null) {
                 arguments.serial = arg;
             } else {
@@ -102,9 +95,5 @@ public class CommandLineArguments {
 
     public int getPort() {
         return port;
-    }
-
-    public boolean isAllTraffic() {
-        return allTraffic;
     }
 }
