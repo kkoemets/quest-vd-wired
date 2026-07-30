@@ -1,0 +1,52 @@
+name: Feature request
+description: Propose a focused improvement to Quest VD Wired
+title: "[Feature] "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea. For broad or early-stage proposals, start in Ideas Discussions first.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What user problem would this solve, and who encounters it?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the smallest useful outcome rather than a specific implementation.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What workarounds or other designs have you tried?
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Supporting details
+      description: Add relevant hardware, compatibility, screenshots, measurements, or links.
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues and discussions for this request.
+          required: true
+        - label: This request is related to Quest VD Wired and not general Virtual Desktop or Meta support.
+          required: true
+        - label: I have not included credentials, private data, or unredacted diagnostics.
+          required: true

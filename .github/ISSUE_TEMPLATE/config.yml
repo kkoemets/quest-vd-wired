@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Setup help and Q&A
+    url: https://github.com/kkoemets/quest-vd-wired/discussions/categories/q-a
+    about: Ask setup, cable, compatibility, and troubleshooting questions.
+  - name: Ideas and design discussion
+    url: https://github.com/kkoemets/quest-vd-wired/discussions/categories/ideas
+    about: Discuss broad ideas before turning them into a focused request.
+  - name: Report a vulnerability privately
+    url: https://github.com/kkoemets/quest-vd-wired/security/advisories/new
+    about: Do not disclose suspected security problems in a public issue.

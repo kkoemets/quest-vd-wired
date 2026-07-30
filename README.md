@@ -1,5 +1,21 @@
 # Quest VD Wired: Virtual Desktop over USB-C on Meta Quest 3
 
+<p align="center">
+  <a href="https://github.com/kkoemets/quest-vd-wired/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/kkoemets/quest-vd-wired?display_name=tag&amp;sort=semver"></a>
+  <a href="#before-you-start"><img alt="Platform: Windows 10/11" src="https://img.shields.io/badge/platform-Windows%2010%2F11-0078D4?logo=windows&amp;logoColor=white"></a>
+  <a href="#before-you-start"><img alt="Headset: Meta Quest 3" src="https://img.shields.io/badge/headset-Meta%20Quest%203-0866FF?logo=meta&amp;logoColor=white"></a>
+  <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/github/license/kkoemets/quest-vd-wired"></a>
+  <a href="https://github.com/kkoemets/quest-vd-wired"><img alt="GitHub stars" src="https://img.shields.io/github/stars/kkoemets/quest-vd-wired?style=flat&amp;logo=github"></a>
+  <a href="CONTRIBUTING.md"><img alt="Contributions welcome" src="https://img.shields.io/badge/contributions-welcome-brightgreen"></a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/kkoemets/quest-vd-wired/releases/latest">Download</a>
+  · <a href="SUPPORT.md">Get help</a>
+  · <a href="CONTRIBUTING.md">Contribute</a>
+  · <a href="SECURITY.md">Report a security issue</a>
+</p>
+
 Quest VD Wired is a free, open-source Windows app that gives Virtual Desktop a
 wired connection through a USB 3 or link cable instead of Quest Wi-Fi. It is
 based on the open-source gnirehtet project and made specifically for Quest 3.
@@ -159,6 +175,18 @@ through the USB cable.
 No. It is an independent, open-source community project. It is not made by or
 affiliated with Meta or Virtual Desktop.
 
+## Community
+
+- Read [SUPPORT.md](SUPPORT.md) for setup help and useful report details.
+- Use the issue chooser for a
+  [reproducible bug or feature request](https://github.com/kkoemets/quest-vd-wired/issues/new/choose).
+- Read [CONTRIBUTING.md](CONTRIBUTING.md) before sending a change.
+- Report suspected vulnerabilities privately as described in
+  [SECURITY.md](SECURITY.md).
+
+Participation in the project is governed by the
+[Code of Conduct](CODE_OF_CONDUCT.md).
+
 ## Older versions
 
 ### v3.0.1 Legacy
@@ -185,4 +213,4 @@ Quest VD Wired is based on [Genymobile's gnirehtet](https://github.com/Genymobil
 Virtual Desktop is required separately. This unofficial community project is
 not affiliated with Meta or Virtual Desktop.
 
-Licensed under the Apache License 2.0.
+Licensed under the [Apache License 2.0](LICENSE).

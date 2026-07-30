@@ -1,0 +1,108 @@
+name: Bug report
+description: Report a reproducible Quest VD Wired problem
+title: "[Bug] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve Quest VD Wired. For setup questions, use Q&A Discussions instead.
+
+  - type: input
+    id: app-version
+    attributes:
+      label: Exact Quest VD Wired version
+      description: Enter the release tag or source commit so the report remains reproducible.
+      placeholder: v4.1.4 or commit 5c8a86e
+    validations:
+      required: true
+
+  - type: dropdown
+    id: windows-version
+    attributes:
+      label: Windows version
+      options:
+        - Windows 11
+        - Windows 10
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: headset
+    attributes:
+      label: Headset and system version
+      description: For example, Meta Quest 3 and the installed system version.
+      placeholder: Meta Quest 3, system version ...
+    validations:
+      required: true
+
+  - type: input
+    id: virtual-desktop
+    attributes:
+      label: Virtual Desktop versions
+      description: Include both the headset app and Windows Streamer versions.
+      placeholder: Headset app ..., Streamer ...
+    validations:
+      required: true
+
+  - type: input
+    id: cable
+    attributes:
+      label: Cable and PC port
+      description: Include the cable model or USB rating and the PC port type.
+      placeholder: USB 3 link cable connected directly to a USB-C port
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Describe the actual behavior and what you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Give the smallest repeatable sequence, including cable or headset state.
+      placeholder: |
+        1. Connect ...
+        2. Start ...
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checkpoints
+    attributes:
+      label: Connection checkpoints
+      description: Select every step that succeeded before the problem occurred.
+      options:
+        - label: Windows detected the headset over USB.
+        - label: I accepted the USB debugging prompt.
+        - label: I accepted the VPN prompt or saw the VPN key.
+        - label: Virtual Desktop reached the PC with Quest Wi-Fi off.
+        - label: I tested unplugging and reconnecting the cable.
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Redacted diagnostics
+      description: Attach a reviewed ZIP containing the support export, or paste a short relevant excerpt. Do not include secrets or personal data.
+      placeholder: Optional
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues and discussions for this problem.
+          required: true
+        - label: I tested the latest release, or explained above why I could not.
+          required: true
+        - label: I removed sensitive information from this report and any attachments.
+          required: true
