@@ -1,11 +1,51 @@
-# Quest VD Wired: Virtual Desktop over USB-C on Meta Quest 3
+<p align="center">
+  <img src="host-rust/crates/gnirehtet-vd/assets/tray-on.svg" width="96" alt="Quest VD Wired connected icon">
+</p>
 
-Quest VD Wired is a free, open-source Windows app that gives Virtual Desktop a
-wired connection through a USB 3 or link cable instead of Quest Wi-Fi. It is
-based on the open-source gnirehtet project and made specifically for Quest 3.
+<h1 align="center">Quest VD Wired</h1>
 
-It works with Windows 10 and Windows 11. It does not need administrator access,
-a special network driver, SideQuest, or a rooted headset.
+<p align="center">
+  <strong>Virtual Desktop over USB-C for Meta Quest 3</strong>
+</p>
+
+<p align="center">
+  Use a USB 3 or Quest Link cable as the network path between your Quest 3 and
+  Windows PC—without relying on Quest Wi-Fi.
+</p>
+
+<p align="center">
+  <a href="https://github.com/kkoemets/quest-vd-wired/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/kkoemets/quest-vd-wired?display_name=tag&amp;sort=semver"></a>
+  <a href="LICENSE"><img alt="Apache 2.0 license" src="https://img.shields.io/github/license/kkoemets/quest-vd-wired"></a>
+  <a href="https://github.com/kkoemets/quest-vd-wired/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/kkoemets/quest-vd-wired?style=flat&amp;logo=github"></a>
+  <img alt="Windows 10 and 11" src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?logo=windows11&amp;logoColor=white">
+  <img alt="Meta Quest 3" src="https://img.shields.io/badge/Meta%20Quest-3-0467DF?logo=meta&amp;logoColor=white">
+</p>
+
+<p align="center">
+  <a href="https://github.com/kkoemets/quest-vd-wired/releases/download/v4.1.4/quest-vd-wired-v4.1.4-windows-x64.zip"><strong>Download v4.1.4 for Windows</strong></a>
+  · <a href="#get-connected">Setup</a>
+  · <a href="#quick-fixes">Troubleshooting</a>
+  · <a href="https://github.com/kkoemets/quest-vd-wired/discussions/categories/q-a">Get help</a>
+</p>
+
+<p align="center">
+  <sub>Free and open source · built on <a href="https://github.com/Genymobile/gnirehtet">gnirehtet</a> · independent community project</sub>
+</p>
+
+> [!IMPORTANT]
+> Quest VD Wired supplies the wired network path. It is separate from Meta Quest
+> Link and does not replace Virtual Desktop. It is not HDMI or DisplayPort input.
+> You still need Virtual Desktop on the Quest and Virtual Desktop Streamer on the
+> PC.
+
+## Why use it?
+
+- **Wired instead of Quest Wi-Fi.** Quest network traffic travels through the
+  USB 3 or link cable while your PC keeps its normal network connection.
+- **Simple Windows setup.** Extract and run it without administrator access, a
+  special network driver, SideQuest, or a rooted headset.
+- **Built for normal play sessions.** A tray icon controls the link, reconnects
+  after cable interruptions, and provides a **Diagnose and fix** option.
 
 ## Download for Windows
 
@@ -77,7 +117,9 @@ Virtual Desktop package routing for advanced diagnostics.
 The app keeps trying quietly if the headset is not ready. Put on and unlock the
 headset if Windows is waiting for USB debugging permission.
 
-![Quest VD Wired tray menu](https://github.com/user-attachments/assets/2ce519de-3997-47e5-ac38-84eb974fd804)
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/2ce519de-3997-47e5-ac38-84eb974fd804" width="520" alt="Quest VD Wired tray menu with wired link and diagnostics controls">
+</p>
 
 ## What success looks like
 
