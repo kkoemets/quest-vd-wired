@@ -56,6 +56,18 @@ const TRANSPORT_RECOVERY_MAX_ATTEMPTS: u32 = 2;
 const TRANSPORT_RECOVERY_RETRY_DELAY: Duration = Duration::from_secs(1);
 const TRANSPORT_RECOVERY_REARM_DELAY: Duration = Duration::from_secs(30);
 const TRANSPORT_RECOVERY_CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
+// HEV bounds all Android tunnel sessions at 256. A wake burst may consist
+// entirely of UDP-in-TCP associations, so the dedicated host lane must cover
+// that full bounded budget instead of inheriting the generic 64-flow default.
+const MAX_UDP_ASSOCIATIONS: usize = 256;
+// An awake headset reconnects its control lane within about a second, so ten
+// awake seconds of silence means the Android service stopped answering rather
+// than the headset sleeping.
+const ANDROID_LIVENESS_GRACE: Duration = Duration::from_secs(10);
+const ANDROID_LIVENESS_AWAKE_PROBE_INTERVAL: Duration = Duration::from_secs(5);
+const ANDROID_LIVENESS_ASLEEP_PROBE_INTERVAL: Duration = Duration::from_secs(15);
+const ANDROID_RESTART_INITIAL_BACKOFF: Duration = Duration::from_secs(60);
+const ANDROID_RESTART_MAX_BACKOFF: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Debug)]
 pub struct AppPaths {
@@ -345,6 +357,87 @@ pub struct TransportRecoverySnapshot {
     pub trigger: Option<TransportRecoveryTrigger>,
 }
 
+/// Tracks whether an awake headset has stopped answering the control lane.
+/// Transitions are pure so the restart policy can be tested without ADB.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct AndroidLiveness {
+    silent_since: Option<Instant>,
+    awake_since: Option<Instant>,
+    next_probe_at: Option<Instant>,
+    next_restart_at: Option<Instant>,
+    restarts: u32,
+}
+
+impl AndroidLiveness {
+    fn connected(self) -> Self {
+        Self::default()
+    }
+
+    /// Leaves the restart backoff intact while another owner (startup,
+    /// transport recovery, or a missing carrier) is responsible for Android.
+    fn ineligible(self) -> Self {
+        Self {
+            silent_since: None,
+            awake_since: None,
+            next_probe_at: None,
+            ..self
+        }
+    }
+
+    fn silent(self, now: Instant) -> Self {
+        Self {
+            silent_since: self.silent_since.or(Some(now)),
+            ..self
+        }
+    }
+
+    fn probe_due(&self, now: Instant) -> bool {
+        self.next_probe_at.is_none_or(|at| now >= at)
+    }
+
+    fn observed(self, awake: bool, now: Instant) -> Self {
+        Self {
+            awake_since: awake.then(|| self.awake_since.unwrap_or(now)),
+            next_probe_at: Some(
+                now + if awake {
+                    ANDROID_LIVENESS_AWAKE_PROBE_INTERVAL
+                } else {
+                    ANDROID_LIVENESS_ASLEEP_PROBE_INTERVAL
+                },
+            ),
+            ..self
+        }
+    }
+
+    fn restart_due(&self, now: Instant) -> bool {
+        let elapsed = |since: Option<Instant>| {
+            since
+                .is_some_and(|since| now.saturating_duration_since(since) >= ANDROID_LIVENESS_GRACE)
+        };
+        elapsed(self.silent_since)
+            && elapsed(self.awake_since)
+            && self.next_restart_at.is_none_or(|at| now >= at)
+    }
+
+    fn restarted(self, now: Instant) -> Self {
+        let restarts = self.restarts.saturating_add(1);
+        Self {
+            silent_since: Some(now),
+            awake_since: None,
+            next_probe_at: Some(now + ANDROID_LIVENESS_AWAKE_PROBE_INTERVAL),
+            next_restart_at: Some(now + android_restart_backoff(restarts)),
+            restarts,
+        }
+    }
+}
+
+fn android_restart_backoff(restarts: u32) -> Duration {
+    let doublings = restarts.saturating_sub(1).min(8);
+    ANDROID_RESTART_INITIAL_BACKOFF
+        .saturating_mul(1 << doublings)
+        .min(ANDROID_RESTART_MAX_BACKOFF)
+}
+
 #[derive(Clone, Default)]
 pub struct AdbHealthMonitor {
     stopping: Arc<AtomicBool>,
@@ -357,6 +450,7 @@ pub struct AdbHealthMonitor {
     transport_auto_rearm_generation: Arc<AtomicU64>,
     transport_rearm_scheduled: Arc<StdMutex<HashSet<u64>>>,
     usb_reconnect_pending: Arc<AtomicBool>,
+    android_liveness: Arc<StdMutex<AndroidLiveness>>,
     status: Arc<StdMutex<AdbMonitorSnapshot>>,
     operation: Arc<Mutex<()>>,
     changed: Arc<Notify>,
@@ -366,6 +460,8 @@ pub struct AdbHealthMonitor {
 struct AdbMonitorConfig {
     adb: AdbController,
     adb_program: PathBuf,
+    session_id: SessionId,
+    all_traffic: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1089,6 +1185,14 @@ impl AdbHealthMonitor {
                                 self.retry_authenticated_reconcile_if_needed();
                             }
                         }
+                        self.supervise_android(
+                            &config,
+                            &control,
+                            &store,
+                            &diagnostics,
+                            &relay_gate,
+                            cached_device_is_available(device_available),
+                        ).await;
                     }
                     _ = self.changed.notified() => {
                         if self.stopping.load(Ordering::Acquire) {
@@ -1495,6 +1599,165 @@ impl AdbHealthMonitor {
         }
     }
 
+    fn update_android_liveness(
+        &self,
+        transition: impl FnOnce(AndroidLiveness) -> AndroidLiveness,
+    ) -> AndroidLiveness {
+        self.android_liveness
+            .lock()
+            .map(|mut liveness| {
+                *liveness = transition(*liveness);
+                *liveness
+            })
+            .unwrap_or_default()
+    }
+
+    /// Recovery waits for Android to reconnect, which never happens once the
+    /// product service wedges. When PowerManager reports an awake headset but
+    /// the control lane stays silent, restart only the product package.
+    async fn supervise_android(
+        &self,
+        config: &AdbMonitorConfig,
+        control: &ControlHandle,
+        store: &StateStore,
+        diagnostics: &Diagnostics,
+        relay_gate: &RelayGateController,
+        device_available: bool,
+    ) {
+        if self.stopping.load(Ordering::Acquire) {
+            return;
+        }
+        let lifecycle = control.snapshot().await;
+        if lifecycle.state == HostState::Connected {
+            self.update_android_liveness(AndroidLiveness::connected);
+            return;
+        }
+        let recovering = matches!(
+            self.transport_recovery_snapshot().state,
+            TransportRecoveryState::Pending
+                | TransportRecoveryState::WaitingForDevice
+                | TransportRecoveryState::RebuildingMappings
+                | TransportRecoveryState::AwaitingControl
+        );
+        if lifecycle.state != HostState::Degraded || !device_available || recovering {
+            self.update_android_liveness(AndroidLiveness::ineligible);
+            return;
+        }
+        let liveness = self.update_android_liveness(|liveness| liveness.silent(Instant::now()));
+        if !liveness.probe_due(Instant::now()) {
+            return;
+        }
+        let probe_adb = config.adb.clone();
+        let awake = matches!(
+            task::spawn_blocking(move || probe_adb.headset_awake_quick()).await,
+            Ok(Ok(Some(true)))
+        );
+        let now = Instant::now();
+        let liveness = self.update_android_liveness(|liveness| liveness.observed(awake, now));
+        if liveness.restart_due(now) {
+            self.restart_android(config, control, store, diagnostics, relay_gate)
+                .await;
+        }
+    }
+
+    async fn restart_android(
+        &self,
+        config: &AdbMonitorConfig,
+        control: &ControlHandle,
+        store: &StateStore,
+        diagnostics: &Diagnostics,
+        relay_gate: &RelayGateController,
+    ) {
+        let _operation = self.operation.lock().await;
+        if self.stopping.load(Ordering::Acquire) {
+            return;
+        }
+        let liveness = self.update_android_liveness(|liveness| liveness.restarted(Instant::now()));
+        let status_adb = config.adb.clone();
+        let android = task::spawn_blocking(move || status_adb.android_status_quick())
+            .await
+            .ok()
+            .and_then(Result::ok);
+        let _ = diagnostics.record(
+            "android_restart_attempt",
+            json!({
+                "attempt": liveness.restarts,
+                "android_status_readable": android.is_some(),
+                "android_service_present": android.as_ref().map(|status| status.present),
+                "android_state": android.as_ref().and_then(|status| status.state.clone()),
+                "android_screen_suspended": android.as_ref().and_then(|status| status.screen_suspended),
+                "android_vpn_fd_open": android.as_ref().and_then(|status| status.vpn_fd_open),
+            }),
+        );
+        relay_gate.carrier_lost_awaiting_recovery();
+        let restarted = async {
+            let adb = config.adb.clone();
+            self.android_restart_step("force_stop", move || adb.force_stop_android())
+                .await?;
+            let adb = config.adb.clone();
+            self.android_restart_step("verify_closed", move || adb.verify_vpn_closed())
+                .await?;
+            let adb = config.adb.clone();
+            self.android_restart_step("mappings", move || adb.reinstall_mappings())
+                .await?;
+            // Only a HELLO from the restarted process may reopen the relay.
+            relay_gate.control_inactive_awaiting_recovery();
+            let snapshot = control.reset_transport(TRANSPORT_RECOVERY_REASON).await;
+            let _ = store.write(&snapshot, Some(std::process::id()));
+            self.update_status(true, true, true, None);
+            relay_gate.carrier_healthy();
+            let adb = config.adb.clone();
+            let (session_id, all_traffic) = (config.session_id, config.all_traffic);
+            self.android_restart_step("start", move || {
+                adb.send_start_intent(session_id, all_traffic)
+            })
+            .await
+        }
+        .await;
+        let next_restart_ms = liveness
+            .next_restart_at
+            .map(|at| at.saturating_duration_since(Instant::now()).as_millis())
+            .unwrap_or_default()
+            .min(u64::MAX as u128) as u64;
+        match restarted {
+            Ok(()) => {
+                let _ = diagnostics.record(
+                    "android_restart_requested",
+                    json!({"attempt": liveness.restarts, "next_restart_after_ms": next_restart_ms}),
+                );
+            }
+            Err(phase) => {
+                if phase != "stopping" {
+                    self.update_status(true, true, false, Some("android_restart_failed".into()));
+                }
+                let _ = diagnostics.record(
+                    "android_restart_failed",
+                    json!({
+                        "attempt": liveness.restarts,
+                        "phase": phase,
+                        "next_restart_after_ms": next_restart_ms,
+                    }),
+                );
+            }
+        }
+    }
+
+    async fn android_restart_step<E: Send + 'static>(
+        &self,
+        phase: &'static str,
+        step: impl FnOnce() -> Result<(), E> + Send + 'static,
+    ) -> Result<(), &'static str> {
+        // Explicit Stop waits on the operation lock, so it never waits behind
+        // more than the single bounded ADB command already in flight.
+        if self.stopping.load(Ordering::Acquire) {
+            return Err("stopping");
+        }
+        match task::spawn_blocking(step).await {
+            Ok(Ok(())) => Ok(()),
+            _ => Err(phase),
+        }
+    }
+
     async fn track_failed(
         &self,
         adb: &AdbController,
@@ -1868,6 +2131,15 @@ pub struct HostRuntime {
     config: RuntimeConfig,
 }
 
+fn udp_socks_config(bind: SocketAddr) -> SocksConfig {
+    SocksConfig {
+        bind,
+        command_policy: SocksCommandPolicy::FwdUdpOnly,
+        max_connections: MAX_UDP_ASSOCIATIONS,
+        ..Default::default()
+    }
+}
+
 impl HostRuntime {
     pub fn new(config: RuntimeConfig) -> Result<Self, RuntimeError> {
         if !config.control_bind.ip().is_loopback() {
@@ -1981,13 +2253,9 @@ impl HostRuntime {
         })?
         .with_diagnostics(diagnostics.clone())
         .with_relay_gate(relay_gate.clone());
-        let udp_socks = SocksServer::new(SocksConfig {
-            bind: self.config.udp_bind,
-            command_policy: SocksCommandPolicy::FwdUdpOnly,
-            ..Default::default()
-        })?
-        .with_diagnostics(diagnostics.clone())
-        .with_relay_gate(relay_gate.clone());
+        let udp_socks = SocksServer::new(udp_socks_config(self.config.udp_bind))?
+            .with_diagnostics(diagnostics.clone())
+            .with_relay_gate(relay_gate.clone());
         let control_listener = TcpListener::bind(self.config.control_bind).await?;
         let tcp_listener = TcpListener::bind(self.config.socks_bind).await?;
         let udp_listener = TcpListener::bind(self.config.udp_bind).await?;
@@ -2096,6 +2364,8 @@ impl HostRuntime {
             AdbMonitorConfig {
                 adb: self.config.adb.clone(),
                 adb_program: self.config.adb_program.clone(),
+                session_id: self.config.session_id,
+                all_traffic: self.config.all_traffic,
             },
             control_handle.clone(),
             store.clone(),
@@ -3217,12 +3487,340 @@ pub fn terminate_daemon(identity_path: &Path, timeout: Duration) -> io::Result<(
 #[cfg(test)]
 mod tests {
     use crate::adb::{
-        AdbError, AdbExecutor, AdbOutput, ACTION_START_V4, ACTION_STOP_V4, REVERSE_MAPPINGS,
+        AdbError, AdbExecutor, AdbOutput, ACTION_START_V4, ACTION_STOP_V4, ANDROID_PACKAGE,
+        REVERSE_MAPPINGS, VIRTUAL_DESKTOP_PACKAGE,
     };
     #[cfg(unix)]
     use crate::protocol::{Frame, MessageType};
+    use crate::socks::CMD_FWD_UDP;
 
     use super::*;
+
+    async fn open_udp_association(address: SocketAddr) -> tokio::net::TcpStream {
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        client.write_all(&[5, 1, 0]).await.unwrap();
+        let mut auth = [0; 2];
+        time::timeout(Duration::from_millis(500), client.read_exact(&mut auth))
+            .await
+            .expect("UDP association negotiation timed out")
+            .unwrap();
+        assert_eq!(auth, [5, 0]);
+        client
+            .write_all(&[5, CMD_FWD_UDP, 0, 1, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        let mut reply = [0; 10];
+        time::timeout(Duration::from_millis(500), client.read_exact(&mut reply))
+            .await
+            .expect("UDP association reply timed out")
+            .unwrap();
+        assert_eq!(reply[1], 0);
+        client
+    }
+
+    #[test]
+    fn udp_listener_capacity_matches_the_android_session_budget() {
+        let config = udp_socks_config("127.0.0.1:0".parse().unwrap());
+
+        assert_eq!(config.max_connections, 256);
+        assert_eq!(SocksConfig::default().max_connections, 64);
+    }
+
+    #[tokio::test]
+    async fn udp_listener_accepts_post_wake_burst_above_legacy_limit() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let gate = RelayGate::default();
+        let server = SocksServer::new(udp_socks_config(address))
+            .unwrap()
+            .with_relay_gate(gate.clone());
+        let stats = server.clone();
+        let task = tokio::spawn(server.serve_on(listener));
+        gate.set_enabled(true);
+
+        let mut associations = Vec::new();
+        for _ in 0..65 {
+            associations.push(open_udp_association(address).await);
+        }
+
+        time::timeout(Duration::from_millis(500), async {
+            while stats.stats().active_connections != associations.len()
+                || stats.stats().udp.active_flows != associations.len()
+            {
+                time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("UDP associations did not become active");
+        assert_eq!(stats.stats().active_connections, associations.len());
+        assert_eq!(stats.stats().udp.active_flows, associations.len());
+        assert_eq!(stats.stats().rejected_connections, 0);
+        task.abort();
+    }
+
+    fn ago(now: Instant, seconds: u64) -> Instant {
+        now.checked_sub(Duration::from_secs(seconds)).unwrap()
+    }
+
+    #[test]
+    fn android_restart_waits_for_ten_awake_seconds_of_control_silence() {
+        let now = Instant::now();
+        let start = ago(now, 20);
+        let liveness = AndroidLiveness::default()
+            .silent(start)
+            .observed(true, start);
+        assert!(!liveness.restart_due(start));
+        assert!(!liveness.restart_due(start + Duration::from_secs(9)));
+        assert!(liveness.restart_due(start + ANDROID_LIVENESS_GRACE));
+
+        // A headset that only just woke gets its own grace even after a long
+        // silent sleep, so a normal resume is never interrupted.
+        let woke = AndroidLiveness::default()
+            .silent(ago(now, 60))
+            .observed(true, now);
+        assert!(!woke.restart_due(now));
+        assert!(woke.restart_due(now + ANDROID_LIVENESS_GRACE));
+    }
+
+    #[test]
+    fn android_sleep_resets_the_awake_grace_and_slows_probing() {
+        let now = Instant::now();
+        let start = ago(now, 20);
+        let asleep = AndroidLiveness::default()
+            .silent(start)
+            .observed(true, start)
+            .observed(false, start + Duration::from_secs(5));
+        assert_eq!(asleep.awake_since, None);
+        assert!(!asleep.restart_due(start + Duration::from_secs(15)));
+        assert!(!asleep.probe_due(start + Duration::from_secs(19)));
+        assert!(asleep.probe_due(start + Duration::from_secs(20)));
+
+        let awake_again = asleep.observed(true, start + Duration::from_secs(6));
+        assert!(!awake_again.restart_due(start + Duration::from_secs(15)));
+        assert!(awake_again.restart_due(start + Duration::from_secs(16)));
+        assert!(!awake_again.probe_due(start + Duration::from_secs(10)));
+        assert!(awake_again.probe_due(start + Duration::from_secs(11)));
+    }
+
+    #[test]
+    fn android_restart_backoff_doubles_to_five_minutes_and_resets_on_connect() {
+        assert_eq!(android_restart_backoff(1), Duration::from_secs(60));
+        assert_eq!(android_restart_backoff(2), Duration::from_secs(120));
+        assert_eq!(android_restart_backoff(3), Duration::from_secs(240));
+        assert_eq!(android_restart_backoff(4), Duration::from_secs(300));
+        assert_eq!(android_restart_backoff(u32::MAX), Duration::from_secs(300));
+
+        let now = Instant::now();
+        let start = ago(now, 30);
+        let restarted = AndroidLiveness::default()
+            .silent(start)
+            .observed(true, start)
+            .restarted(start + ANDROID_LIVENESS_GRACE);
+        assert_eq!(restarted.restarts, 1);
+        let still_silent = restarted.observed(true, start + Duration::from_secs(11));
+        assert!(!still_silent.restart_due(start + Duration::from_secs(69)));
+        assert!(still_silent.restart_due(start + Duration::from_secs(70)));
+
+        let parked = still_silent.ineligible();
+        assert_eq!(parked.restarts, 1);
+        assert_eq!(parked.next_restart_at, still_silent.next_restart_at);
+        assert_eq!(still_silent.connected(), AndroidLiveness::default());
+    }
+
+    async fn degraded_monitor_fixture(
+        awake: bool,
+    ) -> (
+        tempfile::TempDir,
+        Arc<MonitorMockAdb>,
+        AdbMonitorConfig,
+        ControlServer,
+        StateStore,
+        Diagnostics,
+        RelayGateController,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = AppPaths::discover(Some(directory.path().to_owned())).unwrap();
+        let diagnostics = Diagnostics::open(&paths.logs).unwrap();
+        let store = StateStore::new(&paths.status);
+        let session = SessionId([0x5a; 16]);
+        let control = ControlServer::new(ControlConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            session_id: session,
+        })
+        .unwrap();
+        {
+            let state = control.state();
+            let mut state = state.lock().await;
+            state
+                .peer_started(session, std::time::Instant::now())
+                .unwrap();
+            state.transport_lost(CONTROL_TRANSPORT_LOST_REASON);
+        }
+        let executor = Arc::new(MonitorMockAdb::default());
+        executor
+            .mapping_adds
+            .store(REVERSE_MAPPINGS.len() as u64, Ordering::Relaxed);
+        executor.headset_awake.store(awake, Ordering::Relaxed);
+        let config = AdbMonitorConfig {
+            adb: AdbController::with_timing(
+                executor.clone(),
+                Duration::from_millis(20),
+                Duration::from_millis(20),
+                Duration::ZERO,
+            ),
+            adb_program: PathBuf::new(),
+            session_id: session,
+            all_traffic: true,
+        };
+        let relay_gate = RelayGateController::new(RelayGate::default());
+        (
+            directory,
+            executor,
+            config,
+            control,
+            store,
+            diagnostics,
+            relay_gate,
+        )
+    }
+
+    fn silent_and_awake_past_grace(monitor: &AdbHealthMonitor) {
+        let since = ago(Instant::now(), 11);
+        monitor.update_android_liveness(|_| AndroidLiveness {
+            silent_since: Some(since),
+            awake_since: Some(since),
+            ..AndroidLiveness::default()
+        });
+    }
+
+    #[tokio::test]
+    async fn awake_silent_android_is_restarted_with_the_daemon_session() {
+        let (_directory, executor, config, control, store, diagnostics, relay_gate) =
+            degraded_monitor_fixture(true).await;
+        let monitor = AdbHealthMonitor::default();
+        silent_and_awake_past_grace(&monitor);
+
+        monitor
+            .supervise_android(
+                &config,
+                &control.command_handle(),
+                &store,
+                &diagnostics,
+                &relay_gate,
+                true,
+            )
+            .await;
+
+        let calls = executor.calls.lock().unwrap();
+        let position =
+            |predicate: &dyn Fn(&Vec<String>) -> bool| calls.iter().position(predicate).unwrap();
+        let probe = position(&|args| args.iter().any(|arg| arg == "power"));
+        let force = position(&|args| {
+            args.windows(2)
+                .any(|arguments| arguments == ["force-stop", ANDROID_PACKAGE])
+        });
+        let remove = position(&|args| args.iter().any(|arg| arg == "--remove"));
+        let start = position(&|args| args.iter().any(|arg| arg == ACTION_START_V4));
+        assert!(probe < force && force < remove && remove < start);
+        assert!(calls[start]
+            .windows(3)
+            .any(|arguments| arguments == ["--es", "sessionId", &config.session_id.to_string()]));
+        assert!(!calls
+            .iter()
+            .any(|args| args.iter().any(|arg| arg == ACTION_STOP_V4)));
+        assert!(!calls.iter().any(|args| {
+            args.windows(2)
+                .any(|arguments| arguments == ["force-stop", VIRTUAL_DESKTOP_PACKAGE])
+        }));
+        drop(calls);
+        let liveness = monitor.update_android_liveness(|liveness| liveness);
+        assert_eq!(liveness.restarts, 1);
+        assert!(liveness.next_restart_at.is_some());
+        assert!(monitor.snapshot().mappings_healthy);
+    }
+
+    #[tokio::test]
+    async fn sleeping_headset_is_never_restarted() {
+        let (_directory, executor, config, control, store, diagnostics, relay_gate) =
+            degraded_monitor_fixture(false).await;
+        let monitor = AdbHealthMonitor::default();
+        silent_and_awake_past_grace(&monitor);
+
+        monitor
+            .supervise_android(
+                &config,
+                &control.command_handle(),
+                &store,
+                &diagnostics,
+                &relay_gate,
+                true,
+            )
+            .await;
+
+        let calls = executor.calls.lock().unwrap();
+        assert!(calls
+            .iter()
+            .any(|args| args.iter().any(|arg| arg == "power")));
+        assert!(!calls
+            .iter()
+            .any(|args| args.iter().any(|arg| arg == "force-stop")));
+        assert_eq!(
+            monitor
+                .update_android_liveness(|liveness| liveness)
+                .awake_since,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn supervisor_leaves_connected_and_recovering_sessions_alone() {
+        let (_directory, executor, config, control, store, diagnostics, relay_gate) =
+            degraded_monitor_fixture(true).await;
+        let monitor = AdbHealthMonitor::default();
+        silent_and_awake_past_grace(&monitor);
+        monitor.notify_host_resume();
+
+        monitor
+            .supervise_android(
+                &config,
+                &control.command_handle(),
+                &store,
+                &diagnostics,
+                &relay_gate,
+                true,
+            )
+            .await;
+        assert!(executor.calls.lock().unwrap().is_empty());
+        assert_eq!(
+            monitor.update_android_liveness(|liveness| liveness),
+            AndroidLiveness::default()
+        );
+
+        let session = config.session_id;
+        control
+            .state()
+            .lock()
+            .await
+            .heartbeat(session, std::time::Instant::now())
+            .unwrap();
+        let fresh = AdbHealthMonitor::default();
+        silent_and_awake_past_grace(&fresh);
+        fresh
+            .supervise_android(
+                &config,
+                &control.command_handle(),
+                &store,
+                &diagnostics,
+                &relay_gate,
+                true,
+            )
+            .await;
+        assert!(executor.calls.lock().unwrap().is_empty());
+        assert_eq!(
+            fresh.update_android_liveness(|liveness| liveness),
+            AndroidLiveness::default()
+        );
+    }
 
     struct MonitorMockAdb {
         calls: StdMutex<Vec<Vec<String>>>,
@@ -3231,6 +3829,7 @@ mod tests {
         mapping_delay_ms: AtomicU64,
         screen_suspended: AtomicBool,
         vpn_active: AtomicBool,
+        headset_awake: AtomicBool,
     }
 
     impl Default for MonitorMockAdb {
@@ -3242,6 +3841,7 @@ mod tests {
                 mapping_delay_ms: AtomicU64::new(0),
                 screen_suspended: AtomicBool::new(false),
                 vpn_active: AtomicBool::new(true),
+                headset_awake: AtomicBool::new(false),
             }
         }
     }
@@ -3249,6 +3849,19 @@ mod tests {
     impl AdbExecutor for MonitorMockAdb {
         fn execute(&self, args: &[String], _timeout: Duration) -> Result<AdbOutput, AdbError> {
             self.calls.lock().unwrap().push(args.to_vec());
+            if args.iter().any(|argument| argument == "force-stop") {
+                self.vpn_active.store(false, Ordering::Relaxed);
+                return Ok(AdbOutput::success(""));
+            }
+            if args.iter().any(|argument| argument == "power") {
+                return Ok(AdbOutput::success(
+                    if self.headset_awake.load(Ordering::Relaxed) {
+                        "  mWakefulness=Awake\n"
+                    } else {
+                        "  mWakefulness=Asleep\n"
+                    },
+                ));
+            }
             if args.iter().any(|argument| argument == "get-state") {
                 return Ok(AdbOutput::success(
                     if self.device_available.load(Ordering::Relaxed) {
@@ -4031,6 +4644,8 @@ mod tests {
         let config = AdbMonitorConfig {
             adb: AdbController::new(executor.clone()),
             adb_program: PathBuf::new(),
+            session_id: SessionId([0x5a; 16]),
+            all_traffic: true,
         };
         let monitor = AdbHealthMonitor::default();
         let relay_gate = RelayGate::default();
@@ -4114,6 +4729,8 @@ mod tests {
         let config = AdbMonitorConfig {
             adb: AdbController::new(executor.clone()),
             adb_program: PathBuf::new(),
+            session_id: SessionId([0x5a; 16]),
+            all_traffic: true,
         };
         let monitor = AdbHealthMonitor::default();
         let relay_gate = RelayGate::default();

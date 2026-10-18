@@ -1,4 +1,5 @@
 use std::{
+    future::Future,
     io::Error as StdIoError,
     net::{Ipv4Addr, SocketAddr},
     pin::Pin,
@@ -16,7 +17,7 @@ use thiserror::Error;
 use tokio::{
     io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpSocket, TcpStream},
-    sync::{watch, Semaphore},
+    sync::{watch, Notify, Semaphore},
     time,
 };
 
@@ -333,6 +334,7 @@ pub struct SocksServer {
     stats: SocksStats,
     udp_stats: UdpStats,
     virtual_desktop_flows: VirtualDesktopFlowMonitor,
+    streamer_candidates: StreamerCandidates,
     diagnostics: Option<Diagnostics>,
     relay_gate: Option<RelayGate>,
 }
@@ -444,6 +446,7 @@ impl SocksServer {
             stats: SocksStats::default(),
             udp_stats: UdpStats::default(),
             virtual_desktop_flows: VirtualDesktopFlowMonitor::default(),
+            streamer_candidates: StreamerCandidates::default(),
             diagnostics: None,
             relay_gate: None,
         })
@@ -526,10 +529,7 @@ impl SocksServer {
                 server.stats.active.fetch_sub(1, Ordering::Relaxed);
                 drop(permit);
                 if let (Err(error), Some(diagnostics)) = (result, &server.diagnostics) {
-                    let _ = diagnostics.record(
-                        "socks_connection_error",
-                        json!({"category": error.category()}),
-                    );
+                    let _ = diagnostics.record("socks_connection_error", error.diagnostic_fields());
                 }
             });
         }
@@ -611,31 +611,39 @@ impl SocksServer {
         let vd_streamer_flow = VIRTUAL_DESKTOP_STREAMER_PORTS.contains(&destination_port);
         let flow_started = time::Instant::now();
         let upstream = time::timeout(self.config.connect_timeout, async {
-            let resolved_target = destination.resolve().await?;
-            let canonical_local_target =
-                vd_streamer_flow && socket_address_is_local(resolved_target);
+            let resolved_target = destination.resolve().await.map_err(SocksError::Resolve)?;
+            let local_target = socket_address_is_local(resolved_target);
+            let canonical_local_target = vd_streamer_flow && local_target;
             let connect_target = if canonical_local_target {
                 physical_lan_ipv4_target(destination_port).unwrap_or(resolved_target)
             } else {
                 resolved_target
             };
             let canonicalized = connect_target.ip() != resolved_target.ip();
-            let upstream = TcpStream::connect(connect_target)
+            let upstream = connect_upstream(connect_target, local_target)
                 .await
-                .map_err(crate::udp::UdpRelayError::from)?;
-            Ok::<_, crate::udp::UdpRelayError>((upstream, canonicalized))
+                .map_err(|error| SocksError::Connect {
+                    kind: error.kind(),
+                    local_port: local_target.then_some(destination_port),
+                })?;
+            Ok::<_, SocksError>((upstream, canonicalized, local_target))
         })
         .await;
-        let (upstream, canonicalized) = match upstream {
+        let (upstream, canonicalized, local_target) = match upstream {
             Ok(Ok(stream)) => stream,
             Ok(Err(error)) => {
+                if vd_streamer_flow && error.is_local_refusal() {
+                    if let Some(group) = self.streamer_candidates.joinable(destination_port) {
+                        return join_streamer_candidate(client, &group, error).await;
+                    }
+                }
                 let _ = write_reply(
                     &mut client,
                     0x05,
                     Endpoint::Socket(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0)),
                 )
                 .await;
-                return Err(error.into());
+                return Err(error);
             }
             Err(_) => {
                 let _ = write_reply(
@@ -658,6 +666,13 @@ impl SocksServer {
         client.set_nodelay(true)?;
         upstream.set_nodelay(true)?;
         let bound = upstream.local_addr()?;
+        // Opened before the reply so a duplicate refused right after this
+        // accept already finds it.
+        let candidates = if vd_streamer_flow && local_target {
+            self.streamer_candidates.open(destination_port, bound)
+        } else {
+            None
+        };
         write_reply(&mut client, 0, Endpoint::Socket(bound)).await?;
         let virtual_desktop_flow = self.virtual_desktop_flows.begin(destination_port);
         if vd_streamer_flow {
@@ -669,19 +684,47 @@ impl SocksServer {
             }
         }
         let flow_observation = FlowObservation::default();
-        let mut client = ObservedIo::new(
-            client,
-            FlowEndpoint::Quest,
-            &flow_observation,
-            virtual_desktop_flow.as_ref(),
-        );
-        let mut upstream = ObservedIo::new(
-            upstream,
-            FlowEndpoint::Streamer,
-            &flow_observation,
-            virtual_desktop_flow.as_ref(),
-        );
-        let transfer = io::copy_bidirectional(&mut client, &mut upstream).await;
+        let transfer = match candidates {
+            Some(candidates) => {
+                let settlement =
+                    settle_candidates(&candidates, &upstream, client, &flow_observation).await;
+                drop(candidates);
+                self.record_candidate_settlement(destination_port, &settlement);
+                match settlement.chosen {
+                    Some(chosen) => {
+                        if chosen.delivered > 0 {
+                            if let Some(flow) = &virtual_desktop_flow {
+                                flow.mark_forwarded();
+                            }
+                        }
+                        relay_flow(
+                            chosen.client,
+                            upstream,
+                            &flow_observation,
+                            virtual_desktop_flow.as_ref(),
+                            &chosen.client_prefix,
+                            &chosen.upstream_suffix,
+                        )
+                        .await
+                        .map(|(from_client, from_upstream)| {
+                            (from_client, from_upstream + chosen.delivered as u64)
+                        })
+                    }
+                    None => Ok((0, 0)),
+                }
+            }
+            None => {
+                relay_flow(
+                    client,
+                    upstream,
+                    &flow_observation,
+                    virtual_desktop_flow.as_ref(),
+                    &[],
+                    &[],
+                )
+                .await
+            }
+        };
         if vd_streamer_flow {
             if let Some(diagnostics) = &self.diagnostics {
                 let duration_ms = flow_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
@@ -723,6 +766,379 @@ impl SocksServer {
             .fetch_add(from_upstream, Ordering::Relaxed);
         Ok(())
     }
+
+    fn record_candidate_settlement(&self, destination_port: u16, settlement: &CandidateSettlement) {
+        if settlement.arrivals < 2 {
+            return;
+        }
+        if let Some(diagnostics) = &self.diagnostics {
+            let _ = diagnostics.record(
+                "vd_streamer_candidates_settled",
+                json!({
+                    "destination_port": destination_port,
+                    "candidates": settlement.arrivals,
+                    "chosen_arrival": settlement.chosen.as_ref().map(|chosen| chosen.arrival),
+                    "outcome": settlement.outcome,
+                }),
+            );
+        }
+    }
+}
+
+async fn relay_flow(
+    client: TcpStream,
+    upstream: TcpStream,
+    observation: &FlowObservation,
+    virtual_desktop_flow: Option<&VirtualDesktopFlowGuard>,
+    client_prefix: &[u8],
+    upstream_suffix: &[u8],
+) -> Result<(u64, u64), StdIoError> {
+    let mut client = ObservedIo::new(
+        client,
+        FlowEndpoint::Quest,
+        observation,
+        virtual_desktop_flow,
+    );
+    let mut upstream = ObservedIo::new(
+        upstream,
+        FlowEndpoint::Streamer,
+        observation,
+        virtual_desktop_flow,
+    );
+    upstream.write_all(client_prefix).await?;
+    client.write_all(upstream_suffix).await?;
+    let (from_client, from_upstream) = io::copy_bidirectional(&mut client, &mut upstream).await?;
+    Ok((
+        from_client + client_prefix.len() as u64,
+        from_upstream + upstream_suffix.len() as u64,
+    ))
+}
+
+/// Virtual Desktop dials every IPv4 address the PC advertises for each Streamer
+/// port at once. HEV completes all of those handshakes on the Quest before the
+/// PC connects, while the Streamer accepts one connect per port and refuses the
+/// rest, so VD can be left holding a refused duplicate as its chosen socket.
+/// A refused duplicate therefore joins the accepted flow, which sends the
+/// Streamer's bytes to every candidate and keeps the one VD writes on, the last
+/// one VD leaves open, or failing both, the first arrival.
+const CANDIDATE_JOIN_WINDOW: Duration = Duration::from_millis(500);
+const CANDIDATE_DECISION_TIMEOUT: Duration = Duration::from_millis(250);
+const CANDIDATE_UNRESOLVED_LIMIT: Duration = Duration::from_secs(10);
+const CANDIDATE_REPLAY_LIMIT: usize = 64 * 1024;
+
+#[derive(Clone, Default)]
+struct StreamerCandidates {
+    groups: Arc<StdMutex<[Option<Arc<CandidateGroup>>; VIRTUAL_DESKTOP_STREAMER_PORTS.len()]>>,
+}
+
+impl StreamerCandidates {
+    fn open(&self, destination_port: u16, bound: SocketAddr) -> Option<CandidateLease> {
+        let index = streamer_port_index(destination_port)?;
+        let group = Arc::new(CandidateGroup::new(bound));
+        let previous = self.groups.lock().ok()?[index].replace(group.clone());
+        // A newer accept on the same port belongs to a new VD attempt.
+        if let Some(previous) = previous {
+            previous.close();
+        }
+        Some(CandidateLease(group))
+    }
+
+    fn joinable(&self, destination_port: u16) -> Option<Arc<CandidateGroup>> {
+        let index = streamer_port_index(destination_port)?;
+        let group = self.groups.lock().ok()?[index].clone()?;
+        group.is_joinable().then_some(group)
+    }
+}
+
+fn streamer_port_index(destination_port: u16) -> Option<usize> {
+    VIRTUAL_DESKTOP_STREAMER_PORTS
+        .iter()
+        .position(|port| *port == destination_port)
+}
+
+struct CandidateGroup {
+    bound: SocketAddr,
+    join_deadline: time::Instant,
+    /// `None` once the accepted flow has chosen or ended.
+    joins: StdMutex<Option<Vec<TcpStream>>>,
+    joined: Notify,
+}
+
+impl CandidateGroup {
+    fn new(bound: SocketAddr) -> Self {
+        Self {
+            bound,
+            join_deadline: time::Instant::now() + CANDIDATE_JOIN_WINDOW,
+            joins: StdMutex::new(Some(Vec::new())),
+            joined: Notify::new(),
+        }
+    }
+
+    fn is_joinable(&self) -> bool {
+        time::Instant::now() < self.join_deadline
+            && self.joins.lock().is_ok_and(|joins| joins.is_some())
+    }
+
+    fn join(&self, client: TcpStream) -> Result<(), TcpStream> {
+        if time::Instant::now() >= self.join_deadline {
+            return Err(client);
+        }
+        let Ok(mut joins) = self.joins.lock() else {
+            return Err(client);
+        };
+        let Some(pending) = joins.as_mut() else {
+            return Err(client);
+        };
+        pending.push(client);
+        drop(joins);
+        self.joined.notify_one();
+        Ok(())
+    }
+
+    fn take_joined(&self) -> Vec<TcpStream> {
+        self.joins
+            .lock()
+            .ok()
+            .and_then(|mut joins| joins.as_mut().map(std::mem::take))
+            .unwrap_or_default()
+    }
+
+    fn close(&self) {
+        if let Ok(mut joins) = self.joins.lock() {
+            joins.take();
+        }
+    }
+}
+
+/// Stops further joins when the accepted flow settles or is dropped.
+struct CandidateLease(Arc<CandidateGroup>);
+
+impl std::ops::Deref for CandidateLease {
+    type Target = CandidateGroup;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for CandidateLease {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
+async fn join_streamer_candidate(
+    mut client: TcpStream,
+    group: &CandidateGroup,
+    refusal: SocksError,
+) -> Result<(), SocksError> {
+    client.set_nodelay(true)?;
+    write_reply(&mut client, 0, Endpoint::Socket(group.bound)).await?;
+    // Too late to join: VD sees this duplicate close, as it would a refusal.
+    group.join(client).map_err(|_| refusal)
+}
+
+struct Candidate {
+    client: TcpStream,
+    arrival: usize,
+    delivered: usize,
+}
+
+struct ChosenCandidate {
+    client: TcpStream,
+    arrival: usize,
+    /// Bytes VD sent on this candidate before it was chosen.
+    client_prefix: Vec<u8>,
+    /// Streamer bytes already sent to this candidate.
+    delivered: usize,
+    /// Streamer bytes read for the candidates but not yet sent to this one.
+    upstream_suffix: Vec<u8>,
+}
+
+struct CandidateSettlement {
+    arrivals: usize,
+    outcome: &'static str,
+    chosen: Option<ChosenCandidate>,
+}
+
+enum CandidateEvent {
+    Joined,
+    Upstream,
+    Readable(usize),
+    Writable(usize),
+    Deadline,
+}
+
+fn choose_candidate(
+    mut candidates: Vec<Candidate>,
+    index: usize,
+    client_prefix: Vec<u8>,
+    replay: &[u8],
+    arrivals: usize,
+    outcome: &'static str,
+) -> CandidateSettlement {
+    // Dropping the rest closes every duplicate VD did not use.
+    let chosen = candidates.remove(index);
+    CandidateSettlement {
+        arrivals,
+        outcome,
+        chosen: Some(ChosenCandidate {
+            upstream_suffix: replay[chosen.delivered..].to_vec(),
+            delivered: chosen.delivered,
+            arrival: chosen.arrival,
+            client: chosen.client,
+            client_prefix,
+        }),
+    }
+}
+
+async fn settle_candidates(
+    group: &CandidateGroup,
+    upstream: &TcpStream,
+    first: TcpStream,
+    observation: &FlowObservation,
+) -> CandidateSettlement {
+    let give_up = time::Instant::now() + CANDIDATE_UNRESOLVED_LIMIT;
+    let mut candidates = vec![Candidate {
+        client: first,
+        arrival: 0,
+        delivered: 0,
+    }];
+    let mut arrivals = 1;
+    let mut replay = Vec::new();
+    let mut upstream_closed = false;
+    let mut decision_deadline = None;
+    let mut buffer = vec![0; 16 * 1024];
+    loop {
+        for client in group.take_joined() {
+            candidates.push(Candidate {
+                client,
+                arrival: arrivals,
+                delivered: 0,
+            });
+            arrivals += 1;
+        }
+        let now = time::Instant::now();
+        let joining = now < group.join_deadline;
+        let exhausted = upstream_closed || replay.len() >= CANDIDATE_REPLAY_LIMIT;
+        let deadline = match candidates.len() {
+            0 if !joining => {
+                observation.record(FlowEndpoint::Quest, FlowTerminalEvent::ReadEof);
+                return CandidateSettlement {
+                    arrivals,
+                    outcome: "all_closed",
+                    chosen: None,
+                };
+            }
+            1 if !joining || exhausted => {
+                let outcome = if arrivals > 1 {
+                    "sole_survivor"
+                } else {
+                    "single"
+                };
+                return choose_candidate(candidates, 0, Vec::new(), &replay, arrivals, outcome);
+            }
+            0 | 1 => group.join_deadline,
+            _ => {
+                if exhausted {
+                    decision_deadline.get_or_insert(now + CANDIDATE_DECISION_TIMEOUT);
+                }
+                let deadline = decision_deadline.map_or(give_up, |decision| decision.min(give_up));
+                if now >= deadline {
+                    return choose_candidate(
+                        candidates,
+                        0,
+                        Vec::new(),
+                        &replay,
+                        arrivals,
+                        "timeout",
+                    );
+                }
+                deadline
+            }
+        };
+
+        let read_upstream = !upstream_closed && replay.len() < CANDIDATE_REPLAY_LIMIT;
+        let event = {
+            let joined = group.joined.notified();
+            let sleep = time::sleep_until(deadline);
+            tokio::pin!(joined, sleep);
+            std::future::poll_fn(|context| {
+                if joined.as_mut().poll(context).is_ready() {
+                    return Poll::Ready(CandidateEvent::Joined);
+                }
+                if read_upstream && upstream.poll_read_ready(context).is_ready() {
+                    return Poll::Ready(CandidateEvent::Upstream);
+                }
+                for (index, candidate) in candidates.iter().enumerate() {
+                    if candidate.client.poll_read_ready(context).is_ready() {
+                        return Poll::Ready(CandidateEvent::Readable(index));
+                    }
+                    if candidate.delivered < replay.len()
+                        && candidate.client.poll_write_ready(context).is_ready()
+                    {
+                        return Poll::Ready(CandidateEvent::Writable(index));
+                    }
+                }
+                if sleep.as_mut().poll(context).is_ready() {
+                    return Poll::Ready(CandidateEvent::Deadline);
+                }
+                Poll::Pending
+            })
+            .await
+        };
+
+        match event {
+            CandidateEvent::Joined | CandidateEvent::Deadline => {}
+            CandidateEvent::Upstream => {
+                let room = (CANDIDATE_REPLAY_LIMIT - replay.len()).min(buffer.len());
+                match upstream.try_read(&mut buffer[..room]) {
+                    Ok(0) => {
+                        upstream_closed = true;
+                        observation.record(FlowEndpoint::Streamer, FlowTerminalEvent::ReadEof);
+                    }
+                    Ok(read) => replay.extend_from_slice(&buffer[..read]),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(_) => {
+                        upstream_closed = true;
+                        observation.record(FlowEndpoint::Streamer, FlowTerminalEvent::ReadError);
+                    }
+                }
+            }
+            CandidateEvent::Readable(index) => match candidates[index].client.try_read(&mut buffer)
+            {
+                // VD closed a duplicate it is not using.
+                Ok(0) => {
+                    candidates.remove(index);
+                }
+                Ok(read) => {
+                    let prefix = buffer[..read].to_vec();
+                    return choose_candidate(
+                        candidates,
+                        index,
+                        prefix,
+                        &replay,
+                        arrivals,
+                        "client_data",
+                    );
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => {
+                    candidates.remove(index);
+                }
+            },
+            CandidateEvent::Writable(index) => {
+                let candidate = &mut candidates[index];
+                match candidate.client.try_write(&replay[candidate.delivered..]) {
+                    Ok(written) => candidate.delivered += written,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(_) => {
+                        candidates.remove(index);
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn endpoint_port(endpoint: &Endpoint) -> u16 {
@@ -739,6 +1155,54 @@ fn socket_address_is_local(mut target: SocketAddr) -> bool {
         SocketAddr::V6(_) => TcpSocket::new_v6(),
     };
     socket.and_then(|socket| socket.bind(target)).is_ok()
+}
+
+/// HEV has already completed the Quest-side TCP handshake before this connect
+/// starts, so a slow refusal surfaces to the Quest app as a dead connection.
+/// Windows retries a refused SYN for about two seconds; a host-local target
+/// cannot lose SYNs, so fail it immediately like the Wi-Fi path would.
+async fn connect_upstream(target: SocketAddr, local_target: bool) -> Result<TcpStream, StdIoError> {
+    let socket = match target {
+        SocketAddr::V4(_) => TcpSocket::new_v4()?,
+        SocketAddr::V6(_) => TcpSocket::new_v6()?,
+    };
+    if local_target {
+        disable_syn_retransmissions(&socket);
+    }
+    socket.connect(target).await
+}
+
+#[cfg(not(windows))]
+fn disable_syn_retransmissions(_socket: &TcpSocket) {}
+
+#[cfg(windows)]
+fn disable_syn_retransmissions(socket: &TcpSocket) {
+    use std::{mem::size_of, os::windows::io::AsRawSocket};
+    use windows_sys::Win32::Networking::WinSock::{
+        WSAIoctl, SIO_TCP_INITIAL_RTO, SOCKET, TCP_INITIAL_RTO_NO_SYN_RETRANSMISSIONS,
+        TCP_INITIAL_RTO_PARAMETERS,
+    };
+
+    let parameters = TCP_INITIAL_RTO_PARAMETERS {
+        // TCP_INITIAL_RTO_UNSPECIFIED_RTT keeps the stack's default RTO.
+        Rtt: u16::MAX,
+        MaxSynRetransmissions: TCP_INITIAL_RTO_NO_SYN_RETRANSMISSIONS as u8,
+    };
+    let mut returned = 0u32;
+    // Best effort: a stack without this ioctl keeps its default retry policy.
+    unsafe {
+        WSAIoctl(
+            socket.as_raw_socket() as SOCKET,
+            SIO_TCP_INITIAL_RTO,
+            (&parameters as *const TCP_INITIAL_RTO_PARAMETERS).cast(),
+            size_of::<TCP_INITIAL_RTO_PARAMETERS>() as u32,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+            None,
+        );
+    }
 }
 
 #[cfg(not(windows))]
@@ -957,6 +1421,14 @@ pub enum SocksError {
     UnsupportedAddressType(u8),
     #[error("SOCKS CONNECT timed out")]
     ConnectTimeout,
+    #[error("SOCKS destination could not be resolved: {0}")]
+    Resolve(crate::udp::UdpRelayError),
+    #[error("SOCKS upstream connect failed: {kind:?}")]
+    Connect {
+        kind: std::io::ErrorKind,
+        /// Recorded only for the PC's own addresses, never for remote hosts.
+        local_port: Option<u16>,
+    },
     #[error("SOCKS authentication or request timed out")]
     HandshakeTimeout,
     #[error("relay session became inactive")]
@@ -979,11 +1451,34 @@ impl SocksError {
             Self::CommandNotAllowed { .. } => "command_not_allowed",
             Self::UnsupportedAddressType(_) => "unsupported_address_type",
             Self::ConnectTimeout => "connect_timeout",
+            Self::Resolve(_) => "resolve",
+            Self::Connect { .. } => "tcp_connect",
             Self::HandshakeTimeout => "handshake_timeout",
             Self::RelayInactive => "relay_inactive",
             Self::Frame(_) => "udp_frame",
             Self::Udp(_) => "udp_relay",
             Self::Io(_) => "io",
+        }
+    }
+
+    fn is_local_refusal(&self) -> bool {
+        matches!(
+            self,
+            Self::Connect {
+                kind: std::io::ErrorKind::ConnectionRefused,
+                local_port: Some(_),
+            }
+        )
+    }
+
+    fn diagnostic_fields(&self) -> serde_json::Value {
+        match self {
+            Self::Connect { kind, local_port } => json!({
+                "category": self.category(),
+                "error_kind": format!("{kind:?}"),
+                "local_destination_port": local_port,
+            }),
+            _ => json!({"category": self.category()}),
         }
     }
 }
@@ -1459,6 +1954,279 @@ mod tests {
         assert_eq!(auth, [5, 0]);
 
         drop(stalled);
+        task.abort();
+    }
+
+    #[test]
+    fn connect_failures_report_their_own_category_and_only_local_ports() {
+        let local = SocksError::Connect {
+            kind: std::io::ErrorKind::ConnectionRefused,
+            local_port: Some(38_850),
+        };
+        assert_eq!(
+            local.diagnostic_fields(),
+            json!({
+                "category": "tcp_connect",
+                "error_kind": "ConnectionRefused",
+                "local_destination_port": 38_850,
+            })
+        );
+        let remote = SocksError::Connect {
+            kind: std::io::ErrorKind::TimedOut,
+            local_port: None,
+        };
+        assert_eq!(
+            remote.diagnostic_fields()["local_destination_port"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            SocksError::Resolve(crate::udp::UdpRelayError::Unresolved("x".into()))
+                .diagnostic_fields(),
+            json!({"category": "resolve"})
+        );
+    }
+
+    #[tokio::test]
+    async fn refused_local_connect_replies_promptly_and_records_the_local_port() {
+        let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let destination = closed.local_addr().unwrap();
+        drop(closed);
+        let directory = tempfile::tempdir().unwrap();
+        let diagnostics = Diagnostics::open(directory.path()).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = SocksServer::new(SocksConfig {
+            bind: address,
+            ..Default::default()
+        })
+        .unwrap()
+        .with_diagnostics(diagnostics);
+        let task = tokio::spawn(server.serve_on(listener));
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client.write_all(&[5, 1, 0]).await.unwrap();
+        let mut auth = [0; 2];
+        client.read_exact(&mut auth).await.unwrap();
+        let mut request = vec![5, CMD_CONNECT, 0];
+        request.extend_from_slice(&encode_endpoint(&Endpoint::Socket(destination)).unwrap());
+        client.write_all(&request).await.unwrap();
+        let mut reply = [0; 10];
+        time::timeout(Duration::from_millis(500), client.read_exact(&mut reply))
+            .await
+            .expect("refused CONNECT must be answered promptly")
+            .unwrap();
+        assert_eq!(reply[1], 0x05);
+
+        let expected = format!("\"local_destination_port\":{}", destination.port());
+        time::timeout(Duration::from_secs(1), async {
+            loop {
+                let logged = std::fs::read_dir(directory.path())
+                    .unwrap()
+                    .filter_map(|entry| std::fs::read_to_string(entry.unwrap().path()).ok())
+                    .collect::<String>();
+                if logged.contains("\"category\":\"tcp_connect\"") && logged.contains(&expected) {
+                    return;
+                }
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("refused local CONNECT was not recorded as tcp_connect");
+        task.abort();
+    }
+
+    async fn start_connect_server(
+        diagnostics: Option<Diagnostics>,
+    ) -> (SocketAddr, tokio::task::JoinHandle<Result<(), SocksError>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut server = SocksServer::new(SocksConfig {
+            bind: address,
+            ..Default::default()
+        })
+        .unwrap();
+        if let Some(diagnostics) = diagnostics {
+            server = server.with_diagnostics(diagnostics);
+        }
+        (address, tokio::spawn(server.serve_on(listener)))
+    }
+
+    async fn socks_connect_reply(address: SocketAddr, destination: SocketAddr) -> (TcpStream, u8) {
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client.write_all(&[5, 1, 0]).await.unwrap();
+        let mut auth = [0; 2];
+        client.read_exact(&mut auth).await.unwrap();
+        let mut request = vec![5, CMD_CONNECT, 0];
+        request.extend_from_slice(&encode_endpoint(&Endpoint::Socket(destination)).unwrap());
+        client.write_all(&request).await.unwrap();
+        let mut reply = [0; 10];
+        client.read_exact(&mut reply).await.unwrap();
+        (client, reply[1])
+    }
+
+    /// Accepts one connection and stops listening, like VD's Streamer.
+    async fn single_accept_streamer(
+        port: u16,
+    ) -> (SocketAddr, tokio::sync::oneshot::Receiver<TcpStream>) {
+        let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, port))
+            .await
+            .unwrap();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(listener);
+            let _ = sender.send(stream);
+        });
+        (SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port), receiver)
+    }
+
+    async fn wait_for_logged(directory: &std::path::Path, needles: &[&str]) {
+        time::timeout(Duration::from_secs(2), async {
+            loop {
+                let logged = std::fs::read_dir(directory)
+                    .unwrap()
+                    .filter_map(|entry| std::fs::read_to_string(entry.unwrap().path()).ok())
+                    .collect::<String>();
+                if logged
+                    .lines()
+                    .any(|line| needles.iter().all(|needle| line.contains(needle)))
+                {
+                    return;
+                }
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("no log line contained {needles:?}"));
+    }
+
+    #[tokio::test]
+    async fn refused_duplicate_serves_the_candidate_vd_writes_on() {
+        let directory = tempfile::tempdir().unwrap();
+        let diagnostics = Diagnostics::open(directory.path()).unwrap();
+        let (destination, accepted) =
+            single_accept_streamer(VIRTUAL_DESKTOP_STREAMER_PORTS[1]).await;
+        let (address, task) = start_connect_server(Some(diagnostics)).await;
+
+        let (mut first, reply) = socks_connect_reply(address, destination).await;
+        assert_eq!(reply, 0);
+        let mut streamer = accepted.await.unwrap();
+        streamer.write_all(b"HELO").await.unwrap();
+        let mut greeting = [0; 4];
+        first.read_exact(&mut greeting).await.unwrap();
+        assert_eq!(&greeting, b"HELO");
+
+        let (mut second, reply) = socks_connect_reply(address, destination).await;
+        assert_eq!(reply, 0, "a refused duplicate must stay connected");
+        let mut replayed = [0; 4];
+        second.read_exact(&mut replayed).await.unwrap();
+        assert_eq!(&replayed, b"HELO");
+        second.write_all(b"PICK").await.unwrap();
+        let mut picked = [0; 4];
+        streamer.read_exact(&mut picked).await.unwrap();
+        assert_eq!(&picked, b"PICK");
+        streamer.write_all(b"OK").await.unwrap();
+        let mut answer = [0; 2];
+        second.read_exact(&mut answer).await.unwrap();
+        assert_eq!(&answer, b"OK");
+
+        let mut unused = Vec::new();
+        time::timeout(Duration::from_secs(1), first.read_to_end(&mut unused))
+            .await
+            .expect("the duplicate VD did not use stayed open")
+            .unwrap();
+        assert!(unused.is_empty());
+        let (_late, reply) = socks_connect_reply(address, destination).await;
+        assert_eq!(reply, 0x05, "duplicates after the choice are refused");
+        wait_for_logged(
+            directory.path(),
+            &[
+                "\"vd_streamer_candidates_settled\"",
+                "\"candidates\":2",
+                "\"chosen_arrival\":1",
+                "\"outcome\":\"client_data\"",
+            ],
+        )
+        .await;
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn surviving_duplicate_receives_the_whole_streamer_stream() {
+        let (destination, accepted) =
+            single_accept_streamer(VIRTUAL_DESKTOP_STREAMER_PORTS[2]).await;
+        let (address, task) = start_connect_server(None).await;
+
+        let (first, reply) = socks_connect_reply(address, destination).await;
+        assert_eq!(reply, 0);
+        let mut streamer = accepted.await.unwrap();
+        let (mut second, reply) = socks_connect_reply(address, destination).await;
+        assert_eq!(reply, 0);
+        drop(first);
+
+        let payload: Vec<u8> = (0..(4 * CANDIDATE_REPLAY_LIMIT + 7))
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let expected = payload.clone();
+        let sender = tokio::spawn(async move {
+            streamer.write_all(&payload).await.unwrap();
+            streamer.shutdown().await.unwrap();
+            streamer
+        });
+        let mut received = Vec::new();
+        time::timeout(Duration::from_secs(5), second.read_to_end(&mut received))
+            .await
+            .expect("the surviving candidate never got the stream")
+            .unwrap();
+        assert_eq!(received, expected);
+        drop(sender.await.unwrap());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn undecided_duplicates_fall_back_to_the_first_arrival() {
+        let directory = tempfile::tempdir().unwrap();
+        let diagnostics = Diagnostics::open(directory.path()).unwrap();
+        let (destination, accepted) =
+            single_accept_streamer(VIRTUAL_DESKTOP_STREAMER_PORTS[3]).await;
+        let (address, task) = start_connect_server(Some(diagnostics)).await;
+
+        let (mut first, reply) = socks_connect_reply(address, destination).await;
+        assert_eq!(reply, 0);
+        let mut streamer = accepted.await.unwrap();
+        let (mut second, reply) = socks_connect_reply(address, destination).await;
+        assert_eq!(reply, 0);
+        // The join lands right after the reply; let it settle before data flows.
+        time::sleep(Duration::from_millis(50)).await;
+
+        let payload = vec![7; 2 * CANDIDATE_REPLAY_LIMIT];
+        streamer.write_all(&payload).await.unwrap();
+        let mut received = vec![0; payload.len()];
+        time::timeout(Duration::from_secs(5), first.read_exact(&mut received))
+            .await
+            .expect("the first arrival never got the stream")
+            .unwrap();
+        assert_eq!(received, payload);
+        let mut duplicate = Vec::new();
+        time::timeout(Duration::from_secs(1), second.read_to_end(&mut duplicate))
+            .await
+            .expect("the undecided duplicate stayed open")
+            .unwrap();
+        assert!(duplicate.len() <= CANDIDATE_REPLAY_LIMIT);
+
+        first.write_all(b"late").await.unwrap();
+        let mut late = [0; 4];
+        streamer.read_exact(&mut late).await.unwrap();
+        assert_eq!(&late, b"late");
+        wait_for_logged(
+            directory.path(),
+            &[
+                "\"vd_streamer_candidates_settled\"",
+                "\"chosen_arrival\":0",
+                "\"outcome\":\"timeout\"",
+            ],
+        )
+        .await;
         task.abort();
     }
 
