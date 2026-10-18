@@ -9,11 +9,11 @@
   Simple wired networking without relying on Quest Wi-Fi.
 </p>
 
-## Try official Virtual Desktop USB first
+## Virtual Desktop's built-in USB mode
 
-Virtual Desktop now supports wired USB connections directly. As of August 31,
-2026, the Quest app must use its beta release channel. The standard PC Streamer
-already supports USB.
+Virtual Desktop also supports wired USB connections directly, but it is buggy at
+the moment. The Quest app must use its beta release channel. The standard PC
+Streamer already supports USB.
 
 1. Install or update Virtual Desktop Streamer from the
    [official website](https://www.vrdesktop.net/).
@@ -24,9 +24,7 @@ already supports USB.
 5. Disconnect any wireless VD session, refresh the computer list, and select the
    PC with the USB icon.
 
-If this works, you do not need Quest VD Wired. This project is no longer
-maintained and is being archived now that Virtual Desktop provides official USB
-support.
+If it works reliably for you, you do not need Quest VD Wired.
 
 <p align="center">
   <a href="https://github.com/kkoemets/quest-vd-wired/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/kkoemets/quest-vd-wired?display_name=tag&amp;sort=semver"></a>
@@ -37,7 +35,7 @@ support.
 </p>
 
 <p align="center">
-  <a href="https://github.com/kkoemets/quest-vd-wired/releases/download/v4.1.34/quest-vd-wired-v4.1.34-windows-x64.zip"><strong>Download v4.1.34</strong></a>
+  <a href="https://github.com/kkoemets/quest-vd-wired/releases/download/v4.1.35/quest-vd-wired-v4.1.35-windows-x64.zip"><strong>Download v4.1.35</strong></a>
   · <a href="#quick-start">Setup</a>
   · <a href="#troubleshooting">Troubleshooting</a>
   · <a href="https://github.com/kkoemets/quest-vd-wired/discussions/categories/q-a">Get help</a>
@@ -65,7 +63,7 @@ Quest 2, Quest 3S, and Quest Pro have not been tested.
 
 ## Quick start
 
-1. [Download v4.1.34](https://github.com/kkoemets/quest-vd-wired/releases/download/v4.1.34/quest-vd-wired-v4.1.34-windows-x64.zip) and extract it.
+1. [Download v4.1.35](https://github.com/kkoemets/quest-vd-wired/releases/download/v4.1.35/quest-vd-wired-v4.1.35-windows-x64.zip) and extract it.
 2. Connect and unlock the Quest. Accept **Allow USB debugging**.
 3. Run `quest-vd-wired.exe`.
 4. Accept the notification and VPN prompts inside the headset.

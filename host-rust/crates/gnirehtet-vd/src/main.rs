@@ -929,7 +929,9 @@ async fn start(
     if let Err(error) = wait_for_connected(paths, session, &mut daemon) {
         terminate_spawned_daemon(&mut daemon)
             .context("quiescing host monitor before startup rollback")?;
-        let rollback_error = adb.stop().err();
+        // Android received START but never answered, so the next automatic
+        // retry must begin from a fresh product process, not the stalled one.
+        let rollback_error = adb.stop_unresponsive().err();
         let reason = if rollback_error.is_some() {
             "Android did not acknowledge GNR4 STARTED; rollback could not verify VPN closure"
         } else {

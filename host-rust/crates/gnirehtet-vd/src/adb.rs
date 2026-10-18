@@ -688,7 +688,7 @@ impl AdbController {
         // session and reverse mappings. Reusing those mappings lets the old
         // control loop keep presenting its stale session ID to a fresh daemon,
         // so make every new host session begin from a verified Android stop.
-        self.stop_android_session("start_quiesce")?;
+        self.quiesce_android_session()?;
 
         let mut failures = Vec::new();
         for mapping in REVERSE_MAPPINGS {
@@ -718,36 +718,7 @@ impl AdbController {
             }
         }
 
-        let all_traffic_value = if all_traffic { "true" } else { "false" };
-        let args = vec![
-            "-d".into(),
-            "shell".into(),
-            "am".into(),
-            "start".into(),
-            "-n".into(),
-            ANDROID_CONTROL_ACTIVITY.into(),
-            "-a".into(),
-            ACTION_START_V4.into(),
-            "--es".into(),
-            "sessionId".into(),
-            session_id.to_string(),
-            "--es".into(),
-            "vdPackage".into(),
-            allowed_package.into(),
-            "--ei".into(),
-            "socksPort".into(),
-            SOCKS_PORT.to_string(),
-            "--ei".into(),
-            "udpPort".into(),
-            UDP_STREAM_PORT.to_string(),
-            "--ei".into(),
-            "controlPort".into(),
-            CONTROL_PORT.to_string(),
-            "--ez".into(),
-            "allTraffic".into(),
-            all_traffic_value.into(),
-        ];
-        if let Err(error) = self.run_checked(&args) {
+        if let Err(error) = self.send_start_intent(session_id, all_traffic) {
             failures.push(error.to_string());
             let rollback = self.run_checked(&strings(&[
                 "-d",
@@ -825,6 +796,83 @@ impl AdbController {
         } else {
             Err(TransactionError::new(phase, failures))
         }
+    }
+
+    /// A wedged Android service can keep its descriptor open after a graceful
+    /// STOP. Kill the product process only when that stop cannot be verified,
+    /// so a healthy service still closes through its own teardown path.
+    fn quiesce_android_session(&self) -> Result<(), TransactionError> {
+        let Err(graceful) = self.stop_android_session("start_quiesce") else {
+            return Ok(());
+        };
+        self.force_stop_android_session("start_force_quiesce")
+            .map_err(|forced| {
+                TransactionError::new(
+                    forced.phase,
+                    graceful
+                        .failures
+                        .into_iter()
+                        .chain(forced.failures)
+                        .collect(),
+                )
+            })
+    }
+
+    /// Rolls back a start that Android never acknowledged. The service already
+    /// proved it cannot answer the control lane, so a graceful STOP would be
+    /// queued behind the same stall; kill the product process instead.
+    pub fn stop_unresponsive(&self) -> Result<(), TransactionError> {
+        self.require_device()
+            .map_err(|failure| TransactionError::single("unresponsive_stop", failure))?;
+        self.force_stop_android_session("unresponsive_stop")
+    }
+
+    fn force_stop_android_session(&self, phase: &'static str) -> Result<(), TransactionError> {
+        let mut failures = Vec::new();
+        if let Err(error) = self.force_stop_android() {
+            failures.push(format!("force-stop: {error}"));
+        }
+        if let Err(error) = self.verify_vpn_closed() {
+            failures.push(format!("VPN closure verification: {error}"));
+        }
+        self.remove_all_mappings(&mut failures);
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(TransactionError::new(phase, failures))
+        }
+    }
+
+    /// Kills only the wired-link package. Android closes the VPN descriptor
+    /// with the process, and Virtual Desktop is never touched.
+    pub(crate) fn force_stop_android(&self) -> Result<(), AdbError> {
+        self.run_checked(&strings(&[
+            "-d",
+            "shell",
+            "am",
+            "force-stop",
+            ANDROID_PACKAGE,
+        ]))?;
+        Ok(())
+    }
+
+    pub(crate) fn send_start_intent(
+        &self,
+        session_id: SessionId,
+        all_traffic: bool,
+    ) -> Result<(), AdbError> {
+        self.run_checked(&start_intent_args(session_id, all_traffic))?;
+        Ok(())
+    }
+
+    /// Reads PowerManager wakefulness, which stays truthful even when the
+    /// product service itself has stopped observing display changes.
+    pub(crate) fn headset_awake_quick(&self) -> Result<Option<bool>, AdbError> {
+        let output = self.run_checked_with(
+            &strings(&["-d", "shell", "dumpsys", "power"]),
+            self.command_timeout.min(Duration::from_secs(2)),
+        )?;
+        Ok(parse_wakefulness(&output.stdout))
     }
 
     pub fn repair_mappings(&self) -> Result<(), TransactionError> {
@@ -964,7 +1012,7 @@ impl AdbController {
         Ok(AndroidVpnStatus::parse(&output.stdout))
     }
 
-    fn verify_vpn_closed(&self) -> Result<(), AdbError> {
+    pub(crate) fn verify_vpn_closed(&self) -> Result<(), AdbError> {
         let deadline = Instant::now() + self.stop_timeout;
         loop {
             let output = self.run_checked(&strings(&[
@@ -1242,6 +1290,45 @@ impl TransactionError {
 
 fn strings(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_owned()).collect()
+}
+
+fn start_intent_args(session_id: SessionId, all_traffic: bool) -> Vec<String> {
+    let all_traffic_value = if all_traffic { "true" } else { "false" };
+    vec![
+        "-d".into(),
+        "shell".into(),
+        "am".into(),
+        "start".into(),
+        "-n".into(),
+        ANDROID_CONTROL_ACTIVITY.into(),
+        "-a".into(),
+        ACTION_START_V4.into(),
+        "--es".into(),
+        "sessionId".into(),
+        session_id.to_string(),
+        "--es".into(),
+        "vdPackage".into(),
+        VIRTUAL_DESKTOP_PACKAGE.into(),
+        "--ei".into(),
+        "socksPort".into(),
+        SOCKS_PORT.to_string(),
+        "--ei".into(),
+        "udpPort".into(),
+        UDP_STREAM_PORT.to_string(),
+        "--ei".into(),
+        "controlPort".into(),
+        CONTROL_PORT.to_string(),
+        "--ez".into(),
+        "allTraffic".into(),
+        all_traffic_value.into(),
+    ]
+}
+
+fn parse_wakefulness(output: &str) -> Option<bool> {
+    output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("mWakefulness="))
+        .map(|value| value.trim() == "Awake")
 }
 
 fn package_version_matches(output: &str) -> bool {
@@ -1669,6 +1756,110 @@ mod tests {
             args.iter().any(|argument| argument == ACTION_START_V4)
                 && *timeout == Duration::from_secs(8)
         }));
+    }
+
+    #[test]
+    fn start_force_stops_a_wedged_service_that_ignores_graceful_stop() {
+        let still_open = format!(
+            "ServiceRecord {{{ANDROID_VPN_SERVICE}}}\ngnirehtet.state=DEGRADED\nvpnFdOpen=true"
+        );
+        let mock = Arc::new(MockAdb::with_results(vec![
+            Ok(AdbOutput::success("device")),            // device check
+            Ok(AdbOutput::success("")),                  // wake headset
+            Ok(AdbOutput::success("")),                  // graceful STOP
+            Ok(AdbOutput::success(still_open)),          // VPN still open
+            Ok(AdbOutput::success("")),                  // remove SOCKS
+            Ok(AdbOutput::success("")),                  // remove UDP
+            Ok(AdbOutput::success("")),                  // remove control
+            Ok(AdbOutput::success("")),                  // verify removed
+            Ok(AdbOutput::success("")),                  // force-stop
+            Ok(AdbOutput::success("No services match")), // VPN closed
+            Ok(AdbOutput::success("")),                  // remove SOCKS
+            Ok(AdbOutput::success("")),                  // remove UDP
+            Ok(AdbOutput::success("")),                  // remove control
+            Ok(AdbOutput::success("")),                  // verify removed
+            Ok(AdbOutput::success("")),                  // add SOCKS
+            Ok(AdbOutput::success("")),                  // add UDP
+            Ok(AdbOutput::success("")),                  // add control
+            Ok(AdbOutput::success(
+                "UsbFfs tcp:31417 tcp:31417\nUsbFfs tcp:31416 tcp:31416\nUsbFfs tcp:31418 tcp:31418\n",
+            )), // verify mappings
+            Ok(AdbOutput::success("Starting")), // fresh START
+        ]));
+        controller(mock.clone())
+            .start(SessionId([0x12; 16]), true)
+            .unwrap();
+        let calls = mock.calls.lock().unwrap();
+        let position =
+            |predicate: &dyn Fn(&Vec<String>) -> bool| calls.iter().position(predicate).unwrap();
+        let stop_index = position(&|args| args.iter().any(|arg| arg == ACTION_STOP_V4));
+        let force_index = position(&|args| {
+            args.windows(2)
+                .any(|arguments| arguments == ["force-stop", ANDROID_PACKAGE])
+        });
+        let start_index = position(&|args| args.iter().any(|arg| arg == ACTION_START_V4));
+        assert!(stop_index < force_index);
+        assert!(force_index < start_index);
+        assert!(!calls.iter().any(|args| {
+            args.windows(2)
+                .any(|arguments| arguments == ["force-stop", VIRTUAL_DESKTOP_PACKAGE])
+        }));
+    }
+
+    #[test]
+    fn unresponsive_rollback_kills_only_the_product_and_removes_mappings() {
+        let mock = Arc::new(MockAdb::with_results(vec![
+            Ok(AdbOutput::success("device")),
+            Ok(AdbOutput::success("")),
+            Ok(AdbOutput::success("No services match")),
+        ]));
+        controller(mock.clone()).stop_unresponsive().unwrap();
+        let calls = mock.calls.lock().unwrap();
+        assert!(calls[1].iter().map(String::as_str).eq([
+            "-d",
+            "shell",
+            "am",
+            "force-stop",
+            ANDROID_PACKAGE
+        ]));
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|args| args.iter().any(|arg| arg == "--remove"))
+                .count(),
+            REVERSE_MAPPINGS.len()
+        );
+        assert!(!calls
+            .iter()
+            .any(|args| args.iter().any(|arg| arg == ACTION_STOP_V4)));
+    }
+
+    #[test]
+    fn restart_intent_reuses_the_start_contract() {
+        let mock = Arc::new(MockAdb::default());
+        let session = SessionId([0x13; 16]);
+        controller(mock.clone())
+            .send_start_intent(session, true)
+            .unwrap();
+        let calls = mock.calls.lock().unwrap();
+        assert_eq!(calls.as_slice(), [start_intent_args(session, true)]);
+        assert!(calls[0]
+            .windows(3)
+            .any(|arguments| arguments == ["--es", "sessionId", &session.to_string()]));
+    }
+
+    #[test]
+    fn wakefulness_parser_requires_an_explicit_awake_state() {
+        assert_eq!(
+            parse_wakefulness(
+                "POWER MANAGER\n  mWakefulnessChanging=false\n  mWakefulness=Awake\n"
+            ),
+            Some(true)
+        );
+        assert_eq!(parse_wakefulness("  mWakefulness=Asleep\n"), Some(false));
+        assert_eq!(parse_wakefulness("  mWakefulness=Dozing\n"), Some(false));
+        assert_eq!(parse_wakefulness("  mWakefulnessChanging=false\n"), None);
+        assert_eq!(parse_wakefulness(""), None);
     }
 
     #[test]
