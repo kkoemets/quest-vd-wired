@@ -90,6 +90,7 @@ turn off Quest Wi-Fi and confirm that Virtual Desktop can still reach the PC.
 | --- | --- |
 | Headset not found | Unlock it, accept USB debugging, then try another USB 3 port or cable. |
 | VD cannot find the PC | Confirm the Streamer is running, restart VD, then use **Diagnose and fix**. |
+| VD does not reconnect after the headset wakes | End `VirtualDesktop.Streamer.exe` and `VirtualDesktop.Service.exe` in Task Manager, then start Virtual Desktop Streamer again. Then quit VD in the headset and open it again. |
 | Stutters or latency spikes | Restart VD, test a lower bitrate, and note the time of any spike. |
 | Cable was unplugged | Reconnect, unlock the headset, and approve USB debugging again if asked. |
 | Want normal Quest networking | Turn off **Wired link** from the tray or exit the app. |
